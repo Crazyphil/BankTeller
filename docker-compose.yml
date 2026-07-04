@@ -1,0 +1,14 @@
+services:
+  bankteller:
+    build: .
+    container_name: bankteller
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      - bankteller-data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  bankteller-data:

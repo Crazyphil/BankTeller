@@ -9,12 +9,22 @@ import kotlin.test.*
 class ApplicationTest {
 
     @Test
-    fun testRoot() = testApplication {
+    fun testLoginEndpoint() = testApplication {
         application {
             module()
         }
-        val response = client.get("/")
+        val response = client.post("/api/login") {
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            setBody("""{"username":"admin","password":"changeme"}""")
+        }
+        // Login should succeed with default credentials
         assertEquals(HttpStatusCode.OK, response.status)
-        assertEquals("Hello, Ktor!", response.bodyAsText())
+    }
+
+    companion object {
+        init {
+            // Use in-memory SQLite for tests
+            System.setProperty("database.path", ":memory:")
+        }
     }
 }

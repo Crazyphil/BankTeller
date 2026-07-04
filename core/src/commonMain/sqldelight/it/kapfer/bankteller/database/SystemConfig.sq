@@ -1,0 +1,10 @@
+CREATE TABLE system_config (
+    key TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL
+);
+
+selectValue:
+SELECT value FROM system_config WHERE key = ?;
+
+insertOrReplace:
+INSERT OR REPLACE INTO system_config(key, value) VALUES (?, ?);

@@ -28,7 +28,6 @@ dependencyResolutionManagement {
     }
 }
 
-include(":app:shared")
-include(":app:webApp")
+include(":app:web")
 include(":core")
 include(":server")
