@@ -63,3 +63,24 @@ The SPA SHALL render a transient onboarding gate screen when Enable Banking cred
 #### Scenario: Error handling during onboarding
 - **WHEN** any step of the automated flow fails (GIT login error, registration error, verification error)
 - **THEN** the SPA displays the error message and offers a "restart onboarding" action that returns the user to the email-entry step
+
+## ADDED Requirements
+
+### Requirement: Public routes rendered by the SPA without auth gate
+The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The SPA's `App()` composable SHALL include a single early-return at the top (before any auth check) that inspects `window.location.pathname`: if the path is one of the three public routes, the SPA renders the corresponding composable (`PrivacyScreen`, `TermsScreen`, or `CallbackScreen`) wrapped in `MaterialTheme` and returns; otherwise, the SPA falls through to the existing auth-gated flow. This mechanism extends the foundation's existing enum-based state router with a public-route branch — it SHALL NOT introduce a routing library (Decompose, Voyager, Jetbrains Navigation-Compose, or similar). The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change; public routes are not authenticated feature screens and do not require navigation infrastructure.
+
+#### Scenario: Public route bypasses auth gate
+- **WHEN** the SPA loads at `/privacy`, `/terms`, or `/enable-banking-callback` (e.g., Enable Banking's reviewer visits the privacy URL, or the user's email-link click lands on the callback URL on device B)
+- **THEN** the SPA renders the corresponding public composable (`PrivacyScreen` / `TermsScreen` / `CallbackScreen`) styled consistently with the app's Material 3 theme, WITHOUT calling `checkAuth()` and WITHOUT requiring a BankTeller session cookie
+
+#### Scenario: CallbackScreen reads query for context only
+- **WHEN** the SPA loads at `/enable-banking-callback?oobCode=...&state=...` (after the server-side Ktor handler has already captured the oobCode synchronously and persisted it before serving the bundle)
+- **THEN** the SPA's `CallbackScreen` composable reads `window.location.search` only to display a contextual "your login was received, return to your original tab" message; the SPA SHALL NOT make a follow-up API call to relay the oobCode to the server (the server already has it from the GET request)
+
+#### Scenario: Bundle load failure on device B does not lose the oobCode
+- **WHEN** the server-side Ktor handler at `/enable-banking-callback` captures the oobCode synchronously and persists it, but the SPA bundle subsequently fails to load on device B (cold phone, flaky network, browser cache miss)
+- **THEN** the oobCode is already persisted in the onboarding context on the server; the original onboarding tab on device A continues polling the wait endpoint and auto-advances when it observes `complete`. The styled `CallbackScreen` is UX-only ("icing on the cake" so the user knows what to do), not load-bearing for the capture.
+
+#### Scenario: Non-public path falls through to auth-gated flow
+- **WHEN** the SPA loads at any path other than `/privacy`, `/terms`, or `/enable-banking-callback` (e.g., `/`, `/login`, `/dashboard`)
+- **THEN** the public-route early-return does NOT fire; the SPA falls through to the existing `checkAuth()` + `when (viewModel.currentScreen)` flow, exactly as before this change

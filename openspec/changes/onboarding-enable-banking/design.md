@@ -257,4 +257,32 @@ The RegistrationReview step contains:
 
 **What this removes from the UI:** The EmailEntry step is just email + a "send login email" button — no environment selector, no redirect URL form, no production fields. Environment, redirect URL, and production fields all live in the single RegistrationReview step that appears after authentication. The flow is genuinely: enter email → wait for login → review all registration inputs → register → activate.
 
-**What this adds server-side:** Two static route handlers at `/privacy` and `/terms` (or a single combined page) served at the public-redirect-host root, plus the auto-derivation logic in `completeOnboarding` that fills the production fields from the onboarding context + redirect URL before calling `POST /api/applications`. The redirect-URL derivation endpoint stays (`GET /api/onboarding/enable-banking/redirect-url`) — the SPA fetches the derived value to pre-fill the editable field at the RegistrationReview step.
+**What this adds server-side:** Auto-derivation logic in `completeOnboarding` that fills the production fields from the onboarding context + redirect URL before calling `POST /api/applications`. The redirect-URL derivation endpoint stays (`GET /api/onboarding/enable-banking/redirect-url`) — the SPA fetches the derived value to pre-fill the editable field at the RegistrationReview step. Static pages at `/privacy` and `/terms` are served by the SPA (see D14) for theme consistency, not as server-rendered HTML.
+
+### D14: Public routes rendered by the SPA, not as server-rendered HTML
+
+**Decision:** The three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — SHALL be rendered by the SPA (Compose Multiplatform wasmJs) so they inherit the app's actual Material 3 theme, rather than being served as server-rendered HTML with hand-written CSS that approximates the theme. The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change — these are public pages, not authenticated feature screens, so they do not require the navigation infrastructure.
+
+**Routing mechanism — extend the existing enum pattern, do not introduce a routing library:**
+
+The foundation's SPA entry point (`App.kt`) already uses an enum-based state router (`Screen { Login, Onboarding, Dashboard }` switched via `when (viewModel.currentScreen) { ... }`) with no navigation library. Public routes extend this pattern with a **single early-return at the top of `App()`** based on `window.location.pathname`:
+
+- If `pathname` is `/privacy`, `/terms`, or `/enable-banking-callback`, render the corresponding composable (`PrivacyScreen`, `TermsScreen`, `CallbackScreen`) wrapped in `MaterialTheme` and return — skip the `checkAuth()` flow entirely. These pages do not go through the auth gate.
+- Otherwise, fall through to the existing `checkAuth()` + `when (viewModel.currentScreen)` flow.
+
+This adds three new branches in a `when` block plus the early-return — a ~15-line change. No Decompose, no Voyager, no Jetbrains Navigation-Compose. Adding a routing library just for three public pages would be overengineering; it would also raise the question of whether to retrofit the existing login/dashboard routing onto the library, which is a much larger change and exactly the scope creep the foundation explicitly avoided.
+
+The distinction this turns on: **URL routing** (decide which top-level screen renders at which URL — the foundation already has this) is a different concern from the **navigation component** (the in-app UI affordance for switching between authenticated feature screens — deferred). The former is a 15-line `when` branch; the latter is a library + architectural pattern. Public routes need only the former.
+
+**Server-side handling of the three routes:**
+
+- **`/privacy` and `/terms`:** No dedicated Ktor route handler exists for these paths. The foundation's existing catch-all SPA-serving handler (which serves the SPA bundle for unknown paths) is sufficient — the SPA loads, the public-route early-return fires, and the right composable renders.
+- **`/enable-banking-callback`:** This DOES need a dedicated Ktor route handler, because the oobCode capture MUST happen server-side BEFORE the SPA bundle is served. The handler parses `state` and `oobCode` from the query string, calls `service.handleCallback(state, oobCode)` synchronously to validate `state` and persist the `oobCode` (validation + persistence happen BEFORE the response is sent), and then serves the SPA bundle (the same `index.html` the catch-all serves for unknown paths). The SPA loads at that URL, the public-route early-return fires, and `CallbackScreen` renders a styled "return to your original BankTeller tab" message.
+
+**No new API endpoint, no SPA→server round-trip for the oobCode.** The server already has the oobCode from the GET request — it captured it synchronously before sending the response. The SPA on device B does not need to relay the oobCode to the server; it only needs to render a static confirmation message. (Reading `window.location.search` in the SPA is fine for displaying a contextual message, but it is NOT a relay to the server.)
+
+**Robustness against bundle-load failures on device B:** The oobCode is captured server-side BEFORE the SPA bundle is served. If the wasmJs bundle fails to load on device B (cold phone, flaky network, browser cache miss), the oobCode is already persisted in the onboarding context on the server. The user can close the tab without ever seeing the styled confirmation — device A's polling will still observe `complete` and auto-advance. The styled page is purely UX ("icing on the cake" for the user to know what to do); it is not load-bearing for the capture.
+
+**Tradeoff accepted:** Loading the full wasmJs bundle on device B for a ~2-second "close this tab" page is heavier than inline HTML. The user accepted this tradeoff for theme consistency and architectural simplicity (one rendering stack, no parallel hand-maintained CSS that would drift from the Compose theme over time).
+
+**Why SPA-rendered rather than server-rendered HTML:** Server-rendered HTML for the public pages would require maintaining a parallel CSS approximation of the Material 3 theme (colors, typography, spacing) that drifts from the Compose theme over time as the theme evolves. Rendering the three public pages as Compose composables inside the SPA bundle means the SPA's actual Material 3 theme supplies all styling — one rendering stack, no parallel CSS to maintain.

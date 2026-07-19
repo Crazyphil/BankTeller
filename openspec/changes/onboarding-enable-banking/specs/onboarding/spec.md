@@ -46,19 +46,23 @@ The system SHALL expose an authenticated endpoint `POST /api/onboarding/enable-b
 - **THEN** the system returns a validation error
 
 ### Requirement: Email-link callback route
-The system SHALL expose an unauthenticated `GET /enable-banking-callback` route that captures the `oobCode` and `state` query parameters from the Enable Banking email-link redirect. The route SHALL validate the `state` parameter against a persisted onboarding context; on valid `state`, it SHALL store the captured `oobCode` keyed by that `state`, mark the onboarding context as "callback received" so the wait endpoint can report completion, and render a simple HTML page informing the user that they can return to their original BankTeller tab to continue (the original tab will auto-advance). On invalid `state`, the route SHALL render an error page without storing anything. On missing `oobCode`, the route SHALL render an error page indicating the login link was incomplete. This route SHALL NOT require a BankTeller session cookie — the user's browser arrives from an external redirect (clicking the email link) and the foundation's `SameSite=Strict` session cookie is not sent on cross-site navigations. The `state` token provides CSRF defense (unforgeable secret in the email link) and flow correlation (cross-device support).
+The system SHALL expose an unauthenticated `GET /enable-banking-callback` route that captures the `oobCode` and `state` query parameters from the Enable Banking email-link redirect. The route SHALL validate the `state` parameter against a persisted onboarding context; on valid `state`, it SHALL store the captured `oobCode` keyed by that `state`, mark the onboarding context as "callback received" so the wait endpoint can report completion, and then serve the SPA bundle so the SPA can render a styled "return to your original BankTeller tab" screen consistent with the app's Material 3 theme (per design D14). On invalid `state`, the route SHALL serve the SPA bundle so the SPA can render a styled error screen without storing anything. On missing `oobCode`, the route SHALL serve the SPA bundle so the SPA can render a styled error screen indicating the login link was incomplete. This route SHALL NOT require a BankTeller session cookie — the user's browser arrives from an external redirect (clicking the email link) and the foundation's `SameSite=Strict` session cookie is not sent on cross-site navigations. The `state` token provides CSRF defense (unforgeable secret in the email link) and flow correlation (cross-device support). The oobCode capture SHALL happen server-side synchronously before the SPA bundle is served — the SPA does not relay the oobCode to the server via a separate API call (the server already has it from the GET request). The styled confirmation page is UX-only; if the SPA bundle fails to load on device B, the oobCode is already persisted and the original onboarding tab's polling will still observe completion.
 
 #### Scenario: Valid callback received
 - **WHEN** Enable Banking redirects the user's browser to `/enable-banking-callback?oobCode=...&state=<valid-state>`
-- **THEN** the system validates `state`, stores the `oobCode` keyed by that `state`, marks the onboarding context as "callback received," and renders an HTML page telling the user to return to their original BankTeller tab
+- **THEN** the system validates `state`, stores the `oobCode` keyed by that `state`, marks the onboarding context as "callback received," and serves the SPA bundle so the SPA renders a styled "return to your original BankTeller tab" screen
 
 #### Scenario: Invalid or expired state rejected
 - **WHEN** the callback is received with a `state` that does not match any persisted onboarding context
-- **THEN** the system renders an error page without storing the `oobCode`
+- **THEN** the system serves the SPA bundle so the SPA renders a styled error screen, without storing the `oobCode`
 
 #### Scenario: Missing oobCode rejected
 - **WHEN** the callback is received with a valid `state` but no `oobCode` parameter
-- **THEN** the system renders an error page indicating the login link was incomplete
+- **THEN** the system serves the SPA bundle so the SPA renders a styled error screen indicating the login link was incomplete
+
+#### Scenario: Bundle load failure on device B does not lose the oobCode
+- **WHEN** the callback is received with a valid `state` and `oobCode`, the system captures the `oobCode` synchronously and persists it, but the SPA bundle subsequently fails to load on device B (cold phone, flaky network)
+- **THEN** the oobCode is already persisted in the onboarding context; device A's polling still observes `complete` and auto-advances — the styled confirmation page is UX-only, not load-bearing for the capture
 
 ### Requirement: Onboarding wait endpoint
 The system SHALL expose an authenticated endpoint `GET /api/onboarding/enable-banking/wait?state=<token>` that reports whether the email-link callback has been captured for the given `state` token. The endpoint SHALL validate that the `state` token belongs to the calling authenticated user (rejecting with 403 otherwise — multi-user future-proofing). The response SHALL be one of `{"status": "pending"}` (no `oobCode` captured yet) or `{"status": "complete"}` (the callback has been received and the `oobCode` is stored). The SPA SHALL poll this endpoint every 1-2 seconds (with backoff) while in the "waiting for authentication…" state and, upon receiving `complete`, auto-advance by calling `POST /api/onboarding/enable-banking/complete` with the `state` token.
@@ -111,15 +115,15 @@ The system SHALL expose an authenticated endpoint `POST /api/onboarding/enable-b
 - **THEN** the system returns an error and does not persist any credentials; the user is directed to restart the onboarding flow
 
 ### Requirement: Static privacy and terms pages served by BankTeller
-The system SHALL serve static privacy and terms pages at `/privacy` and `/terms` (unauthenticated, public) so that PRODUCTION app registration can reference them as `privacy_url` and `terms_url` (per design D13). The pages SHALL initially contain placeholder content and MAY be combined into a single page reachable at both paths. The pages SHALL be served at the public-redirect-host root, distinct from the `/api/*` and `/enable-banking-callback` routes.
+The system SHALL serve static privacy and terms pages at `/privacy` and `/terms` (unauthenticated, public) so that PRODUCTION app registration can reference them as `privacy_url` and `terms_url` (per design D13). The pages SHALL initially contain placeholder content. They SHALL be rendered by the SPA (not as server-rendered HTML) so they inherit the app's actual Material 3 theme — per design D14, the foundation's catch-all SPA-bundle handler serves the bundle for these paths, and the SPA's public-route early-return renders the corresponding `PrivacyScreen` / `TermsScreen` composable without going through the auth gate. No dedicated Ktor route handler is needed for `/privacy` or `/terms` — the catch-all serves the bundle.
 
 #### Scenario: Privacy page reachable
 - **WHEN** an unauthenticated client requests `GET <public-redirect-host>/privacy`
-- **THEN** a static placeholder privacy page is returned (HTTP 200, text/html)
+- **THEN** the SPA bundle is served and the SPA renders the `PrivacyScreen` composable (HTTP 200, text/html containing the SPA bootstrap), styled consistently with the app's Material 3 theme
 
 #### Scenario: Terms page reachable
 - **WHEN** an unauthenticated client requests `GET <public-redirect-host>/terms`
-- **THEN** a static placeholder terms page is returned (HTTP 200, text/html)
+- **THEN** the SPA bundle is served and the SPA renders the `TermsScreen` composable, styled consistently with the app's Material 3 theme
 
 ### Requirement: Onboarding detection on login
 The server SHALL not render the onboarding screen. The SPA SHALL call `GET /api/onboarding/status` after successful login to determine whether the onboarding gate should be shown. The server's role is limited to exposing the status, redirect-url, start, wait, callback, completion, and static privacy/terms pages endpoints described above.
