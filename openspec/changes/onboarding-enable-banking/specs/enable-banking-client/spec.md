@@ -53,30 +53,30 @@ The system SHALL expose the ability to call `GET /application` on the Enable Ban
 - **THEN** the Enable Banking API returns 401/403 and the system reports credentials as invalid
 
 ### Requirement: Google Identity Toolkit email-link authentication
-The system SHALL implement the Enable Banking email-link login flow via the Google Identity Toolkit (GIT) REST endpoints to obtain a Firebase `idToken` for control-plane application registration. The flow SHALL: (1) call GIT `createAuthUri` with the user's email and the BankTeller callback URL to confirm email-link is a supported sign-in method; (2) call GIT `getOobConfirmationCode` with the email and the callback URL as `continueUrl` to trigger Enable Banking to send the login email; (3) capture the `oobCode` from the callback redirect after the user clicks the email link; (4) call GIT `emailLinkSignin` with the email and `oobCode` to obtain the Firebase `idToken`. The Firebase API key used for these calls SHALL be the one embedded in the Enable Banking public website frontend.
+The system SHALL implement the Enable Banking email-link login flow via the Google Identity Toolkit (GIT) REST endpoints to obtain a Firebase `idToken` for control-plane application registration. The flow SHALL: (1) call GIT `createAuthUri` with the user's email and the BankTeller callback URL to confirm email-link is a supported sign-in method; (2) call GIT `getOobConfirmationCode` with the email and the callback URL as `continueUrl` to trigger Enable Banking to send the login email; (3) capture the `oobCode` from the callback redirect after the user clicks the email link; (4) the callback route calls GIT `emailLinkSignin` with the email and `oobCode` to obtain the Firebase `idToken`, validates the oobCode is fresh, and caches the `idToken` on the onboarding context (marked "auth validated"); the completion endpoint reuses this cached `idToken` rather than calling `emailLinkSignin` again. The Firebase API key used for these calls SHALL be the one embedded in the Enable Banking public website frontend.
 
 #### Scenario: Initiate email-link login
 - **WHEN** the onboarding flow requests email-link authentication for a given Enable Banking email
 - **THEN** the system calls GIT `getOobConfirmationCode` with that email and the BankTeller callback URL, and Enable Banking sends a login email to the user
 
 #### Scenario: Complete email-link login after callback
-- **WHEN** the callback route has captured a valid `oobCode` for an in-progress onboarding context
-- **THEN** the system calls GIT `emailLinkSignin` with the user's email and the `oobCode`, and receives a Firebase `idToken`
+- **WHEN** the callback route captures a valid `oobCode` for an in-progress onboarding context
+- **THEN** the system calls GIT `emailLinkSignin` with the user's email and the `oobCode`, receives a Firebase `idToken`, caches it on the context, and marks the context "auth validated"
 
 #### Scenario: Invalid or expired oobCode rejected
-- **WHEN** the system calls GIT `emailLinkSignin` with an invalid, expired, or already-used `oobCode`
-- **THEN** the GIT API returns an error and the system reports that login failed, directing the user to restart the onboarding flow
+- **WHEN** the callback route calls GIT `emailLinkSignin` with an invalid, expired, or already-used `oobCode`
+- **THEN** the GIT API returns an error, the context is marked "auth failed", and the wait endpoint reports `auth_failed` so the SPA directs the user to restart the onboarding flow
 
 ### Requirement: Enable Banking control-plane application registration
-The system SHALL implement a control-plane client that registers a new Enable Banking application by calling `POST https://enablebanking.com/api/applications` with the Firebase `idToken` obtained from the GIT flow as the `Authorization: Bearer` token. The request body SHALL include the in-app-generated X.509 certificate, the chosen `environment` (SANDBOX or PRODUCTION), an application `name`, and the `redirect_urls` list containing the BankTeller callback URL. For PRODUCTION, the body SHALL also include `description`, `gdpr_email`, `privacy_url`, and `terms_url`. The response SHALL contain the new `application_id`, which the system SHALL return to the caller for persistence.
+The system SHALL implement a control-plane client that registers a new Enable Banking application by calling `POST https://enablebanking.com/api/applications` with the Firebase `idToken` obtained from the GIT flow as the `Authorization: Bearer` token. The request body SHALL include the in-app-generated X.509 certificate, the chosen `environment` (SANDBOX or PRODUCTION), an application `name`, and the `redirect_urls` list containing the BankTeller callback URL. For PRODUCTION, the body SHALL also include `description`, `gdpr_email`, `privacy_url`, and `terms_url`. The response SHALL contain the new `app_id` (the Enable Banking application identifier, used as the JWT `kid` header for data-plane auth and stored under the internal `enable_banking_application_id` key), which the system SHALL return to the caller for persistence.
 
 #### Scenario: Successful sandbox application registration
 - **WHEN** the control-plane client calls `POST /api/applications` with a valid Firebase `idToken`, the generated certificate, environment `SANDBOX`, an application name, and the redirect URL
-- **THEN** Enable Banking returns a new `application_id` and the system returns it to the caller
+- **THEN** Enable Banking returns a new `app_id` and the system returns it to the caller
 
 #### Scenario: Successful production application registration
 - **WHEN** the control-plane client calls `POST /api/applications` with a valid Firebase `idToken`, the generated certificate, environment `PRODUCTION`, an application name, the redirect URL, and the required production fields (`description`, `gdpr_email`, `privacy_url`, `terms_url`)
-- **THEN** Enable Banking returns a new `application_id` and the system returns it to the caller
+- **THEN** Enable Banking returns a new `app_id` and the system returns it to the caller
 
 #### Scenario: Invalid or expired Firebase idToken rejected
 - **WHEN** the control-plane client calls `POST /api/applications` with an expired or invalid Firebase `idToken`
