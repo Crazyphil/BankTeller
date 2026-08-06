@@ -1,0 +1,41 @@
+# Test-runner container for Kotlin/JS browser tests (ChromeHeadless via Karma).
+#
+# Purpose: run :app:web:jsBrowserTest / :wasmJsBrowserTest in an isolated Chrome
+# environment so the host's personal browser (Firefox, Chrome, etc.) is never
+# touched and never killed by a stray cleanup attempt.
+#
+# Base image: Microsoft's Playwright image bundles Chromium + all browser system
+# dependencies (nss, freetype, fonts, mesa, etc.) pre-installed and pinned. We
+# layer JDK 21 + libatomic1 on top so the Kotlin/JS plugin's downloaded Node
+# binary and Gradle itself both run.
+#
+# Build:   ./scripts/build-browser-tests-image.sh
+# Run:     ./gradlew :app:web:containerJsBrowserTest
+#          ./gradlew :app:web:containerWasmJsBrowserTest
+FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+
+LABEL org.opencontainers.image.title="BankTeller browser-tests runner"
+LABEL org.opencontainers.image.description="Isolated Chrome environment for running :app:web:jsBrowserTest / :wasmJsBrowserTest"
+
+# JDK 21 (matches the main build) + libatomic1 (required by the Kotlin/JS
+# plugin's downloaded Node binary, which runs webpack/Karma tooling).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openjdk-21-jdk-headless \
+        libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV PATH="$JAVA_HOME/bin:$PATH"
+
+# Expose Playwright's bundled Chromium at stable paths so Karma's
+# chrome-launcher finds it via CHROME_BIN or standard binary lookup.
+# The find resolves the version-suffixed directory (e.g. /ms-playwright/chromium-1134-...).
+RUN set -e; \
+    chromium_path=$(find /ms-playwright -path '*/chrome-linux/chrome' -type f 2>/dev/null | head -1); \
+    test -n "$chromium_path"; \
+    ln -sf "$chromium_path" /usr/bin/chromium; \
+    ln -sf "$chromium_path" /usr/bin/chromium-browser; \
+    ln -sf "$chromium_path" /usr/bin/google-chrome
+ENV CHROME_BIN=/usr/bin/chromium
+
+WORKDIR /work

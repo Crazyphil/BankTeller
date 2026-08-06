@@ -1,0 +1,23 @@
+# Build artifacts — copied into the image would waste ~640 MB and slow COPY.
+# The container's stage-1 `gradle:8.11-jdk21` rebuilds everything from source.
+build
+**/build
+.gradle
+**/.gradle
+kotlin-js-store/.cache
+
+# VCS and IDE
+.git
+.gitignore
+.idea
+.vscode
+*.iml
+
+# Local env / runtime
+.env
+*.log
+node_modules
+**/node_modules
+
+# Manual test artifacts
+openspec/changes/onboarding-enable-banking/manual-test-plan.md

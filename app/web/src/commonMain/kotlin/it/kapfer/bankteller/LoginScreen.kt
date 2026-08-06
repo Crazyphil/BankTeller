@@ -8,18 +8,24 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContentPadding
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 
@@ -33,6 +39,13 @@ import androidx.compose.ui.unit.dp
 fun LoginScreen(viewModel: AppViewModel) {
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+
+    val usernameFocusRequester = remember { FocusRequester() }
+    val passwordFocusRequester = remember { FocusRequester() }
+    // Auto-focus the username field so the user can start typing immediately
+    LaunchedEffect(Unit) {
+        usernameFocusRequester.requestFocus()
+    }
 
     Column(
         modifier = Modifier
@@ -54,7 +67,11 @@ fun LoginScreen(viewModel: AppViewModel) {
             onValueChange = { username = it },
             label = { Text("Username") },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+            keyboardActions = KeyboardActions(onNext = { passwordFocusRequester.requestFocus() }),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(usernameFocusRequester),
         )
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -65,7 +82,11 @@ fun LoginScreen(viewModel: AppViewModel) {
             label = { Text("Password") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { viewModel.login(username, password) }),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(passwordFocusRequester),
         )
 
         Spacer(modifier = Modifier.height(16.dp))

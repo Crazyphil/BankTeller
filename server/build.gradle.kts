@@ -24,8 +24,12 @@ dependencies {
     implementation(libs.ktor.serialization.kotlinx.json)
     implementation(libs.ktor.server.status.pages)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.bouncycastle.bcpkix)
+    implementation(libs.ktor.client.core.jvm)
+    implementation(libs.ktor.client.cio.jvm)
     testImplementation(libs.ktor.serverTestHost)
     testImplementation(libs.kotlin.testJunit)
+    testImplementation(libs.ktor.client.mock.jvm)
 }
 
 val generatedResourcesDir = layout.buildDirectory.dir("generated/resources")
@@ -45,4 +49,24 @@ sourceSets {
 
 tasks.named("processResources") {
     dependsOn("copyWebDist")
+}
+
+tasks.test {
+    // The EnableBankingClientIntegrationTest calls the real Enable Banking
+    // sandbox API (api.enablebanking.com). It is excluded from the default
+    // test run so the build stays hermetic (no network dependency for CI or
+    // offline development). This is a build-level exclusion (not a run-time
+    // self-skip): when the property is set, the test runs with NO @Ignore /
+    // Assume and hard-fails if the API is unreachable — per the spec's
+    // "no self-skip" rule.
+    //
+    // Sandbox credentials live in :server/src/test/resources/enable-banking-sandbox/
+    // (application_id.txt + private_key.pem, tasks 6.1 + 6.2).
+    //
+    // To run this test:
+    //   ./gradlew :server:test -PenableBankingIntegration
+    val enableIntegration = providers.gradleProperty("enableBankingIntegration").isPresent
+    if (!enableIntegration) {
+        exclude("**/EnableBankingClientIntegrationTest*")
+    }
 }

@@ -13,17 +13,25 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import it.kapfer.bankteller.enablebanking.EnableBankingClient
+import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
+import it.kapfer.bankteller.enablebanking.buildEnableBankingClient
+import it.kapfer.bankteller.onboarding.OnboardingService
+import it.kapfer.bankteller.onboarding.onboardingRoutes
 import it.kapfer.bankteller.server.*
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import org.slf4j.Logger
 
 fun main() {
-    embeddedServer(Netty, port = 8080, host = "0.0.0.0", module = Application::module)
+    embeddedServer(Netty, port = 8080, host = "0.0.0.0", module = { module() })
         .start(wait = true)
 }
 
-fun Application.module() {
+fun Application.module(
+    controlPlaneClient: EnableBankingControlPlaneClient = EnableBankingControlPlaneClient(),
+    enableBankingClientFactory: (() -> EnableBankingClient)? = null,
+) {
     val logger: Logger = LoggerFactory.getLogger(Application::class.java)
 
     // Initialize database
@@ -40,6 +48,19 @@ fun Application.module() {
     if (AuthService.isDefaultPassword()) {
         logger.warn("DEFAULT PASSWORD DETECTED: AUTH_PASSWORD is set to 'changeme'. Please change it in your .env file!")
     }
+
+    // Initialize onboarding service (uses injected controlPlaneClient + optional
+    // enableBankingClientFactory; defaults create real instances for production).
+    val onboardingService = OnboardingService(
+        database = database,
+        controlPlaneClient = controlPlaneClient,
+        enableBankingClientFactory = enableBankingClientFactory ?: { buildEnableBankingClient(database) },
+    )
+    // TODO: Close controlPlaneClient and any pooled EnableBankingClient instances
+    //       on server shutdown via a proper Closeable management hook. Ktor's
+    //       embeddedServer does not provide a built-in graceful shutdown hook,
+    //       but they can be managed via monitor.subscribe(ApplicationStopping) { ... }
+    //       or by wrapping the server in a use {} block.
 
     // Install XForwardedHeaders for proxy-aware IP resolution
     install(XForwardedHeaders)
@@ -84,6 +105,9 @@ fun Application.module() {
 
     // Configure routes
     routing {
+        // Onboarding routes (registered first so they are matched before the catch-all)
+        onboardingRoutes(onboardingService, controlPlaneClient)
+
         // API routes
         post("/api/login") {
             val ip = call.request.origin.remoteHost

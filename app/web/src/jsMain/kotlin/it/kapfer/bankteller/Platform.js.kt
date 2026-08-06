@@ -1,6 +1,8 @@
 package it.kapfer.bankteller
 
 import web.navigator.navigator
+import web.window.window
+import js.reflect.unsafeCast
 
 class JsPlatform : Platform {
     private val userAgent = navigator.userAgent
@@ -12,3 +14,7 @@ class JsPlatform : Platform {
 }
 
 actual fun getPlatform(): Platform = JsPlatform()
+
+actual fun getCurrentPathname(): String = window.location.pathname
+actual fun getCurrentSearch(): String = window.location.search
+actual fun openUrlInNewTab(url: String) { window.open(url = url, target = unsafeCast("_blank")) }
