@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Compose Multiplatform wasmJs/JS web frontend for BankTeller — the browser-delivered single-page application. Provides the login screen, a post-login welcome dashboard, session-aware routing (unauthenticated users are redirected to login; authenticated users cannot reach the login screen), a logout action, the onboarding gate shown when Enable Banking credentials are missing, invalid, or the application is inactive, and public routes (`/privacy`, `/terms`, `/enable-banking-callback`) rendered without the auth gate.
+
+## Requirements
 
 ### Requirement: Login screen
 The SPA SHALL present a login screen with username and password fields and a submit button. The login screen SHALL be the default route when no authenticated session exists.

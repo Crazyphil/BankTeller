@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+SQLite database infrastructure for BankTeller. The database is accessed through SQLDelight with the JDBC SQLite driver, runs in WAL journal mode with a busy timeout for safe concurrent access, and uses SQLDelight's migration framework for schema evolution. The `system_config` key/value table stores configuration such as the auto-generated JWT signing key.
+
+## Requirements
 
 ### Requirement: SQLite database with SQLDelight
 The system SHALL use SQLite as its database, accessed through SQLDelight with the JDBC SQLite driver. The database file SHALL be located at `/data/bankteller.db` inside the container.

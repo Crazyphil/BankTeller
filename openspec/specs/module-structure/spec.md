@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Gradle module layout and source conventions for BankTeller. The project is split into a single `:app:web` KMP module (wasmJs + JS browser targets with `binaries.executable()`), a `:core` module for shared domain logic, and a `:server` module for Ktor server code. The server serves static SPA assets from the classpath and falls back to `index.html` for unmatched routes (SPA routing).
+
+## Requirements
 
 ### Requirement: Merged web application module
 The system SHALL replace the `:app:shared` and `:app:webApp` Gradle modules with a single `:app:web` KMP module targeting wasmJs (browser) and JS (browser) with `binaries.executable()`.

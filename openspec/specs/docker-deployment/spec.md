@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Single-container Docker packaging for BankTeller. Provides a Dockerfile producing an image with the Ktor fat JAR, static SPA assets, and a JRE runtime; a `docker-compose.yml` with a persistent data volume; and a `.env` template for startup configuration.
+
+## Requirements
 
 ### Requirement: Dockerfile for single-container deployment
 The system SHALL provide a Dockerfile that produces a Docker image containing the Ktor fat JAR, static SPA assets, and a JRE runtime. The image SHALL be based on Eclipse Temurin JRE.

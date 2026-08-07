@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Username and password authentication for BankTeller. Users log in with credentials defined in the `.env` file; the server issues httpOnly, SameSite=Strict session cookies signed with HMAC-SHA256, validates sessions on protected routes, and rate-limits login attempts per client IP with proxy-aware resolution.
+
+## Requirements
 
 ### Requirement: Username and password authentication
 The system SHALL authenticate users against credentials defined in the `.env` file (`AUTH_USERNAME` and `AUTH_PASSWORD`). On first startup, the system SHALL hash the password with bcrypt and store the hash in the database. On subsequent starts, the system SHALL compare the `.env` password against the stored bcrypt hash.
