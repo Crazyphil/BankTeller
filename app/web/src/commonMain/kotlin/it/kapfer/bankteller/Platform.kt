@@ -14,3 +14,19 @@ expect fun getCurrentSearch(): String
 
 /** Opens [url] in a new browser tab (target = "_blank"). */
 expect fun openUrlInNewTab(url: String)
+
+/** Redirects the current browser tab to [url]. */
+expect fun redirectTo(url: String)
+
+/**
+ * Pre-scales an image [srcBytes] (PNG/JPEG bytes) to [dstWidth]x[dstHeight] using
+ * the browser's native canvas image smoothing (anti-aliased). Returns the scaled
+ * image as PNG bytes, or null on failure. On non-web targets, returns null.
+ */
+expect suspend fun preScaleImageBytes(srcBytes: ByteArray, dstWidth: Int, dstHeight: Int): ByteArray?
+
+/** Logs a message to the browser console (or stdout on non-web targets). */
+expect fun consoleLog(msg: String)
+
+/** Returns the browser's device pixel ratio (1, 2, 3, etc.). Returns 1 on non-web targets. */
+expect fun getDevicePixelRatio(): Int

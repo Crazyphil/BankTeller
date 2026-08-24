@@ -1300,4 +1300,97 @@ class OnboardingServiceTest {
         )
         assertTrue(secondStart is StartResult.Ok)
     }
+
+    // =====================================================================
+    // Task 1.7 — completeOnboarding persists refresh_token
+    // =====================================================================
+
+    @Test
+    fun `completeOnboarding persists application_id private_key and refresh_token`() = testWithCall { call ->
+        val db = createDatabase()
+        val engine = MockEngine { request ->
+            when {
+                request.url.toString().contains("getOobConfirmationCode") ->
+                    respond(
+                        content = """{"success": true}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("emailLinkSignin") ->
+                    respond(
+                        content = """{"idToken": "test-id-token", "refreshToken": "test-refresh-token"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"app_id": "app-001"}""",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val mockClient = object : EnableBankingClient(
+            DatabaseEnableBankingCredentialProvider(db)
+        ) {
+            override suspend fun verifyApplication() = ApplicationVerificationResult.Success(active = true)
+            override fun close() = Unit
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+        val startResult = service.startOnboarding(
+            email = "user@example.com",
+            ownerUsername = "admin",
+            call = call,
+        )
+        val state = (startResult as StartResult.Ok).state
+        service.handleCallback(state, "oob-123")
+        val result = service.completeOnboarding(
+            state = state,
+            ownerUsername = "admin",
+            environment = Environment.SANDBOX,
+            redirectUrl = "https://app.example.com/cb",
+        )
+        assertTrue(result is CompleteResult.Success)
+        // All three keys must be persisted: application_id, private_key, refresh_token.
+        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
+        assertEquals("app-001", appId)
+        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        assertNotNull(privateKey)
+        assertTrue(privateKey!!.isNotBlank())
+        val refreshToken = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        assertEquals("test-refresh-token", refreshToken)
+    }
+
+    // =====================================================================
+    // Task 1.8 — resetCredentials blanks refresh_token
+    // =====================================================================
+
+    @Test
+    fun `resetCredentials blanks all four keys including refresh token`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "refresh-xyz")
+        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
+        val service = createService(database = db)
+
+        service.resetCredentials()
+
+        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val refreshToken = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val previouslyActive = db.systemConfigQueries
+            .selectValue("enable_banking_previously_active")
+            .executeAsOneOrNull()
+        assertEquals("", appId)
+        assertEquals("", privateKey)
+        assertEquals("", refreshToken)
+        assertEquals("", previouslyActive)
+    }
 }

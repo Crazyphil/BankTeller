@@ -9,11 +9,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContentPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 
 /**
  * Callback screen rendered at the `/enable-banking-callback` public route.
@@ -28,6 +31,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun CallbackScreen() {
     val search = remember { getCurrentSearch() }
+    val isAuthFlow = search.contains("code=")
 
     Column(
         modifier = Modifier
@@ -37,8 +41,8 @@ fun CallbackScreen() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        if (search.contains("state=") && search.contains("oobCode=")) {
-            SuccessContent()
+        if (search.contains("state=") && (search.contains("oobCode=") || isAuthFlow)) {
+            SuccessContent(isAuthFlow)
         } else {
             ErrorContent()
         }
@@ -46,18 +50,34 @@ fun CallbackScreen() {
 }
 
 @Composable
-private fun SuccessContent() {
+private fun SuccessContent(isAuthFlow: Boolean) {
+    if (isAuthFlow) {
+        LaunchedEffect(Unit) {
+            delay(2000)
+            redirectTo("/")
+        }
+    }
+
     Text(
-        text = "Your login was received",
+        text = if (isAuthFlow) "Authorization complete" else "Your login was received",
         style = MaterialTheme.typography.headlineSmall,
     )
 
     Spacer(modifier = Modifier.height(12.dp))
 
     Text(
-        text = "Return to your original BankTeller tab to continue the onboarding setup.",
+        text = if (isAuthFlow) {
+            "Your bank account has been connected. You'll be redirected to BankTeller shortly."
+        } else {
+            "Return to your original BankTeller tab to continue the onboarding setup."
+        },
         style = MaterialTheme.typography.bodyMedium,
     )
+
+    if (isAuthFlow) {
+        Spacer(modifier = Modifier.height(24.dp))
+        CircularProgressIndicator()
+    }
 
     Spacer(modifier = Modifier.height(24.dp))
 

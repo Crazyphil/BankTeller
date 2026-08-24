@@ -63,6 +63,7 @@ data class OnboardingContext(
     val derivedRedirectUrl: String,
     var oobCode: String? = null,
     var cachedIdToken: String? = null,
+    var cachedRefreshToken: String? = null,
     var status: OnboardingStatus = OnboardingStatus.PENDING,
 )
 
@@ -254,6 +255,7 @@ class OnboardingService(
     fun resetCredentials() {
         database.systemConfigQueries.insertOrReplace("enable_banking_application_id", "")
         database.systemConfigQueries.insertOrReplace("enable_banking_private_key", "")
+        database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
         database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
         invalidateStatusCache()
     }
@@ -313,6 +315,7 @@ class OnboardingService(
         return when (val result = controlPlaneClient.emailLinkSignin(context.email, oobCode)) {
             is EmailLinkSigninResult.Ok -> {
                 context.cachedIdToken = result.idToken
+                context.cachedRefreshToken = result.refreshToken
                 context.status = OnboardingStatus.AUTH_VALIDATED
                 CallbackResult.Ok
             }
@@ -348,13 +351,17 @@ class OnboardingService(
 
         // --- Step 4: Email-link sign-in (or reuse cached idToken) ---
         val idToken: String
+        val refreshToken: String
         if (context.cachedIdToken != null) {
             idToken = context.cachedIdToken!!
+            refreshToken = context.cachedRefreshToken ?: ""
         } else {
             when (val result = controlPlaneClient.emailLinkSignin(context.email, context.oobCode!!)) {
                 is EmailLinkSigninResult.Ok -> {
                     idToken = result.idToken
+                    refreshToken = result.refreshToken
                     context.cachedIdToken = idToken
+                    context.cachedRefreshToken = refreshToken
                 }
                 is EmailLinkSigninResult.InvalidOobCode -> {
                     context.status = OnboardingStatus.FAILED
@@ -425,9 +432,10 @@ class OnboardingService(
             return CompleteResult.Error("Registration request failed: ${e.message}")
         }
 
-        // --- Step 9: Persist application ID + redirect URL ---
+        // --- Step 9: Persist application ID + redirect URL + refresh token ---
         database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
         database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
+        database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
 
         // --- Step 10: Invalidate cached status ---
         invalidateStatusCache()

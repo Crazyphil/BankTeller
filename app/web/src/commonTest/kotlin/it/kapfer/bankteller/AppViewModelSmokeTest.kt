@@ -20,13 +20,16 @@ class AppViewModelSmokeTest {
     }
 
     @Test
-    fun onboarding_step_enum_has_five_values() {
-        assertEquals(5, OnboardingStep.entries.size)
+    fun onboarding_step_enum_has_eight_values() {
+        assertEquals(8, OnboardingStep.entries.size)
         assertEquals(OnboardingStep.EmailEntry, OnboardingStep.entries[0])
         assertEquals(OnboardingStep.WaitingForAuthentication, OnboardingStep.entries[1])
         assertEquals(OnboardingStep.RegistrationReview, OnboardingStep.entries[2])
         assertEquals(OnboardingStep.Verifying, OnboardingStep.entries[3])
         assertEquals(OnboardingStep.ActivationGuide, OnboardingStep.entries[4])
+        assertEquals(OnboardingStep.BankSelection, OnboardingStep.entries[5])
+        assertEquals(OnboardingStep.LinkingProgress, OnboardingStep.entries[6])
+        assertEquals(OnboardingStep.AuthProgress, OnboardingStep.entries[7])
     }
 
     @Test

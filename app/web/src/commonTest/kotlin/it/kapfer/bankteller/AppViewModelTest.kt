@@ -573,6 +573,143 @@ class AppViewModelTest {
         assertEquals("SANDBOX", call.environment)
         assertNull(call.overrides)
     }
+
+    // ---------------------------------------------------------------
+    // Account linking & state endpoint tests (tasks 7.3, 8.2, 8.3, 9.2-9.5, 10.1)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun checkAuth_stateRequiresRelogin_routesToEmailEntry() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = true,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.EmailEntry, vm.onboardingStep)
+    }
+
+    @Test
+    fun checkAuth_stateAuthCompleted_routesToDashboard() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = null,
+            selectedBank = SelectedBank("TestBank", "FI", "personal")
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun checkAuth_stateLinkingCompleted_routesToLinkingProgress() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        val bank = SelectedBank("TestBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "Bank denied authorization",
+            selectedBank = bank
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        assertEquals(bank, vm.selectedBankFromState)
+        assertEquals("Bank denied authorization", vm.authError)
+    }
+
+    @Test
+    fun loadAspsps_success_updatesStateToLoaded() = runTest(testDispatcher) {
+        val bankList = listOf(Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L))
+        fakeApi.nextAspspsResult = AspspsResult.Ok(bankList)
+        vm.loadAspsps()
+        advanceUntilIdle()
+        val state = vm.aspspsState
+        assertTrue(state is AspspsState.Loaded)
+        assertEquals(bankList, state.aspsps)
+    }
+
+    @Test
+    fun linkAccounts_success_storesPsuIdHashAndAuthorizationUrl() = runTest(testDispatcher) {
+        val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth", "hash123")
+        vm.linkAccounts()
+        advanceUntilIdle()
+        assertEquals("hash123", vm.psuIdHash)
+        assertEquals("https://enablebanking.com/auth", vm.linkAuthorizationUrl)
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        // Check consuming link auth url
+        assertEquals("https://enablebanking.com/auth", vm.consumeLinkAuthorizationUrl())
+        assertNull(vm.linkAuthorizationUrl)
+    }
+
+    @Test
+    fun linkAccounts_error_setsLinkError() = runTest(testDispatcher) {
+        val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Error("Linking failed")
+        vm.linkAccounts()
+        advanceUntilIdle()
+        assertEquals("Linking failed", vm.linkError)
+    }
+
+    @Test
+    fun checkLinkStatus_linkedTrue_triggersStartAuth() = runTest(testDispatcher) {
+        val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        fakeApi.nextLinkStatus = true
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.checkLinkStatus()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("https://bank.com/sca", vm.authRedirectUrl)
+    }
+
+    @Test
+    fun checkLinkStatus_linkedFalse_setsLinkError() = runTest(testDispatcher) {
+        fakeApi.nextLinkStatus = false
+        vm.checkLinkStatus()
+        advanceUntilIdle()
+        assertNotNull(vm.linkError)
+        assertTrue(vm.linkError!!.contains("not been completed"))
+    }
+
+    @Test
+    fun continueToAuthorization_usesSelectedBankFromState() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        val bank = SelectedBank("TestBank", "FI", "business")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.continueToAuthorization()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("https://bank.com/sca", vm.authRedirectUrl)
+    }
 }
 
 /**
@@ -588,6 +725,18 @@ private class FakeApiClient : ApiClient() {
     var nextStartResult: StartResult = StartResult.Error("not configured")
     var nextCompleteResult: CompleteResult = CompleteResult(false, null, "not configured")
     var completeCallDelayMs: Long = 0L
+
+    var nextOnboardingState: OnboardingState? = null
+    var nextAspspsResult: AspspsResult = AspspsResult.Ok(emptyList())
+    var nextLinkAccountsResult: LinkAccountsResult = LinkAccountsResult.Error("not configured")
+    var nextStartAuthResult: StartAuthResult = StartAuthResult.Error("not configured")
+    var nextLinkStatus: Boolean? = null
+
+    override suspend fun getOnboardingState(): OnboardingState? = nextOnboardingState
+    override suspend fun getAspsps(): AspspsResult = nextAspspsResult
+    override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult = nextLinkAccountsResult
+    override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult = nextStartAuthResult
+    override suspend fun getLinkStatus(): Boolean? = nextLinkStatus
 
     /** Sequence of poll results; if `waitStatusRepeat` is true, the last value repeats. */
     var waitStatusSequence: List<WaitStatus> = emptyList()

@@ -20,7 +20,23 @@ import kotlinx.coroutines.launch
 enum class Screen { Login, Onboarding, Dashboard }
 
 /** Steps within the Enable Banking onboarding flow. */
-enum class OnboardingStep { EmailEntry, WaitingForAuthentication, RegistrationReview, Verifying, ActivationGuide }
+enum class OnboardingStep {
+    EmailEntry,
+    WaitingForAuthentication,
+    RegistrationReview,
+    Verifying,
+    ActivationGuide,
+    BankSelection,
+    LinkingProgress,
+    AuthProgress,
+}
+
+/** State for bank list fetching. */
+sealed class AspspsState {
+    data object Loading : AspspsState()
+    data class Loaded(val aspsps: List<Aspssp>) : AspspsState()
+    data class Error(val message: String) : AspspsState()
+}
 
 /**
  * Production-specific field overrides submitted during the final registration step.
@@ -90,6 +106,40 @@ class AppViewModel(
         private set
 
     var onboardingResultActive by mutableStateOf<Boolean?>(null)
+        private set
+
+    // ---------------------------------------------------------------
+    // Account Linking & Auth state
+    // ---------------------------------------------------------------
+
+    var aspspsState: AspspsState by mutableStateOf(AspspsState.Loading)
+        private set
+
+    var selectedAspsp: Aspssp? by mutableStateOf(null)
+        private set
+
+    var selectedPsuType: String by mutableStateOf("personal")
+        private set
+
+    var psuIdHash: String? by mutableStateOf(null)
+        private set
+
+    var linkAuthorizationUrl: String? by mutableStateOf(null)
+        private set
+
+    var linkError: String? by mutableStateOf(null)
+        private set
+
+    var linkStatusChecking: Boolean by mutableStateOf(false)
+        private set
+
+    var authError: String? by mutableStateOf(null)
+        private set
+
+    var selectedBankFromState: SelectedBank? by mutableStateOf(null)
+        private set
+
+    var authRedirectUrl: String? by mutableStateOf(null)
         private set
 
     // ---------------------------------------------------------------
@@ -200,20 +250,37 @@ class AppViewModel(
             currentScreen = Screen.Dashboard
             return
         }
-        when {
-            !status.enableBankingConfigured -> {
+        if (!status.enableBankingConfigured || (status.verified != null && !status.verified)) {
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.EmailEntry
+            return
+        }
+
+        val state = apiClient.getOnboardingState()
+        if (state != null) {
+            if (state.requiresRelogin) {
                 currentScreen = Screen.Onboarding
                 onboardingStep = OnboardingStep.EmailEntry
-            }
-            status.verified != null && !status.verified -> {
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.EmailEntry
-            }
-            status.active == true -> {
+            } else if (state.authCompleted) {
                 currentScreen = Screen.Dashboard
+            } else if (state.linkingCompleted) {
+                currentScreen = Screen.Onboarding
+                onboardingStep = OnboardingStep.LinkingProgress
+                selectedBankFromState = state.selectedBank
+                authError = state.authError
+            } else {
+                if (status.active == true) {
+                    currentScreen = Screen.Dashboard
+                } else {
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.ActivationGuide
+                }
             }
-            else -> {
-                // active is false or absent (absent → treat as unknown/false per spec)
+        } else {
+            // Fallback to status-only routing if state endpoint call returns null
+            if (status.active == true) {
+                currentScreen = Screen.Dashboard
+            } else {
                 currentScreen = Screen.Onboarding
                 onboardingStep = OnboardingStep.ActivationGuide
             }
@@ -367,6 +434,153 @@ class AppViewModel(
     }
 
     // ---------------------------------------------------------------
+    // Actions — bank selection, linking & auth
+    // ---------------------------------------------------------------
+
+    fun startBankSetup() {
+        onboardingStep = OnboardingStep.BankSelection
+        // Don't call loadAspsps() here — the BankSelectionStep composable's
+        // LaunchedEffect loads when it enters composition (if state is Loading).
+        // Calling it here too would fire two concurrent requests.
+    }
+
+    fun loadAspsps() {
+        aspspsState = AspspsState.Loading
+        viewModelScope.launch {
+            val result = apiClient.getAspsps()
+            aspspsState = when (result) {
+                is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
+                is AspspsResult.Error -> AspspsState.Error(result.message)
+            }
+        }
+    }
+
+    fun selectAspsp(aspsp: Aspssp) {
+        selectedAspsp = aspsp
+        if (aspsp.psuTypes.isNotEmpty() && !aspsp.psuTypes.contains(selectedPsuType)) {
+            selectedPsuType = aspsp.psuTypes.first()
+        }
+    }
+
+    fun selectPsuType(psuType: String) {
+        selectedPsuType = psuType
+    }
+
+    fun linkAccounts() {
+        val aspsp = selectedAspsp ?: run {
+            linkError = "No bank selected"
+            return
+        }
+        isLoading = true
+        linkError = null
+        viewModelScope.launch {
+            val result = apiClient.linkAccounts(aspsp.country, selectedPsuType, aspsp.name)
+            isLoading = false
+            when (result) {
+                is LinkAccountsResult.Ok -> {
+                    psuIdHash = result.psuIdHash
+                    linkAuthorizationUrl = result.authorizationUrl
+                    onboardingStep = OnboardingStep.LinkingProgress
+                }
+                is LinkAccountsResult.Error -> {
+                    linkError = result.message
+                }
+            }
+        }
+    }
+
+    fun relinkAccount() {
+        val bank = selectedBankFromState ?: run {
+            linkError = "Bank information missing."
+            return
+        }
+        isLoading = true
+        linkError = null
+        viewModelScope.launch {
+            val result = apiClient.linkAccounts(bank.aspspCountry, bank.psuType, bank.aspspName)
+            isLoading = false
+            when (result) {
+                is LinkAccountsResult.Ok -> {
+                    linkAuthorizationUrl = result.authorizationUrl
+                }
+                is LinkAccountsResult.Error -> {
+                    linkError = result.message
+                }
+            }
+        }
+    }
+
+    fun cancelLinking() {
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+            // Reset all linking-related state
+            psuIdHash = null
+            linkAuthorizationUrl = null
+            linkError = null
+            linkStatusChecking = false
+            selectedBankFromState = null
+            selectedAspsp = null
+            selectedPsuType = "personal"
+            authError = null
+            onboardingStep = OnboardingStep.BankSelection
+        }
+    }
+
+    fun consumeLinkAuthorizationUrl(): String? {
+        val url = linkAuthorizationUrl
+        linkAuthorizationUrl = null
+        return url
+    }
+
+    fun consumeAuthRedirectUrl(): String? {
+        val url = authRedirectUrl
+        authRedirectUrl = null
+        return url
+    }
+
+    fun checkLinkStatus() {
+        linkStatusChecking = true
+        linkError = null
+        viewModelScope.launch {
+            val linked = apiClient.getLinkStatus()
+            linkStatusChecking = false
+            if (linked == true) {
+                val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
+                val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
+                val psuType = selectedPsuType.ifEmpty { selectedBankFromState?.psuType ?: "personal" }
+                if (aspspName != null && aspspCountry != null) {
+                    startAuth(aspspName, aspspCountry, psuType)
+                } else {
+                    linkError = "Bank information missing."
+                }
+            } else if (linked == false) {
+                linkError = "Account linking has not been completed yet. Please finish linking in the other tab and try again."
+            } else {
+                linkError = "Failed to check link status. Please try again."
+            }
+        }
+    }
+
+    fun startAuth(aspspName: String, aspspCountry: String, psuType: String) {
+        isLoading = true
+        linkError = null
+        authError = null
+        viewModelScope.launch {
+            val result = apiClient.startAuth(aspspName, aspspCountry, psuType)
+            isLoading = false
+            when (result) {
+                is StartAuthResult.Ok -> {
+                    authRedirectUrl = result.url
+                    onboardingStep = OnboardingStep.AuthProgress
+                }
+                is StartAuthResult.Error -> {
+                    linkError = result.message
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------
 
@@ -378,6 +592,16 @@ class AppViewModel(
         onboardingError = null
         onboardingIsVerifying = false
         onboardingResultActive = null
+        aspspsState = AspspsState.Loading
+        selectedAspsp = null
+        selectedPsuType = "personal"
+        psuIdHash = null
+        linkAuthorizationUrl = null
+        linkError = null
+        linkStatusChecking = false
+        authError = null
+        selectedBankFromState = null
+        authRedirectUrl = null
     }
 
     /**

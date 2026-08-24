@@ -249,6 +249,260 @@ open class ApiClient {
         }
     }
 
+    open suspend fun getOnboardingState(): OnboardingState? {
+        try {
+            val response = client.get("/api/onboarding/state")
+            if (response.status.value == 200) {
+                val body = response.bodyAsText()
+                val requiresRelogin = extractJsonBool(body, "requires_relogin") ?: false
+                val linkingCompleted = extractJsonBool(body, "linking_completed") ?: false
+                val authCompleted = extractJsonBool(body, "auth_completed") ?: false
+                val authError = extractJsonStringOrNull(body, "auth_error")
+                
+                val bankObjJson = extractJsonObject(body, "selected_bank")
+                val selectedBank = bankObjJson?.let {
+                    val name = extractJsonString(it, "aspsp_name")
+                    val country = extractJsonString(it, "aspsp_country")
+                    val psuType = extractJsonString(it, "psu_type")
+                    if (name.isNotEmpty() && country.isNotEmpty() && psuType.isNotEmpty()) {
+                        SelectedBank(aspspName = name, aspspCountry = country, psuType = psuType)
+                    } else null
+                }
+                return OnboardingState(requiresRelogin, linkingCompleted, authCompleted, authError, selectedBank)
+            }
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    open suspend fun getAspsps(): AspspsResult {
+        try {
+            val response = client.get("/api/aspsps")
+            val body = response.bodyAsText()
+            if (response.status.value == 200) {
+                val aspsps = parseAspspArray(body)
+                return AspspsResult.Ok(aspsps)
+            }
+            val errorMsg = extractJsonString(body, "error").ifEmpty { "Server returned ${response.status.value}" }
+            return AspspsResult.Error(errorMsg)
+        } catch (e: Exception) {
+            return AspspsResult.Error("Network error: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    open suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult {
+        try {
+            val response = client.post("/api/link-accounts") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"country":"${escapeJsonString(country)}","psu_type":"${escapeJsonString(psuType)}","aspsp_name":"${escapeJsonString(aspspName)}"}""")
+            }
+            val body = response.bodyAsText()
+            if (response.status.value == 200) {
+                val authUrl = extractJsonString(body, "authorization_url")
+                val psuIdHash = extractJsonString(body, "psu_id_hash")
+                if (authUrl.isNotEmpty() && psuIdHash.isNotEmpty()) {
+                    return LinkAccountsResult.Ok(authUrl, psuIdHash)
+                }
+                return LinkAccountsResult.Error("Invalid response from server")
+            }
+            val errorMsg = extractJsonString(body, "error").ifEmpty { "Server returned ${response.status.value}" }
+            return LinkAccountsResult.Error(errorMsg)
+        } catch (e: Exception) {
+            return LinkAccountsResult.Error("Network error: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    open suspend fun cancelLinking(): Boolean {
+        return try {
+            val response = client.post("/api/onboarding/cancel-linking")
+            response.status.value == 200
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    open suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult {
+        try {
+            val response = client.post("/api/auth") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"aspsp_name":"${escapeJsonString(aspspName)}","aspsp_country":"${escapeJsonString(aspspCountry)}","psu_type":"${escapeJsonString(psuType)}"}""")
+            }
+            val body = response.bodyAsText()
+            if (response.status.value == 200) {
+                val url = extractJsonString(body, "url")
+                if (url.isNotEmpty()) {
+                    return StartAuthResult.Ok(url)
+                }
+                return StartAuthResult.Error("Invalid response from server")
+            }
+            val errorMsg = extractJsonString(body, "error").ifEmpty { "Server returned ${response.status.value}" }
+            return StartAuthResult.Error(errorMsg)
+        } catch (e: Exception) {
+            return StartAuthResult.Error("Network error: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    open suspend fun getLinkStatus(): Boolean? {
+        try {
+            val response = client.get("/api/onboarding/link-status")
+            if (response.status.value == 200) {
+                return extractJsonBool(response.bodyAsText(), "linked")
+            }
+            return null
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun extractJsonStringOrNull(json: String, field: String): String? {
+        val key = "\"${field}\":"
+        val start = json.indexOf(key)
+        if (start < 0) return null
+        val remainder = json.substring(start + key.length).trimStart()
+        if (remainder.startsWith("null")) return null
+        if (!remainder.startsWith("\"")) return null
+        return extractJsonString(json, field)
+    }
+
+    private fun extractJsonObject(json: String, field: String): String? {
+        val key = "\"${field}\":"
+        val start = json.indexOf(key)
+        if (start < 0) return null
+        val remainder = json.substring(start + key.length).trimStart()
+        if (remainder.startsWith("null")) return null
+        if (!remainder.startsWith("{")) return null
+        
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        for (i in remainder.indices) {
+            val c = remainder[i]
+            if (inString) {
+                if (isEscaped) {
+                    isEscaped = false
+                } else if (c == '\\') {
+                    isEscaped = true
+                } else if (c == '"') {
+                    inString = false
+                }
+            } else {
+                if (c == '"') {
+                    inString = true
+                } else if (c == '{') {
+                    depth++
+                } else if (c == '}') {
+                    depth--
+                    if (depth == 0) {
+                        return remainder.substring(0, i + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun parseAspspArray(json: String): List<Aspssp> {
+        val result = mutableListOf<Aspssp>()
+        val trimmed = json.trim()
+        if (!trimmed.startsWith("[")) return emptyList()
+        
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        var objectStart = -1
+        
+        for (i in trimmed.indices) {
+            val c = trimmed[i]
+            if (inString) {
+                if (isEscaped) {
+                    isEscaped = false
+                } else if (c == '\\') {
+                    isEscaped = true
+                } else if (c == '"') {
+                    inString = false
+                }
+            } else {
+                if (c == '"') {
+                    inString = true
+                } else if (c == '{') {
+                    if (depth == 0) {
+                        objectStart = i
+                    }
+                    depth++
+                } else if (c == '}') {
+                    depth--
+                    if (depth == 0 && objectStart != -1) {
+                        val objJson = trimmed.substring(objectStart, i + 1)
+                        val aspsp = parseAspspObject(objJson)
+                        if (aspsp != null) {
+                            result.add(aspsp)
+                        }
+                        objectStart = -1
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private fun parseAspspObject(json: String): Aspssp? {
+        val name = extractJsonString(json, "name")
+        val country = extractJsonString(json, "country")
+        if (name.isEmpty() || country.isEmpty()) return null
+        val bic = extractJsonString(json, "bic").ifEmpty { null }
+        val logo = extractJsonString(json, "logo").ifEmpty { null }
+        val psuTypes = extractStringList(json, "psu_types")
+        val maxValidity = extractJsonLong(json, "maximum_consent_validity")
+        return Aspssp(name, country, bic, logo, psuTypes, maxValidity)
+    }
+
+    private fun extractStringList(json: String, field: String): List<String> {
+        val key = "\"${field}\":"
+        val start = json.indexOf(key)
+        if (start < 0) return emptyList()
+        val remainder = json.substring(start + key.length).trimStart()
+        if (!remainder.startsWith("[")) return emptyList()
+        
+        val listEnd = remainder.indexOf(']')
+        if (listEnd < 0) return emptyList()
+        val arrayContent = remainder.substring(0, listEnd + 1)
+        
+        val result = mutableListOf<String>()
+        var i = 0
+        while (i < arrayContent.length) {
+            if (arrayContent[i] == '"') {
+                val sb = StringBuilder()
+                i++
+                while (i < arrayContent.length) {
+                    val c = arrayContent[i]
+                    if (c == '\\' && i + 1 < arrayContent.length) {
+                        sb.append(arrayContent[i + 1])
+                        i += 2
+                    } else if (c == '"') {
+                        result.add(sb.toString())
+                        break
+                    } else {
+                        sb.append(c)
+                        i++
+                    }
+                }
+            }
+            i++
+        }
+        return result
+    }
+
+    private fun extractJsonLong(json: String, field: String): Long? {
+        val key = "\"${field}\":"
+        val start = json.indexOf(key)
+        if (start < 0) return null
+        val remainder = json.substring(start + key.length).trimStart()
+        if (remainder.startsWith("null")) return null
+        val numStr = remainder.takeWhile { it.isDigit() || it == '-' }
+        return numStr.toLongOrNull()
+    }
+
     /**
      * Builds the JSON body for the complete-onboarding request.
      * Uses string interpolation matching the existing hand-rolled JSON pattern.
@@ -314,4 +568,48 @@ sealed class LoginResult {
 sealed class AuthState {
     data class Authenticated(val username: String) : AuthState()
     data object Unauthenticated : AuthState()
+}
+
+/** Detailed onboarding state returned by GET /api/onboarding/state. */
+data class OnboardingState(
+    val requiresRelogin: Boolean,
+    val linkingCompleted: Boolean,
+    val authCompleted: Boolean,
+    val authError: String?,
+    val selectedBank: SelectedBank?
+)
+
+/** Selected bank details inside the onboarding state. */
+data class SelectedBank(
+    val aspspName: String,
+    val aspspCountry: String,
+    val psuType: String
+)
+
+/** ASPSP bank information. */
+data class Aspssp(
+    val name: String,
+    val country: String,
+    val bic: String?,
+    val logo: String?,
+    val psuTypes: List<String>,
+    val maximumConsentValidity: Long?
+)
+
+/** Result of fetching the ASPSPs list. */
+sealed class AspspsResult {
+    data class Ok(val aspsps: List<Aspssp>) : AspspsResult()
+    data class Error(val message: String) : AspspsResult()
+}
+
+/** Result of the account linking request. */
+sealed class LinkAccountsResult {
+    data class Ok(val authorizationUrl: String, val psuIdHash: String) : LinkAccountsResult()
+    data class Error(val message: String) : LinkAccountsResult()
+}
+
+/** Result of initiating the session auth redirect. */
+sealed class StartAuthResult {
+    data class Ok(val url: String) : StartAuthResult()
+    data class Error(val message: String) : StartAuthResult()
 }

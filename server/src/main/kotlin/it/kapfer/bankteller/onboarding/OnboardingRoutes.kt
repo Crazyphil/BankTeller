@@ -6,10 +6,14 @@ import io.ktor.server.response.*
 import io.ktor.server.request.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
+import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.Environment
 import it.kapfer.bankteller.server.UserSession
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -50,21 +54,89 @@ data class ProductionFieldOverridesBody(
 fun Route.onboardingRoutes(
     service: OnboardingService,
     controlPlaneClient: EnableBankingControlPlaneClient, // retained for future use
+    enableBankingClientFactory: (() -> EnableBankingClient)? = null,
+    stateJwt: StateJwt? = null,
 ) {
     // -----------------------------------------------------------------------
     // Unauthenticated routes (not under /api/, so SessionAuth does not apply)
     // -----------------------------------------------------------------------
 
-    // 5.5 — Enable Banking OOB callback (unauthenticated).
-    // oobCode capture happens server-side synchronously BEFORE the SPA bundle is
-    // served (design D14 + task 5.5). The SPA bundle is always served (200 OK)
-    // so the SPA can render a styled CallbackScreen; the oobCode is already
-    // persisted by the time the bundle loads.
+    // 5.5 — Enable Banking callback (unauthenticated).
+    // Handles two kinds of redirects (design D2):
+    //  - Email-link callback (`oobCode` + `state`): possibly a different device,
+    //    NO session cookie expected. oobCode capture happens server-side
+    //    synchronously BEFORE the SPA bundle is served.
+    //  - Auth callback (`code` + `state`, no `oobCode`): same browser tab, so the
+    //    session cookie IS expected. Missing/invalid cookie → 302 to the
+    //    BankTeller login page, discarding the single-use `code`. On valid
+    //    session the code is exchanged via authorizeSession; the result is
+    //    stored in the user session (session_id + accounts[] on success,
+    //    auth_error on failure) before the SPA bundle is served.
     get("/enable-banking-callback") {
         val state = call.request.queryParameters["state"]
         val oobCode = call.request.queryParameters["oobCode"]
-        service.handleCallback(state, oobCode) // captures oobCode as side-effect
-        serveSpaBundle(call)
+        val code = call.request.queryParameters["code"]
+
+        when {
+            // Email-link flow — no session cookie required (regression path, 6.11)
+            oobCode != null -> {
+                service.handleCallback(state, oobCode) // captures oobCode as side-effect
+                serveSpaBundle(call)
+            }
+
+            // Auth flow — session cookie required (same-tab redirect)
+            code != null -> {
+                val session = call.sessions.get<UserSession>()
+                if (session == null) {
+                    // 302 redirect to the BankTeller login page (username/password —
+                    // not the EB email-link flow). The code is single-use and
+                    // time-limited, so it is discarded; the SPA resumes via
+                    // GET /api/onboarding/state after re-login.
+                    call.respondRedirect("/")
+                    return@get
+                }
+
+                // Decode the state JWT and bind it to this session.
+                val sessionId = state?.let { stateJwt?.verify(it) }
+                if (sessionId == null || sessionId != session.username) {
+                    call.sessions.set(session.copy(authError = "State mismatch — please retry the authorization"))
+                    serveSpaBundle(call)
+                    return@get
+                }
+
+                val client = enableBankingClientFactory?.invoke()
+                if (client == null) {
+                    call.sessions.set(session.copy(authError = "Technical error"))
+                    serveSpaBundle(call)
+                    return@get
+                }
+                try {
+                    when (val result = client.authorizeSession(code)) {
+                        is AuthorizeSessionResult.Ok -> {
+                            // Success — clear any stored auth_error (belt-and-suspenders;
+                            // POST /api/auth already clears it) and store the session.
+                            call.sessions.set(session.copy(
+                                ebSessionId = result.sessionId,
+                                accountsJson = Json.encodeToString(result.accounts),
+                                authError = null,
+                            ))
+                        }
+                        is AuthorizeSessionResult.Error -> {
+                            call.sessions.set(session.copy(authError = result.message))
+                        }
+                    }
+                } finally {
+                    client.close()
+                }
+                serveSpaBundle(call)
+            }
+
+            // Neither param — preserve the previous missing-oobCode behavior
+            else -> {
+                service.handleCallback(state, null)
+                serveSpaBundle(call)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
