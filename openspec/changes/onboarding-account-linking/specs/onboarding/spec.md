@@ -16,7 +16,7 @@ The `oobCode` capture and `emailLinkSignin` SHALL happen server-side synchronous
 #### Scenario: Auth callback received with valid session
 - **WHEN** the callback route receives a request with `code` and `state` (no `oobCode`) and a valid session cookie
 - **THEN** it decodes the `state` JWT to get the session ID, calls `authorizeSession(code)` to exchange the code for a session, stores the `session_id` and `accounts[]`, and serves the SPA bundle
-- **AND** the SPA transitions to the dashboard on success
+- **AND** the SPA shows an "Authorization complete" screen, then redirects to `/` after a brief delay, loading the main app which transitions to the dashboard
 
 #### Scenario: Auth callback received without session cookie
 - **WHEN** the callback route receives a request with `code` and `state` (no `oobCode`) but no valid session cookie
@@ -115,18 +115,18 @@ The SPA SHALL update the `ActivationGuide` step (shown after registration, befor
 ## ADDED Requirements
 
 ### Requirement: Bank listing endpoint
-The system SHALL expose an authenticated `GET /api/aspsps` endpoint that proxies to the Enable Banking data-plane `GET /aspsps` (RS256 JWT auth — no Firebase token needed). The endpoint SHALL accept **no query parameters** — all ASPSPs are fetched and returned **unfiltered**; filtering (by search text, country, PSU type) is performed client-side in the SPA. The endpoint SHALL require a valid BankTeller session cookie. On success, it SHALL return a JSON array of banks, each with `name`, `country`, `bic`, `logo`, `psu_types`, and `maximum_consent_validity` (seconds — used later to compute the maximum `valid_until` for `POST /auth`). Banks are identified by the `{name, country}` pair — the Enable Banking API has no ASPSP UID. On data-plane API error, it SHALL return a structured error. If Enable Banking credentials are not configured (`application_id` or `private_key` missing from `system_config`), it SHALL return a 503 error.
+The system SHALL expose an authenticated `GET /api/aspsps` endpoint that proxies to the Enable Banking **control-plane** `GET https://enablebanking.com/api/aspsps` (Firebase idToken auth — requires the persisted `refreshToken`, same auth as `/api/applications` and `/api/link_accounts`). The control-plane endpoint is used rather than the data-plane `GET /aspsps` (application RS256 JWT) because the data-plane endpoint returns `403 "Application is not active"` for an inactive production app — i.e. before the first account link — whereas the control-plane endpoint works for inactive apps. The endpoint SHALL accept **no query parameters** — all ASPSPs are fetched and returned **unfiltered**; filtering (by search text, country, PSU type) is performed client-side in the SPA. The endpoint SHALL require a valid BankTeller session cookie. The server SHALL read the `refreshToken` from `system_config`, call `refreshIdToken(refreshToken)` to obtain a fresh idToken, and call `EnableBankingControlPlaneClient.getAspsps(idToken)`. On success, it SHALL return a JSON array of banks, each with `name`, `country`, `bic`, `logo`, `psu_types`, and `maximum_consent_validity` (seconds — used later to compute the maximum `valid_until` for `POST /auth`). Banks are identified by the `{name, country}` pair — the Enable Banking API has no ASPSP UID. On control-plane API error (including non-200 from `refreshIdToken`), it SHALL return a structured error. If the `refreshToken` is not configured in `system_config`, it SHALL return a 500 error.
 
 #### Scenario: List all banks without server-side filters
 - **WHEN** `GET /api/aspsps` is called without query parameters
-- **THEN** the endpoint calls `EnableBankingClient.getAspsps()` and returns the full bank list, including `maximum_consent_validity` for each bank
+- **THEN** the endpoint calls `EnableBankingControlPlaneClient.getAspsps(idToken)` (control-plane, Firebase idToken auth) and returns the full bank list, including `maximum_consent_validity` for each bank
 
-#### Scenario: Credentials not configured
-- **WHEN** `GET /api/aspsps` is called but `enable_banking_application_id` or `enable_banking_private_key` is missing
-- **THEN** a 503 error is returned
+#### Scenario: Refresh token not configured
+- **WHEN** `GET /api/aspsps` is called but `enable_banking_refresh_token` is missing from `system_config`
+- **THEN** a 500 error is returned
 
 #### Scenario: Enable Banking API error
-- **WHEN** the data-plane API returns a non-200 status
+- **WHEN** the control-plane API returns a non-200 status
 - **THEN** a structured error is returned with the status code and message
 
 #### Scenario: Session required
@@ -172,15 +172,26 @@ The system SHALL expose an authenticated `POST /api/auth` endpoint that proxies 
 - **THEN** a 401 error is returned
 
 ### Requirement: Link-completion check endpoint
-The system SHALL expose an authenticated `GET /api/onboarding/link-status` endpoint that checks the Enable Banking control-plane `GET /application` (Firebase idToken auth — requires the persisted `refreshToken`) to detect link completion. The endpoint SHALL require a valid BankTeller session cookie. The server SHALL read the `psu_id_hash` (stored from the `POST /api/link-accounts` response), call `refreshIdToken` to obtain a fresh idToken, call `EnableBankingControlPlaneClient.getApplication`, and inspect `whitelisted_accounts[]` for an entry whose `identification_hash` matches the `psu_id_hash`. On match, the endpoint SHALL return `{ "linked": true }`. On no match, it SHALL return `{ "linked": false }`. This is a **single on-demand check** triggered by the user clicking a button in the SPA — it is **not** a polling endpoint and the server SHALL NOT implement polling, backoff, or timeouts.
+The system SHALL expose an authenticated `GET /api/onboarding/link-status` endpoint that checks the Enable Banking control-plane `GET /application` (Firebase idToken auth — requires the persisted `refreshToken`) to detect link completion. The endpoint SHALL require a valid BankTeller session cookie. The server SHALL read the `psu_id_hash` (stored from the `POST /api/link-accounts` response), call `refreshIdToken` to obtain a fresh idToken, call `EnableBankingControlPlaneClient.getApplication` (which calls `GET https://enablebanking.com/api/applications` — plural, returning a JSON array of all applications, matched by `kid` against the stored `application_id`), and inspect `whitelisted_accounts[]` for an entry whose `aspsp.name` and `aspsp.country` match the `aspsp_name` and `aspsp_country` stored in the user session from the prior `POST /api/link-accounts` call. The `identification_hash` field in `whitelisted_accounts` identifies the account (not the PSU) and cannot be matched against `psu_id_hash` — the ASPSP name/country match is a heuristic to verify the entry belongs to the current linking flow. On match, the endpoint SHALL return `{ "linked": true }`. On no match, it SHALL return `{ "linked": false }`. This is a **single on-demand check** triggered by the user clicking a button in the SPA — it is **not** a polling endpoint and the server SHALL NOT implement polling, backoff, or timeouts.
 
 #### Scenario: Link completed
-- **WHEN** `GET /api/onboarding/link-status` is called and the `psu_id_hash` is found in `whitelisted_accounts[].identification_hash`
+- **WHEN** `GET /api/onboarding/link-status` is called and a `whitelisted_accounts` entry matches the session's `aspsp_name` and `aspsp_country`
 - **THEN** `{ "linked": true }` is returned
 
 #### Scenario: Link not yet completed
-- **WHEN** `GET /api/onboarding/link-status` is called and the `psu_id_hash` is not yet in `whitelisted_accounts`
+- **WHEN** `GET /api/onboarding/link-status` is called and no `whitelisted_accounts` entry matches the session's `aspsp_name` and `aspsp_country`
 - **THEN** `{ "linked": false }` is returned
+
+#### Scenario: Session required
+- **WHEN** the endpoint is called without a valid session cookie
+- **THEN** a 401 error is returned
+
+### Requirement: Cancel-linking endpoint
+The system SHALL expose an authenticated `POST /api/onboarding/cancel-linking` endpoint that clears the linking-related fields (`psu_id_hash`, `aspsp_name`, `aspsp_country`, `psu_type`, `auth_error`) from the user session so the user can return to the bank list and start over with a different bank. The endpoint SHALL require a valid BankTeller session cookie.
+
+#### Scenario: Cancel clears linking state
+- **WHEN** `POST /api/onboarding/cancel-linking` is called with a valid session
+- **THEN** the linking-related fields are cleared from the user session and `{ "success": true }` is returned
 
 #### Scenario: Session required
 - **WHEN** the endpoint is called without a valid session cookie
@@ -233,9 +244,9 @@ The SPA SHALL add a `BankSelection` screen to the onboarding flow (after `Activa
 - **THEN** a styled error state is shown with a retry option
 
 ### Requirement: SPA LinkingProgress step
-The SPA SHALL add a `LinkingProgress` screen to the onboarding flow (after `BankSelection`). After `POST /api/link-accounts` returns `authorization_url` and `psu_id_hash`, the SPA SHALL store the `psu_id_hash` in viewmodel state, open `authorization_url` in a **new browser tab** (the Enable Banking control panel), and show an explanatory message in the original tab instructing the user to complete linking in the other tab, then click "I've completed linking, authorize now". **No background polling.** When the button is clicked, the SPA SHALL call `GET /api/onboarding/link-status` **once** (a single on-demand check). On `linked: true`, the SPA SHALL transition to `AuthProgress`. On `linked: false`, the SPA SHALL show an error and let the user retry the check or re-initiate linking.
+The SPA SHALL add a `LinkingProgress` screen to the onboarding flow (after `BankSelection`). After `POST /api/link-accounts` returns `authorization_url` and `psu_id_hash`, the SPA SHALL store the `psu_id_hash` in viewmodel state and show an explanatory message with an "Open linking page" button that the user clicks to open `authorization_url` in a **new browser tab** (the Enable Banking control panel). After completing linking in the other tab, the user closes that tab and returns to BankTeller, then clicks "I've completed linking, authorize now". **No background polling.** When the button is clicked, the SPA SHALL call `GET /api/onboarding/link-status` **once** (a single on-demand check). On `linked: true`, the SPA SHALL transition to `AuthProgress`. On `linked: false`, the SPA SHALL show an error and let the user retry the check or re-initiate linking.
 
-The LinkingProgress screen SHALL also serve as the **resume point** when the SPA loads and `GET /api/onboarding/state` returns `(requires_relogin=false, linking_completed=true, auth_completed=false)`. This covers two cases: (a) the user opened a new tab while the original tab was at the bank's SCA page — the new tab shows the LinkingProgress screen with a "Continue to authorization" button so the user can re-initiate auth; (b) the auth callback failed (invalid code, bank denied, technical error) — the SPA shows the LinkingProgress screen with the `auth_error` message from the state endpoint and a "Continue to authorization" retry button. In both cases, clicking the button triggers `POST /api/auth` to start a fresh authorization, passing the `selected_bank` fields (`aspsp_name`, `aspsp_country`, `psu_type`) from the state endpoint response as the request body — the SPA does not have this info in viewmodel state after a reload. The server **clears `auth_error` from the user session at the start of that request**, so the error is shown exactly once and does not follow the user into the new attempt or appear in a subsequently opened tab. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message, primary `Button`, error `Text` on failure).
+The LinkingProgress screen SHALL also serve as the **resume point** when the SPA loads and `GET /api/onboarding/state` returns `(requires_relogin=false, linking_completed=true, auth_completed=false)`. This covers two cases: (a) the user opened a new tab while the original tab was at the bank's SCA page — the new tab shows the LinkingProgress screen with a "Continue to authorization" button so the user can re-initiate auth; (b) the auth callback failed (invalid code, bank denied, technical error) — the SPA shows the LinkingProgress screen with the `auth_error` message from the state endpoint and a "Continue to authorization" retry button. In both cases, clicking the button triggers `GET /api/onboarding/link-status` to verify linking was completed. On `linked: true`, the SPA then calls `POST /api/auth` to start a fresh authorization, passing the `selected_bank` fields (`aspsp_name`, `aspsp_country`, `psu_type`) from the state endpoint response as the request body. On `linked: false`, the SPA shows an error and offers a "Re-open linking tab" button to re-initiate linking. — the SPA does not have this info in viewmodel state after a reload. The server **clears `auth_error` from the user session at the start of that request**, so the error is shown exactly once and does not follow the user into the new attempt or appear in a subsequently opened tab. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message, primary `Button`, error `Text` on failure).
 
 #### Scenario: Open linking URL in a new tab
 - **WHEN** `POST /api/link-accounts` returns `authorization_url`
@@ -258,7 +269,7 @@ The LinkingProgress screen SHALL also serve as the **resume point** when the SPA
 - **THEN** the SPA shows the LinkingProgress screen with the error message (e.g. "Bank denied the authorization", "Invalid or expired code", "Technical error") and a "Continue to authorization" retry button
 
 ### Requirement: SPA AuthProgress step
-The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `LinkingProgress`). The screen SHALL trigger `POST /api/auth`, redirect the **current tab** (not a new tab) to the returned `authorization_url` (bank SCA for session), and on return (callback with `code`+`state`, processed server-side) check the callback result. If session authorization succeeded, the SPA SHALL forward to the existing dashboard (unchanged, out of scope for this change). On callback errors (invalid code, state mismatch, authorization failure), the SPA SHALL show the LinkingProgress screen with the error message and a "Continue to authorization" retry button (via the `GET /api/onboarding/state` resume flow). The missing-session-cookie case is handled server-side by a 302 redirect to login — the SPA does not render an error screen for it. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message; the redirect happens automatically on entering this step).
+The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `LinkingProgress`). The screen SHALL show a consent preview explaining what the bank's consent page will ask for (accounts, balances, transactions), and a "Continue to your bank" button that triggers `POST /api/auth` and redirects the **current tab** (not a new tab) to the returned `url` (bank SCA for session). On return (callback with `code`+`state`, processed server-side) the SPA checks the callback result. If session authorization succeeded, the SPA SHALL forward to the existing dashboard (unchanged, out of scope for this change). On callback errors (invalid code, state mismatch, authorization failure), the SPA SHALL show the LinkingProgress screen with the error message and a "Continue to authorization" retry button (via the `GET /api/onboarding/state` resume flow). The missing-session-cookie case is handled server-side by a 302 redirect to login — the SPA does not render an error screen for it. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message; the redirect happens on user button click, not automatically).
 
 #### Scenario: Redirect current tab to bank SCA for session
 - **WHEN** `POST /api/auth` returns `authorization_url`
