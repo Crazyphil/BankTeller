@@ -108,7 +108,7 @@ The system SHALL bundle Fraunces Variable and Inter Variable as WOFF2 files in `
 - **THEN** `<link rel="preload">` tags reference the Fraunces, Inter, and JetBrains Mono WOFF2 files
 
 ### Requirement: ScreenShell layout component
-The system SHALL provide a `ScreenShell` composable in `ui/components/ScreenShell.kt` that wraps screen content. It SHALL apply `fillMaxSize()`, `safeContentPadding()`, horizontal centering, and `widthIn(max = maxWidth)` where `maxWidth` defaults to `Dimens.contentMaxWidth` (720dp). It SHALL accept an optional `maxWidth` parameter so forms can use `Dimens.formMaxWidth` (400dp). It SHALL replace the duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate across all screens.
+The system SHALL provide a `ScreenShell` composable in `ui/components/ScreenShell.kt` that wraps screen content. It SHALL apply `fillMaxSize()`, `safeContentPadding()`, horizontal centering, and `widthIn(max = maxWidth)` where `maxWidth` defaults to `Dimens.contentMaxWidth` (720dp). It SHALL accept an optional `maxWidth` parameter so forms can use `Dimens.formMaxWidth` (400dp). It SHALL accept an optional `topBar: @Composable () -> Unit` parameter (default empty) — when provided, the top bar is rendered at the top of the Column above the content. It SHALL accept `verticalArrangement: Arrangement.Vertical` (default `Top`) and `scrollable: Boolean` (default `false`). It SHALL replace the duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate across all screens.
 
 #### Scenario: ScreenShell centers content within reading width
 - **WHEN** a screen is wrapped in `ScreenShell`
@@ -117,6 +117,35 @@ The system SHALL provide a `ScreenShell` composable in `ui/components/ScreenShel
 #### Scenario: ScreenShell with form max width
 - **WHEN** `ScreenShell(maxWidth = Dimens.formMaxWidth)` is used
 - **THEN** the content is constrained to at most 400dp width
+
+#### Scenario: ScreenShell with top bar
+- **WHEN** `ScreenShell(topBar = { BrandedTopBar(...) })` is used
+- **THEN** the top bar is rendered at the top of the Column, above the content
+
+#### Scenario: ScreenShell without top bar
+- **WHEN** `ScreenShell` is used without a `topBar` parameter
+- **THEN** no top bar is rendered and the content occupies the full height
+
+### Requirement: BrandedTopBar component
+The system SHALL provide a `BrandedTopBar` composable in `ui/components/BrandedTopBar.kt` that renders a lightweight app chrome bar: logo icon (24dp, theme-aware variant via `painterResource`) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and an optional `actions: @Composable RowScope.() -> Unit` slot on the right. The bar SHALL have a transparent background, no elevation, and no shadow. It SHALL NOT use M3 `TopAppBar` or `Scaffold` — it is a simple `Row` with `SpaceBetween` arrangement. It SHALL be rendered via `ScreenShell`'s `topBar` parameter.
+
+#### Scenario: BrandedTopBar shows logo and wordmark
+- **WHEN** `BrandedTopBar` is composed
+- **THEN** the logo icon (24dp, theme-appropriate variant) and "BankTeller" wordmark in Inter `titleMedium` are displayed left-aligned
+
+#### Scenario: BrandedTopBar shows actions slot
+- **WHEN** `BrandedTopBar(actions = { TextButton(onClick = { logout() }) { Text("Logout") } })` is composed
+- **THEN** the logout button is displayed right-aligned in the actions slot
+
+#### Scenario: BrandedTopBar uses theme-aware logo variant
+- **WHEN** the app is in light mode
+- **THEN** `logo_light.svg` is displayed in the top bar
+- **WHEN** the app is in dark mode
+- **THEN** `logo_dark.svg` is displayed in the top bar
+
+#### Scenario: BrandedTopBar has no elevation or background
+- **WHEN** `BrandedTopBar` is composed
+- **THEN** the background is transparent and no shadow or elevation is applied
 
 ### Requirement: WizardScaffold component
 The system SHALL provide a `WizardScaffold` composable in `ui/components/WizardScaffold.kt` that implements the wizard shell from `DESIGN-LANGUAGE.md` §5. It SHALL accept: `eyebrow: String` (displaySmall, brass, uppercase), `title: String` (headlineMedium, primary), `oneLiner: String?` (bodyMedium, 70% opacity), `currentStep: Int`, `totalSteps: Int`, `onBack: (() -> Unit)?` (null hides back button), `backLabel: String` (default "Back"), `forwardContent: @Composable () -> Unit` (primary action), and `content: @Composable ColumnScope.() -> Unit` (step content). The footer SHALL be quiet-back (TextButton/OutlinedButton, left-aligned) / loud-forward (primary Button, right-aligned). On mobile (<480dp), footer buttons SHALL stack full-width with forward on top.
@@ -184,3 +213,28 @@ The system SHALL replace the 12 hardcoded hex colors in `avatarBackgroundColors`
 #### Scenario: Avatar colors work in both themes
 - **WHEN** the app is in light mode and dark mode
 - **THEN** avatar background colors are legible and consistent with the theme palette in both modes
+
+### Requirement: App logo and branding assets
+The system SHALL bundle the "Sovereign Ledger" logo as SVG drawable resources: `logo_light.svg` (ink-navy book, for light backgrounds) and `logo_dark.svg` (light-ink book, for dark backgrounds) in `composeResources/drawable/`. A simplified `favicon.svg` (16x16px) SHALL be placed in `wasmJsMain/resources/`. The `index.html` SHALL reference the favicon via `<link rel="icon">`. The logo icon SHALL be loaded in Compose via `painterResource(Res.drawable.logo_light)` or `logo_dark` depending on the effective theme. The "BankTeller" wordmark SHALL be rendered as a Compose `Text` element in Fraunces (not embedded in the SVG) so it inherits the loaded font.
+
+#### Scenario: Logo SVG assets are bundled
+- **WHEN** the drawable resources are inspected
+- **THEN** `logo_light.svg` and `logo_dark.svg` exist in `composeResources/drawable/` with a 64x64 viewBox
+
+#### Scenario: Favicon is bundled and referenced
+- **WHEN** the web resources and `index.html` are inspected
+- **THEN** `favicon.svg` exists in `wasmJsMain/resources/` and `index.html` contains `<link rel="icon" href="favicon.svg">`
+
+#### Scenario: Login screen displays logo icon and wordmark
+- **WHEN** the login screen renders
+- **THEN** the logo icon (48dp, theme-appropriate variant) is displayed above the "BankTeller" wordmark in Fraunces `headlineMedium`, centered, with `Dimens.lg` spacing between icon and wordmark
+
+#### Scenario: Callback success displays logo icon
+- **WHEN** the callback screen renders in the success state
+- **THEN** the logo icon (48dp, theme-appropriate variant) is displayed above the headline
+
+#### Scenario: Logo variant follows theme
+- **WHEN** the app is in light mode
+- **THEN** `logo_light.svg` is displayed
+- **WHEN** the app is in dark mode
+- **THEN** `logo_dark.svg` is displayed

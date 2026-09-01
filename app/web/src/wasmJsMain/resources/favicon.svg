@@ -1,0 +1,31 @@
+<!-- Favicon Concept A: The Sovereign Ledger — 16x16px open book silhouette with curved page wings, brass spine bookmark ribbon, and emerald verification dot. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Container Background -->
+  <rect width="16" height="16" rx="3" fill="#1B2A4A" />
+  
+  <!-- Outer Brass Double Rule Accents -->
+  <rect x="2" y="1" width="12" height="1" fill="#D4A94E" />
+  <rect x="2" y="14" width="12" height="1" fill="#D4A94E" />
+
+  <!-- Hardcover Base Shadow -->
+  <path d="M 2,5 Q 8,3.5 14,5 V 12 Q 8,10.5 2,12 Z" fill="#D4A94E" opacity="0.4" />
+
+  <!-- Left Open Page -->
+  <path d="M 2,4 Q 5,3 8,4.5 V 11 Q 5,9.5 2,10.5 Z" fill="#FAF8F3" />
+  
+  <!-- Right Open Page -->
+  <path d="M 8,4.5 Q 11,3 14,4 V 10.5 Q 11,9.5 8,11 Z" fill="#FAF8F3" opacity="0.9" />
+
+  <!-- Page Lines -->
+  <line x1="3.5" y1="6.5" x2="6.5" y2="6.5" stroke="#1B2A4A" stroke-width="0.8" opacity="0.5" />
+  <line x1="3.5" y1="8.5" x2="6.5" y2="8.5" stroke="#1B2A4A" stroke-width="0.8" opacity="0.5" />
+  <line x1="9.5" y1="6.5" x2="12.5" y2="6.5" stroke="#1B2A4A" stroke-width="0.8" opacity="0.5" />
+  <line x1="9.5" y1="8.5" x2="12.5" y2="8.5" stroke="#1B2A4A" stroke-width="0.8" opacity="0.5" />
+
+  <!-- Spine & Hanging Bookmark Ribbon -->
+  <line x1="8" y1="4" x2="8" y2="12" stroke="#D4A94E" stroke-width="1" />
+  <polygon points="7,12 8,13.5 9,12" fill="#D4A94E" />
+
+  <!-- Emerald Verification Dot -->
+  <circle cx="8" cy="7.5" r="1.1" fill="#4FAE87" />
+</svg>

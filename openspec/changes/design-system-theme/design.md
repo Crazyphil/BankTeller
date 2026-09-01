@@ -145,6 +145,45 @@ Public pages are the app's public face (Enable Banking reviewers read privacy/te
 
 **Alternative considered**: Use the full 720dp content width for legal pages. Rejected — legal text at 720dp creates long lines that are hard to read; 400dp is the established form/reading width.
 
+### D14: App logo — "Sovereign Ledger" icon
+
+The app logo is the "Sovereign Ledger" concept: an open book/ledger with brass double-rules, a spine bookmark ribbon, and an emerald verification dot. It evokes the "Private Ledger" design language and the product name (a bank teller's ledger).
+
+**Asset strategy**: Three SVG files:
+- `logo_light.svg` (64×64 viewBox) — ink-navy book on transparent background, for light mode
+- `logo_dark.svg` (64×64 viewBox) — light-ink book on transparent background, for dark mode
+- `favicon.svg` (16×16 viewBox) — simplified mark on ink-navy background, for browser tab
+
+The in-app icon is loaded via `painterResource(Res.drawable.logo_light)` or `logo_dark` depending on the effective theme. The wordmark "BankTeller" is rendered as a Compose `Text` element in Fraunces (not part of the SVG) so it inherits the loaded font and scales correctly.
+
+**Placement**:
+- **BrandedTopBar** (new component): logo icon (24dp) + "BankTeller" wordmark on the left, optional `actions` slot on the right. Transparent background, no elevation. Rendered via `ScreenShell`'s new optional `topBar` parameter.
+- **Login screen**: prominent logo icon (48dp) above the "BankTeller" wordmark (Fraunces `headlineMedium`), centered, with `Dimens.lg` spacing. No top bar — the login IS the branding moment.
+- **Dashboard**: `BrandedTopBar` with logout action in the actions slot. The primary branding location for authenticated screens.
+- **Onboarding**: `BrandedTopBar` with logout action. Replaces ad-hoc logout buttons buried in individual wizard steps. The `WizardProgressIndicator` stays inside `WizardScaffold`'s header — it's flow content, not app chrome.
+- **Callback success**: logo icon (48dp) above the headline, with emerald accent. No top bar — transient screen.
+- **Legal pages**: no top bar — wordmark footer is sufficient.
+
+**Alternative considered**: Use M3 `Scaffold` + `TopAppBar`. Rejected — Scaffold brings snackbarHost, bottomBar, FAB, and drawer slots that don't exist yet. `ScreenShell` + a lightweight `BrandedTopBar` is simpler and the migration to Scaffold later is a 10-minute refactor (ScreenShell becomes Scaffold's content lambda, BrandedTopBar moves to the topBar slot).
+
+### D15: BrandedTopBar — lightweight app chrome without Scaffold
+
+`BrandedTopBar` is a simple `Row(fillMaxWidth, CenterVertically, SpaceBetween)` composable — NOT an M3 `TopAppBar` and NOT wrapped in `Scaffold`. It shows the logo icon (24dp, theme-aware variant) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and an optional `actions: @Composable RowScope.() -> Unit` slot on the right. Transparent background, no elevation, no shadow. Quiet, per the "calm by default" design philosophy.
+
+`ScreenShell` gains an optional `topBar: @Composable () -> Unit = {}` parameter. When provided, it renders the top bar at the top of the Column, above the content. When absent (login, legal pages, callback), the screen has no top bar — backward compatible.
+
+**Dashboard**: `BrandedTopBar` with a logout `TextButton` in the actions slot. Future navigation icons land here when dashboard features arrive.
+
+**Onboarding**: `BrandedTopBar` with a logout `TextButton` in the actions slot. This replaces the ad-hoc logout buttons currently buried in individual wizard step content (e.g., `ActivationGuideStep`'s secondary "Logout" button). The `WizardProgressIndicator` stays inside `WizardScaffold`'s header — it is flow content (which step am I on), not app chrome (which app am I in). The wizard's eyebrow/title/one-liner also stay in the content area.
+
+**Why not move wizard progress to the top bar?** The top bar would become stateful (needs `currentStep`/`totalSteps`), it would need conditional rendering (progress on onboarding, nothing on dashboard), and it couples app chrome to flow state. The progress indicator is semantically part of the wizard, not the app frame.
+
+**Alternative considered**: Use M3 `TopAppBar` inside `Scaffold`. Rejected — Scaffold's snackbarHost, bottomBar, FAB, and drawer slots are all unused. The migration path to Scaffold is clean when navigation arrives: ScreenShell becomes Scaffold's content lambda, BrandedTopBar moves to the topBar slot.
+
+**Favicon**: `favicon.svg` is served from `wasmJsMain/resources/` and referenced via `<link rel="icon">` in `index.html`. The 16×16px simplified mark uses an ink-navy background container with brass rules, simplified page shapes, and the emerald dot — readable at browser-tab size.
+
+**Alternative considered**: Use a single SVG with CSS media queries for light/dark. Rejected — Compose Multiplatform's `painterResource` doesn't process CSS; separate files selected by the theme composable is simpler and more reliable.
+
 ## Risks / Trade-offs
 
 - **Font download weight** → ~250-400K new WOFF2 files. Mitigation: Latin subset only, variable fonts (one file per family), `preloadFont()` avoids layout shift. Total font payload remains under 600K — acceptable for a single-user self-hosted app.
