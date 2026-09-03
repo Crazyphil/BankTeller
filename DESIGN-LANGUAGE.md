@@ -20,7 +20,7 @@
 - **Define only what is used.** No speculative components, icons, or patterns. This document inventories what exists and what the design language requires. The "Not Yet Defined" list tracks acknowledged gaps.
 - **Explanations adjacent to decisions.** No wall-of-text step intros. Context appears next to the control it explains.
 - **Semantic color is reserved.** Colors carry meaning, never decoration. See §3.
-- **German first.** All copy is German for the EU audience. Number formatting follows German conventions (€ 1.234,56). Mono figures are right-aligned and tabular in lists.
+- **English only.** All copy and all number/formatting conventions follow English (UK) for now (€ 1,234.56 — comma thousands separator, period decimal). Mono figures are right-aligned and tabular in lists. Correct, beautiful representation of numbers and graphs is a deliberate quality bar. Number/date formats will localize together with language when i18n is added later.
 
 ---
 
@@ -84,7 +84,7 @@ Three font families, each with a distinct role. All served as **variable fonts i
 
 **Font loading**: Use `preloadFont()` (experimental, CMP 1.8.0+) to avoid FOUT on initial render. Add `<link rel="preload">` tags in `index.html` for critical fonts.
 
-**Financial figures**: Always mono, tabular figures (`fontFeatureSettings = "tnum"`), right-aligned in lists. German number formatting: `€ 1.234,56` (period as thousands separator, comma as decimal).
+**Financial figures**: Always mono, tabular figures (`fontFeatureSettings = "tnum"`), right-aligned in lists. English (UK) number formatting: `€1,234.56` (comma as thousands separator, period as decimal). Formats localize with language when i18n arrives.
 
 ### 2.3 Spacing
 
@@ -117,6 +117,7 @@ Avatars and logos use `RoundedCornerShape(8 dp)` as the sole exception — they 
 |---|---|---|
 | `contentMaxWidth` | 720 dp | Reading-width container — all content centers within this |
 | `formMaxWidth` | 400 dp | Login and single-purpose forms within the container |
+| `readingMaxWidth` | 640 dp | Legal/letterhead pages (privacy, terms) — wider than forms, narrower than content |
 | `screenPadding` | 16 dp | Default screen edge padding (replaces current hardcoded 16.dp) |
 | `screenPaddingCompact` | 12 dp | Tablet breakpoint |
 | `screenPaddingMobile` | 8 dp | Mobile breakpoint |
@@ -182,7 +183,7 @@ A tinted surface for consequential choices. Used when a control has financial or
 - Background: `color-mix(in srgb, <semantic> 12%, transparent)`
 - Left border: 3px solid in the semantic color
 - Content: brief guarantee, warning, or implication text
-- Example: "BankTeller wird niemals Geld ohne deine explizite Freigabe überweisen." (emerald tint)
+- Example: "BankTeller will never transfer money without your explicit approval." (emerald tint)
 
 ---
 
@@ -192,9 +193,9 @@ One scaffold for all multi-step flows (onboarding, bank linking, rule creation).
 
 ```
 ┌─────────────────────────────────────┐
-│ Eyebrow (displaySmall, brass, caps) │  ← "SCHRITT 2 VON 5"
-│ Title (headlineMedium, primary)     │  ← "Bank verknüpfen"
-│ One-liner (bodyMedium, 70% opacity) │  ← "Wähle deine Bank aus der Liste"
+│ Eyebrow (displaySmall, brass, caps) │  ← "STEP 2 OF 5"
+│ Title (headlineMedium, primary)     │  ← "Connect your bank"
+│ One-liner (bodyMedium, 70% opacity) │  ← "Select your bank from the list"
 ├─────────────────────────────────────┤
 │                                     │
 │         Content Zone                │  ← Step-specific controls
@@ -213,7 +214,7 @@ An SVG component showing numbered step circles connected by a line:
 - **Current step**: outlined circle with number, `brass` stroke (2.5px), `brass` text
 - **Future steps**: outlined circle with number, `outline` stroke (1.5px), `onSurface` 50% opacity text
 - **Connecting line**: `brass` for completed segments, `outline` for future segments
-- Label beside indicator: "Schritt N von M" in mono, `brass`
+- Label beside indicator: "Step N of M" in mono, `brass`
 
 ### Footer
 
@@ -252,11 +253,15 @@ Only components that exist in the current codebase or are required by the design
 
 | Component | Purpose | Notes |
 |---|---|---|
-| `ScreenShell` *(to create)* | Shared layout wrapper | Replaces duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate. Centers content within `contentMaxWidth`, applies screen padding. |
-| `WizardScaffold` *(to create)* | Multi-step flow scaffold | Implements §5 structure: eyebrow, title, one-liner, content, footer, progress indicator. |
-| `WizardProgressIndicator` *(to create)* | SVG step progress | Numbered circles + connecting line. See §5. |
-| `DecisionBox` *(to create)* | Tinted consequential choice surface | See §4, Tier 3. |
-| `BankAvatar` | 2-letter initials in colored circle | Hash-picked background color, 64dp, `RoundedCornerShape(8dp)`. Colors should derive from theme tokens, not hardcoded hexes. |
+| `ScreenShell` | Shared layout wrapper | Replaces duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate. Centers content within `contentMaxWidth`, applies screen padding and theme background. |
+| `WizardScaffold` | Multi-step flow scaffold | Implements §5 structure: eyebrow, title, one-liner, content, footer, progress indicator. |
+| `WizardProgressIndicator` | SVG/Canvas step progress | Numbered circles + connecting line. See §5. |
+| `DecisionBox` | Tinted consequential choice surface | See §4, Tier 3. |
+| `BrandedTopBar` | Lightweight app chrome (authenticated shell) | Logo icon (24dp) + "BankTeller" wordmark left, `actions` slot right (theme toggle first, then logout). Transparent, no elevation. NOT an M3 `TopAppBar` — plain Row; migration to `Scaffold` later is trivial. Used on dashboard and onboarding. Never on the public family (login, legal, callback). |
+| `ThemeToggle` | Theme-mode switcher | Quiet `IconButton`, icon shows CURRENT mode (`Contrast`/`LightMode`/`DarkMode` from `materialIconsExtended`), clicking cycles System → Light → Dark → System, persists to `localStorage`, tooltip names the mode. Placement is per-screen-family (see §10). |
+| `QuietButton` | Low-prominence secondary control | 1dp outline border, onSurface text, small shape (3dp). Used in wizard back affordance & secondary actions. |
+| `BankTellerMark` | Primary brand mark | Canvas-rendered brass coin with engraved ledger-book glyph. Supports Compact (24dp), Standard (48dp), Hero (72dp), or custom Dp. |
+| `BankAvatar` | 2-letter initials in colored circle | Hash-picked background color, 64dp, `RoundedCornerShape(8dp)`. Colors derive from theme tokens. |
 | `BankLogo` | Async-loaded bank PNG via ktor+Skia | 64dp, falls back to `BankAvatar`. Cached in module-level `bankLogoCache`. |
 | `ConsentItem` | Bullet row: title + description | "-" bullet, `bodyMedium` title, `bodySmall` description. |
 | `EnvironmentOption` | Radio + label + description, full-row clickable | Entire `Row` is clickable, not just the radio. |
@@ -272,6 +277,33 @@ One pattern, three contexts — replaces the current 3 inconsistent styles:
 | Field-level error | `supportingText` slot in `OutlinedTextField`, `danger` color, replaces helper text |
 | Form-level error (login, submit) | `Text` below form, `danger` color, `bodySmall` — not inside a card |
 | Flow-level error (onboarding step) | `Text` inside the step card, `danger` color, `bodySmall`, with a retry `Button` |
+
+### 6.4 Branding — the Sovereign Ledger mark
+
+The app mark is the **Sovereign Ledger**: an open ledger book — brass double-rules, hanging brass bookmark ribbon at the spine, and a single emerald verification dot on the pages. It is the visual embodiment of the product promise (a ledger that never moves money without your explicit ✓).
+
+**Assets**
+- `logo_light.svg` / `logo_dark.svg` (64×64 viewBox) in `composeResources/drawable/` — theme-aware pair, selected by the effective theme.
+- `favicon.svg` (16×16) in `wasmJsMain/resources/`, referenced via `<link rel="icon">` — simplified mark (rounded ink-navy tile, brass rules, simplified pages, emerald dot) readable at tab size.
+- The wordmark "BankTeller" is never baked into the SVG — it renders as Compose `Text` in Fraunces, so it inherits the bundled font.
+
+**Placement & sizes**
+
+| Surface | Lockup | Size |
+|---|---|---|
+| Login | Icon + wordmark (Fraunces `headlineMedium`), centered, above the form | 48 dp |
+| BrandedTopBar (dashboard, onboarding) | Icon + wordmark (`titleMedium`), left-aligned | 24 dp |
+| Legal pages (privacy, terms) | Letterhead: icon + wordmark + brass double-rule hairline, top of reading column | 32 dp |
+| Callback | Same lockup as login, above the status card — shown in BOTH success and error states | 48 dp |
+
+Branding is deliberately absent inside wizard step content — the wizard shell (§5) is its own identity; chrome-level branding lives in the top bar.
+
+### 6.5 Public Pages — the Sovereign Letterhead
+
+Unauthenticated screens (`/privacy`, `/terms`, `/enable-banking-callback`) form a coherent public family together with login: top-bar-less, centered, carrying the full brand lockup. They never get the `BrandedTopBar` — that would blur the line between the public face and the authenticated shell.
+
+- **Legal pages**: `ScreenShell(maxWidth = readingMaxWidth, scrollable = true)`. Letterhead (§6.4) on top, then Fraunces `headlineLarge` title, "Last updated" date in JetBrains Mono (`bodySmall`, 70% opacity), section headers Inter `titleMedium` with a 2dp `primary` left tick, body Inter `bodyLarge` at ~1.6 line-height, compact legal footer in JetBrains Mono `labelSmall`.
+- **Callback**: brand lockup (login-style, 48dp) above a **status card** — `OutlinedCard`, hairline `outlineVariant`, brass double-rule across its top edge. Success = emerald status badge + `onSurface` headline + identifiers in Mono `bodySmall` + brass spinner during redirect; Error = danger badge + `danger` text + error detail in a Mono code block, no countdown.
 
 ---
 
@@ -315,7 +347,7 @@ When the approval button is clicked, a spring confirmation plays before the acti
 - Animation: `springConfirm` — scale 1.0 → 0.94 → 1.04 → 1.0
 - Duration: 380ms
 - Easing: `cubic-bezier(0.34, 1.56, 0.64, 1)` (spring overshoot)
-- Post-animation: button transitions to confirmed state (darker emerald, "✓ Ausgeführt" text)
+- Post-animation: button transitions to confirmed state (darker emerald, "✓ Executed" text)
 
 ### 8.3 Surges & Springs (Hover)
 
@@ -363,11 +395,22 @@ Three-way preference: **System / Light / Dark**. Default: **System**.
 
 Login renders before server settings are available. Theme preference is stored in `localStorage` (browser-side), not in the SQLite database. This ensures the login screen respects the user's theme choice on first paint.
 
+### The Toggle
+
+A single quiet `IconButton` cycles System → Light → Dark → System and persists immediately. The button shows the icon of the CURRENT mode (Contrast = System, LightMode = sun, DarkMode = moon — from `materialIconsExtended`, tinted `onSurfaceVariant`) with a tooltip naming it, so the state is discoverable without a caption.
+
+**Placement is per screen family:**
+
+| Family | Placement |
+|---|---|
+| Authenticated shell (dashboard, onboarding) | First item in the `BrandedTopBar` actions slot, before logout |
+| Public family (login, callback, privacy, terms) | Viewport-fixed top-right corner, `screenPadding` inset, overlays scrollable content — stays reachable even on arbitrarily long documents |
+
 ### Implementation
 
 - `isSystemInDarkTheme()` for System mode
-- `localStorage.getItem("bankteller-theme")` for explicit Light/Dark override
-- Theme switch in Settings writes to `localStorage`
+- `localStorage.getItem("bankteller-theme")` for explicit Light/Dark override — values `"system"` (or absent) / `"light"` / `"dark"`
+- `rememberThemeMode()` holds `ThemeMode` in `mutableStateOf`; the toggle writes both state and `localStorage`
 - `App.kt` reads `localStorage` on startup before first composition
 
 ---
@@ -385,7 +428,7 @@ Login renders before server settings are available. Theme preference is stored i
 
 Acknowledged gaps. These will be defined when the app needs them, not before.
 
-- **TopAppBar / Scaffold**: No app bar exists. Will be needed when Dashboard grows beyond the current stub.
+- **M3 `Scaffold` / `TopAppBar`**: Deliberately skipped for now — the lightweight `BrandedTopBar` (§6.2) covers app chrome. Revisit when snackbars/drawer/FAB arrive; migration path is defined (ScreenShell becomes Scaffold's content lambda).
 - **Navigation**: No navigation library, back stack, or drawer. Will be defined when multi-screen navigation beyond the current state-machine `when` is required.
 - **Dialogs**: No dialogs exist. Will be defined when modal interactions are needed (e.g., delete confirmation).
 - **Snackbar / Toast**: Not defined. Will be needed for transient feedback.

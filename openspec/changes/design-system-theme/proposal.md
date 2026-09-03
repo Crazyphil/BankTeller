@@ -11,6 +11,7 @@ The app currently invokes `MaterialTheme { }` with zero parameters — stock M3 
 - Create `ui/theme/Dimens.kt` — 6-step spacing ladder + layout tokens (contentMaxWidth, formMaxWidth, screenPadding)
 - Create `ui/theme/Theme.kt` — `BankTellerTheme` composable wrapping `MaterialTheme` with light/dark `ColorScheme`, `Typography`, `Shapes`, and dark-mode detection
 - Add three-way theme preference (System / Light / Dark) stored in `localStorage`, defaulting to System
+- Add a visible `ThemeToggle` on every screen — in the `BrandedTopBar` actions slot (dashboard, onboarding) and as a quiet bottom-center icon button on top-bar-less screens (login, callback, legal pages); cycles System → Light → Dark → System with custom sun/moon/auto SVG icons
 - Bundle Fraunces Variable + Inter Variable as WOFF2; re-encode JetBrains Mono to WOFF2; add `preloadFont()` + `<link rel="preload">` tags
 - Replace all 4 bare `MaterialTheme { }` calls in `App.kt` with `BankTellerTheme { }`
 
@@ -48,7 +49,7 @@ The app currently invokes `MaterialTheme { }` with zero parameters — stock M3 
 
 ## Impact
 
-- **New files**: `ui/theme/Color.kt`, `Type.kt`, `Shapes.kt`, `Dimens.kt`, `Theme.kt`, `ui/components/ScreenShell.kt`, `BrandedTopBar.kt`, `WizardScaffold.kt`, `WizardProgressIndicator.kt`, `DecisionBox.kt` under `app/web/src/commonMain/kotlin/it/kapfer/bankteller/`
+- **New files**: `ui/theme/Color.kt`, `Type.kt`, `Shapes.kt`, `Dimens.kt`, `Theme.kt`, `ui/components/ScreenShell.kt`, `BrandedTopBar.kt`, `ThemeToggle.kt`, `WizardScaffold.kt`, `WizardProgressIndicator.kt`, `DecisionBox.kt` under `app/web/src/commonMain/kotlin/it/kapfer/bankteller/`
 - **Modified files**: `App.kt` (replace `MaterialTheme` calls), `Fonts.kt` (add Fraunces/Inter families), `index.html` (font preload tags, favicon link), `LoginScreen.kt` (logo display), `DashboardScreen.kt`, `OnboardingScreen.kt`, `PrivacyScreen.kt`, `TermsScreen.kt`, `CallbackScreen.kt`, `build.gradle.kts` (font resource config if needed)
 - **New bundled resources**: Fraunces Variable WOFF2 (~150-250K), Inter Variable WOFF2 (~100-150K) in `composeResources/font/`; `logo_light.svg`, `logo_dark.svg` in `composeResources/drawable/`; `favicon.svg` in `wasmJsMain/resources/`
 - **Re-encoded resources**: JetBrains Mono TTF → WOFF2 (saves ~60K)

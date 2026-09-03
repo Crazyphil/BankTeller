@@ -27,6 +27,18 @@ The SPA SHALL present a login screen with username and password fields and a sub
 - **WHEN** the login screen renders
 - **THEN** the content is wrapped in `ScreenShell(maxWidth = Dimens.formMaxWidth)`, centered horizontally and constrained to 400dp
 
+#### Scenario: Login screen has theme toggle
+- **WHEN** the login screen renders
+- **THEN** a `ThemeToggle` (quiet `IconButton` with sun/moon/auto icon showing the CURRENT mode) is displayed as a viewport-fixed icon in the top-right corner, clickable without authentication
+
+#### Scenario: Dashboard top bar has theme toggle and logout
+- **WHEN** the dashboard renders
+- **THEN** the `BrandedTopBar` actions slot contains the theme `ThemeToggle` (quiet `IconButton`, no caption — shows current-mode icon only) as the first item, followed by the logout action
+
+#### Scenario: Onboarding top bar has theme toggle and logout
+- **WHEN** any onboarding step renders
+- **THEN** the `BrandedTopBar` actions slot contains the theme `ThemeToggle` (first item) and the logout action; no logout button is shown inside the step content
+
 ### Requirement: Welcome dashboard
 The SPA SHALL present a simple welcome dashboard as the post-login landing page. The dashboard SHALL display a welcome message. No navigation items or business data are included — future changes add screens and navigation incrementally. The dashboard SHALL be shown only after Enable Banking onboarding is complete (credentials present, verified, and `active: true`); while onboarding is pending, invalid, or the application is not yet active, the SPA SHALL render the onboarding gate instead of the dashboard. The dashboard SHALL be rendered within `BankTellerTheme` and use `ScreenShell` with a `BrandedTopBar` (logo icon + wordmark, logout action in the actions slot) as its `topBar` parameter. The welcome headline SHALL use Fraunces (`headlineMedium`). Spacing SHALL use `Dimens` tokens; no hardcoded dp values.
 
@@ -102,11 +114,13 @@ The SPA SHALL render a transient onboarding gate screen when Enable Banking cred
 - **THEN** the step is rendered inside `WizardScaffold` with eyebrow, title, one-liner, `WizardProgressIndicator`, and unified back affordance
 
 ### Requirement: Public routes rendered by the SPA without auth gate
-The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The SPA's `App()` composable SHALL include a single early-return at the top (before any auth check) that inspects `window.location.pathname`: if the path is one of the three public routes, the SPA renders the corresponding composable (`PrivacyScreen`, `TermsScreen`, or `CallbackScreen`) wrapped in `BankTellerTheme` and returns; otherwise, the SPA falls through to the existing auth-gated flow. This mechanism extends the foundation's existing enum-based state router with a public-route branch — it SHALL NOT introduce a routing library (Decompose, Voyager, Jetbrains Navigation-Compose, or similar). The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change; public routes are not authenticated feature screens and do not require navigation infrastructure. Each public screen SHALL use `ScreenShell` as its layout wrapper (replacing the raw `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate). Headlines SHALL use Fraunces (`headlineMedium`); body text SHALL use Inter. Spacing SHALL use `Dimens` tokens; no hardcoded dp values.
+The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The SPA's `App()` composable SHALL include a single early-return at the top (before any auth check) that inspects `window.location.pathname`: if the path is one of the three public routes, the SPA renders the corresponding composable (`PrivacyScreen`, `TermsScreen`, or `CallbackScreen`) wrapped in `BankTellerTheme` and returns; otherwise, the SPA falls through to the existing auth-gated flow. This mechanism extends the foundation's existing enum-based state router with a public-route branch — it SHALL NOT introduce a routing library (Decompose, Voyager, Jetbrains Navigation-Compose, or similar). The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change; public routes are not authenticated feature screens and do not require navigation infrastructure. Each public screen SHALL use `ScreenShell` as its layout wrapper (replacing the raw `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate). Headlines SHALL use Fraunces (`headlineMedium`); body text SHALL use Inter. Spacing SHALL use `Dimens` tokens; no hardcoded dp values. Each public screen SHALL show the `ThemeToggle` as a viewport-fixed quiet `IconButton` in the top-right corner (overlaying scrollable content, never scrolling away) — public screens have no top bar, so the corner toggle keeps the theme preference reachable from every screen in the app, including long legal documents.
 
-The legal pages (`/privacy`, `/terms`) SHALL use `ScreenShell(maxWidth = Dimens.formMaxWidth, scrollable = true)` — the 400dp reading width improves readability for dense legal text. Content hierarchy: title in Fraunces `headlineMedium`, optional last-updated date in Inter `bodySmall` `onSurfaceVariant`, section headers in `titleMedium` (Inter, primary), body in `bodyMedium` (Inter) with `lineHeight` override for legal reading comfort. A "BankTeller" wordmark footer in `bodySmall` `onSurfaceVariant` anchors the page to the product. The actual legal text content is out of scope (placeholder remains) — this change defines the layout vessel, not the copy.
+The legal pages (`/privacy`, `/terms`) SHALL use `ScreenShell(maxWidth = Dimens.readingMaxWidth, scrollable = true)` — a 640dp reading width (wider than forms, narrower than content pages) for comfortable legal reading. Each legal page SHALL carry a **letterhead header** at the top of the reading column: 32dp logo icon (theme-aware variant) + "BankTeller" wordmark in Fraunces, followed by a hairline brass double-rule (`brass` at 30% opacity) separating the letterhead from the content. Content hierarchy: title in Fraunces `headlineLarge`, "Last updated" date in JetBrains Mono (`bodySmall`, `onSurfaceVariant`), section headers in Inter `titleMedium` with a 2dp `primary` left border tick, body in Inter `bodyLarge` with `lineHeight` ~1.6 for legal reading comfort. The footer SHALL be a compact legal line (copyright/disclosure) in JetBrains Mono `labelSmall` — replacing the old "BankTeller" wordmark footer, since the letterhead now carries the branding. The actual legal text content is out of scope (placeholder remains) — this change defines the layout vessel, not the copy.
 
-The callback screen (`/enable-banking-callback`) SHALL use `ScreenShell(maxWidth = Dimens.formMaxWidth, verticalArrangement = Center)` — it is a transient status screen, not a reading page. Two states carry semantic color weight: success SHALL use an emerald accent (emerald = verified, per `DESIGN-LANGUAGE.md` §3) on the headline, with `CircularProgressIndicator` in `brass` during the 2s redirect countdown (auth flow only), and a "BankTeller" wordmark footer; error SHALL use `danger` color for headline and body, with no redirect countdown and no wordmark footer (error is terminal, not a branded moment).
+The callback screen (`/enable-banking-callback`) SHALL use `ScreenShell(maxWidth = Dimens.formMaxWidth, verticalArrangement = Center)` — it is a transient status screen, not a reading page. It SHALL mirror the login screen's brand lockup: 48dp logo icon (theme-aware variant) + "BankTeller" wordmark in Fraunces `headlineMedium`, centered. Below the lockup, the status SHALL be presented in a **status card**: an `OutlinedCard` with 3dp corners, 1dp `outlineVariant` hairline border, and a brass double-rule accent across its top edge (ledger motif). Two states carry semantic color weight:
+- **Success**: an emerald status badge (emerald container + verification-dot icon), headline in `onSurface` with an emerald-accented subtitle, session/redirect identifiers in JetBrains Mono `bodySmall`, and a `CircularProgressIndicator` in `brass` at the card's bottom during the 2s redirect countdown (auth flow only).
+- **Error**: a danger status badge, headline and body in `danger` color, error details in JetBrains Mono inside a subtle code block, and no redirect countdown. The brand lockup still renders on the error state (the page must assure the user they are still on BankTeller), but no status badge is emerald.
 
 #### Scenario: Public route bypasses auth gate
 - **WHEN** the SPA loads at `/privacy`, `/terms`, or `/enable-banking-callback` (e.g., Enable Banking's reviewer visits the privacy URL, or the user's email-link click lands on the callback URL on device B)
@@ -128,14 +142,33 @@ The callback screen (`/enable-banking-callback`) SHALL use `ScreenShell(maxWidth
 - **WHEN** a public route (`/privacy`, `/terms`, or `/enable-banking-callback`) renders
 - **THEN** the content is wrapped in `ScreenShell` within `BankTellerTheme`, with Fraunces headlines and Inter body text
 
-#### Scenario: Legal pages use reading-optimized width and scrollable layout
+#### Scenario: Legal pages use letterhead layout
 - **WHEN** the privacy or terms page renders
-- **THEN** the content uses `ScreenShell(maxWidth = Dimens.formMaxWidth, scrollable = true)`, with title in Fraunces `headlineMedium`, section headers in `titleMedium` (Inter, primary), body in `bodyMedium` (Inter) with `lineHeight` override for legal reading, and a "BankTeller" wordmark footer in `bodySmall` `onSurfaceVariant`
+- **THEN** the content uses `ScreenShell(maxWidth = Dimens.readingMaxWidth, scrollable = true)`, with a letterhead header (32dp logo + "BankTeller" wordmark in Fraunces + brass double-rule hairline at 30% opacity), title in Fraunces `headlineLarge`, "Last updated" date in JetBrains Mono `bodySmall` `onSurfaceVariant`, section headers in Inter `titleMedium` with a 2dp `primary` left border tick, body in Inter `bodyLarge` with `lineHeight` ~1.6, and a compact legal footer line in JetBrains Mono `labelSmall`
 
-#### Scenario: Callback success uses emerald accent
+#### Scenario: Callback success shows brand lockup and status card
 - **WHEN** the callback screen renders with a valid `state` + `oobCode` (or `code`) query
-- **THEN** the logo icon (48dp, theme-appropriate variant) is displayed above the headline, the headline uses an emerald accent (emerald = verified), `CircularProgressIndicator` in `brass` shows during the 2s redirect countdown (auth flow only), and a "BankTeller" wordmark footer anchors the page
+- **THEN** the login-style brand lockup (48dp logo + "BankTeller" wordmark in Fraunces `headlineMedium`) appears above a status card (3dp corners, 1dp `outlineVariant` hairline, brass double-rule top accent) containing an emerald status badge, headline in `onSurface` with emerald accent, session/redirect identifiers in JetBrains Mono `bodySmall`, and a `CircularProgressIndicator` in `brass` during the 2s redirect countdown (auth flow only)
 
-#### Scenario: Callback error uses danger color, no branding
+#### Scenario: Callback error shows danger status card
 - **WHEN** the callback screen renders without a valid `state` + `oobCode`/`code` query
-- **THEN** the headline and body use `danger` color, no redirect countdown runs, and no "BankTeller" wordmark footer is shown (error is terminal, not a branded moment)
+- **THEN** the brand lockup still renders (assuring the user they are on BankTeller), but the status card shows a danger status badge, headline and body in `danger` color, error details in JetBrains Mono in a code block, and no redirect countdown
+
+### Requirement: Post-implementation Layout and Affordance Fixes
+Screens SHALL enforce content max-width via `widthIn(max)` applied before `fillMaxWidth()` so content never stretches edge-to-edge on wide viewports. The `WizardScaffold` progress indicator SHALL be horizontally centered above the title, not left-aligned. Secondary/tertiary actions (back, restart, re-open) SHALL render as `QuietButton` — 1dp outline hairline, onSurface text, labelLarge, 3dp corners — never as bare TextButtons that disappear into the background. When a wizard step carries multiple secondary actions, back plus additional quiet actions SHALL group left in the footer with the loud forward action right. This documents refinements landed during manual verification that extend the original spec.
+
+#### Scenario: ScreenShell width constraint
+- **WHEN** a screen specifies a content max width (contentMaxWidth / formMaxWidth)
+- **THEN** the constraint is enforced via `widthIn(max)` applied before `fillMaxWidth()` so content never stretches edge-to-edge on wide viewports
+
+#### Scenario: Wizard progress indicator positioning
+- **WHEN** WizardScaffold shows the progress indicator
+- **THEN** the indicator is horizontally centered above the title, not left-aligned
+
+#### Scenario: Quiet secondary action pattern
+- **WHEN** a wizard or screen exposes secondary/tertiary actions (back, restart, re-open)
+- **THEN** they render as QuietButton (1dp outline hairline, onSurface text, labelLarge, 3dp corners), never as bare TextButtons that disappear into the background
+
+#### Scenario: WizardScaffold extraActions slot
+- **WHEN** a wizard step carries multiple secondary actions
+- **THEN** back + additional quiet actions are grouped left in the footer, the loud forward action stays right

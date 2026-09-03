@@ -40,7 +40,7 @@ The system SHALL define an M3 `Shapes` in `ui/theme/Shapes.kt` with `small=3.dp`
 - **THEN** `small` is `RoundedCornerShape(3.dp)`, `medium` is `RoundedCornerShape(4.dp)`, and `large` is `RoundedCornerShape(4.dp)`
 
 ### Requirement: Spacing and layout dimension tokens
-The system SHALL define a `Dimens` object in `ui/theme/Dimens.kt` with a 6-step spacing ladder: `xs=4.dp`, `sm=8.dp`, `md=16.dp`, `lg=24.dp`, `xl=32.dp`, `xxl=48.dp`. Layout tokens SHALL include `contentMaxWidth=720.dp`, `formMaxWidth=400.dp`, `screenPadding=16.dp`, `screenPaddingCompact=12.dp`, `screenPaddingMobile=8.dp`.
+The system SHALL define a `Dimens` object in `ui/theme/Dimens.kt` with a 6-step spacing ladder: `xs=4.dp`, `sm=8.dp`, `md=16.dp`, `lg=24.dp`, `xl=32.dp`, `xxl=48.dp`. Layout tokens SHALL include `contentMaxWidth=720.dp`, `formMaxWidth=400.dp`, `readingMaxWidth=640.dp` (letterhead legal pages — wider than forms, narrower than content), `screenPadding=16.dp`, `screenPaddingCompact=12.dp`, `screenPaddingMobile=8.dp`.
 
 #### Scenario: Spacing ladder values
 - **WHEN** `Dimens` is referenced
@@ -48,7 +48,7 @@ The system SHALL define a `Dimens` object in `ui/theme/Dimens.kt` with a 6-step 
 
 #### Scenario: Layout token values
 - **WHEN** `Dimens` is referenced
-- **THEN** `Dimens.contentMaxWidth` is `720.dp`, `Dimens.formMaxWidth` is `400.dp`, `Dimens.screenPadding` is `16.dp`, `Dimens.screenPaddingCompact` is `12.dp`, `Dimens.screenPaddingMobile` is `8.dp`
+- **THEN** `Dimens.contentMaxWidth` is `720.dp`, `Dimens.formMaxWidth` is `400.dp`, `Dimens.readingMaxWidth` is `640.dp`, `Dimens.screenPadding` is `16.dp`, `Dimens.screenPaddingCompact` is `12.dp`, `Dimens.screenPaddingMobile` is `8.dp`
 
 ### Requirement: BankTellerTheme composable
 The system SHALL provide a `BankTellerTheme` composable in `ui/theme/Theme.kt` that wraps `MaterialTheme` with the light or dark `ColorScheme` (based on theme preference), the custom `Typography`, the `Shapes`, and provides `BankTellerColors` via `CompositionLocal`. The composable SHALL accept a `content` lambda. All bare `MaterialTheme { }` calls in `App.kt` SHALL be replaced with `BankTellerTheme { }`.
@@ -87,6 +87,33 @@ The system SHALL support a three-way theme preference: System, Light, or Dark. T
 #### Scenario: Setting back to System clears override
 - **WHEN** the theme mode is set to System
 - **THEN** `localStorage["bankteller-theme"]` is `"system"` (or removed) and the effective theme follows `isSystemInDarkTheme()`
+
+### Requirement: Theme toggle UI
+The system SHALL provide a `ThemeToggle` composable in `ui/components/ThemeToggle.kt` that lets the user change the theme mode from anywhere in the app, including before login. It SHALL render as a quiet `IconButton` showing the icon of the CURRENT mode: `Icons.Filled.Contrast` for System, `Icons.Filled.LightMode` for Light, `Icons.Filled.DarkMode` for Dark. Clicking SHALL cycle System → Light → Dark → System and persist the new mode to `localStorage` immediately. On screens with a `BrandedTopBar` (dashboard, onboarding), the toggle SHALL be the first item in the top bar's `actions` slot, before logout. On screens without a top bar (login, callback, legal pages), the toggle SHALL be a viewport-fixed quiet `IconButton` in the top-right corner (padded by `Dimens.screenPadding`, inside safe-area insets, overlaying scrollable content) so it never scrolls out of reach — no caption; the current-mode icon plus a tooltip SHALL carry the meaning. The icons SHALL come from `compose.materialIconsExtended` (Material Symbols as `ImageVector` objects), tinted `onSurfaceVariant` — no custom SVG assets for theme icons.
+
+#### Scenario: Toggle is reachable before login
+- **WHEN** the login screen renders
+- **THEN** the theme toggle is visible as a fixed icon button in the top-right corner and clickable without any authentication
+
+#### Scenario: Toggle stays visible while scrolling long content
+- **WHEN** a user scrolls a long legal page (privacy or terms)
+- **THEN** the theme toggle remains visible in the top-right corner and does not scroll with the content
+
+#### Scenario: Clicking toggle advances and persists mode
+- **WHEN** the current mode is System and the user clicks the toggle
+- **THEN** the mode changes to Light, `localStorage["bankteller-theme"]` becomes `"light"`, and the UI re-renders in the light scheme immediately
+
+#### Scenario: Toggle icon shows current mode
+- **WHEN** the current mode is Dark
+- **THEN** the toggle shows the DarkMode (moon) icon; WHEN the mode is System it shows the Contrast (half-filled circle) icon; WHEN the mode is Light it shows the LightMode (sun) icon
+
+#### Scenario: Toggle in top bar precedes logout
+- **WHEN** the dashboard or an onboarding screen renders
+- **THEN** the `BrandedTopBar` actions slot contains the theme toggle first, with the logout action after it
+
+#### Scenario: materialIconsExtended dependency is declared
+- **WHEN** the web module's `build.gradle.kts` is inspected
+- **THEN** it declares `implementation(compose.materialIconsExtended)`
 
 ### Requirement: Font bundling and preloading
 The system SHALL bundle Fraunces Variable and Inter Variable as WOFF2 files in `composeResources/font/`. The existing JetBrains Mono TTF files SHALL be re-encoded to WOFF2. The system SHALL use `preloadFont()` to preload critical fonts before first composition. The `index.html` SHALL include `<link rel="preload">` tags for the font files.
@@ -229,9 +256,9 @@ The system SHALL bundle the "Sovereign Ledger" logo as SVG drawable resources: `
 - **WHEN** the login screen renders
 - **THEN** the logo icon (48dp, theme-appropriate variant) is displayed above the "BankTeller" wordmark in Fraunces `headlineMedium`, centered, with `Dimens.lg` spacing between icon and wordmark
 
-#### Scenario: Callback success displays logo icon
+#### Scenario: Callback success displays brand lockup
 - **WHEN** the callback screen renders in the success state
-- **THEN** the logo icon (48dp, theme-appropriate variant) is displayed above the headline
+- **THEN** the logo icon (48dp, theme-appropriate variant) and "BankTeller" wordmark (Fraunces `headlineMedium`) are displayed together above the status card, matching the login screen lockup
 
 #### Scenario: Logo variant follows theme
 - **WHEN** the app is in light mode

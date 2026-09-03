@@ -77,3 +77,21 @@ The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `Linkin
 #### Scenario: Consent preview uses wizard frame and decision box
 - **WHEN** the `AuthProgress` step is shown
 - **THEN** the consent preview is rendered inside `WizardScaffold` with the progress indicator, the guarantee text appears in an emerald-tinted `DecisionBox`, and "Continue to your bank" occupies the footer's forward slot
+
+### Requirement: Consent Preview Info Box (Tier 4)
+Gray-zone informational panels (e.g., the consent preview) SHALL use an `OutcomeBox` styling: `OutlinedCard` with `surfaceContainer` fill, 1dp outline hairline border, and 4dp corners — not `surfaceVariant`. This documents the info-box pattern added during verification.
+
+#### Scenario: Tier 4 info box styling
+- **WHEN** gray-zone informational panels are shown (e.g., consent preview)
+- **THEN** they use OutcomeBox: OutlinedCard with surfaceContainer fill, 1dp outline hairline border, 4dp corners — not surfaceVariant
+
+### Requirement: Linking Open/Re-open Flow
+The linking step SHALL provide an always-available way to (re-)open the bank linking URL, even when the original URL was already consumed (e.g., the tab was closed accidentally). A quiet "Re-open linking page" action SHALL re-request the URL and auto-open it (`pendingAutoOpen`), and the forward action ("I've completed linking") SHALL always be rendered regardless of URL state. When a linking error is shown, exactly one retry path SHALL be offered (the forward action) — no duplicate inline retry button.
+
+#### Scenario: Always-available linking action
+- **WHEN** the user is on the linking step and the link URL was already consumed (tab closed accidentally)
+- **THEN** a quiet "Re-open linking page" action is available in content which re-requests the URL and auto-opens it (pendingAutoOpen), and the forward action ("I've completed linking") is always rendered regardless of URL state
+
+#### Scenario: Duplicate retry removal
+- **WHEN** the linking step shows a linking error
+- **THEN** only one retry path is offered (the forward action), no duplicate inline retry button

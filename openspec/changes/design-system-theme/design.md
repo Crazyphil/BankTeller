@@ -37,13 +37,23 @@ Color tokens are defined as `val` constants in `Color.kt`. `Dimens` is an `objec
 
 **Alternative considered**: A `DesignTokens` data class passed via `CompositionLocal`. Rejected — adds indirection for no benefit; M3 already provides `MaterialTheme.colorScheme` as the access pattern.
 
-### D2: Dark mode via `isSystemInDarkTheme()` + localStorage override
+### D2: Dark mode via `isSystemInDarkTheme()` + localStorage override + in-app toggle
 
 `BankTellerTheme` reads `isSystemInDarkTheme()` for the System default. An explicit Light/Dark override is read from `localStorage["bankteller-theme"]` on startup. The theme composable resolves the effective mode: if localStorage has an explicit value, it takes precedence; otherwise `isSystemInDarkTheme()` decides.
 
 Login renders before server settings are available, so the preference must live browser-side. `localStorage` is synchronous, readable before first composition. A `mutableStateOf<ThemeMode>` holds the current mode in memory; writes to localStorage update both.
 
-**Alternative considered**: Store theme preference in SQLite via an API call. Rejected — login screen needs the theme before any API is available.
+The user SHALL be able to change the theme mode from anywhere in the app, including the login screen (before authentication). A `ThemeToggle` composable cycles the three modes on click: System → Light → Dark → System. It renders as a quiet `IconButton` showing the icon of the CURRENT mode: auto/system icon (half-filled circle) for System, sun for Light, moon for Dark. The current mode is thus discoverable without a tooltip; clicking advances to the next mode.
+
+Placement:
+- Screens with a `BrandedTopBar` (dashboard, onboarding): the toggle is the FIRST item in the top bar's `actions` slot, before logout.
+- Screens without a top bar (login, callback, legal pages): the toggle is a viewport-fixed quiet `IconButton` in the **top-right corner** (with padding equal to `Dimens.screenPadding`), rendered inside `SafeArea` insets and overlaying the scrollable content. It never scrolls away — legal texts can be arbitrarily long and the toggle stays reachable. The caption label is dropped at the corner; the current-mode icon plus an M3 tooltip carries the meaning.
+
+**Corner placement alternatives considered**: (a) Bottom-of-content (below the footer) — rejected: on long legal documents the toggle would scroll out of reach, violating "reachable from every screen". (b) A `FloatingActionButton` — rejected: FAB signals the screen's PRIMARY action; a theme toggle is a quiet utility, and a FAB's elevation/color would dominate the calm page. The corner IconButton matches the docs-site convention and keeps content untouched.
+
+**Icons**: The app gains a `compose.materialIconsExtended` dependency (Material Symbols as Kotlin `ImageVector` objects — the full icon set, of which only referenced icons ship in the build). The toggle uses `Icons.Filled.Contrast` (System), `Icons.Filled.LightMode` (Light), and `Icons.Filled.DarkMode` (Dark), tinted `onSurfaceVariant` via the default `Icon` tint. This follows the design language's "Build WITH Material" principle and future-proofs icon needs for navigation/settings screens. The iconography rule in `DESIGN-LANGUAGE.md` remains: Material Icons first, custom vector assets only for gaps.
+
+**Alternative considered**: Store theme preference in SQLite via an API call. Rejected — login screen needs the theme before any API is available. Also rejected: a three-option dropdown in a settings page — rejected because a settings screen doesn't exist yet and the toggle must be reachable pre-login.
 
 ### D3: Font loading via WOFF2 + preloadFont()
 
@@ -131,19 +141,20 @@ Replace the current 3 inconsistent error styles with one pattern per `DESIGN-LAN
 
 Replace the 12 hardcoded hex colors in `avatarBackgroundColors` with a function that derives colors from the theme. Use a hash of the bank name to pick from a curated list of theme-compatible colors (primary, brass, emerald, and their tonal variants). This ensures avatars look correct in both light and dark mode.
 
-### D13: Public page content layout — legal pages and callback screen
+### D13: Public page styling — "Sovereign Letterhead" direction
 
-Public pages are the app's public face (Enable Banking reviewers read privacy/terms; users land on callback after email-link clicks). They must feel like they belong to the same product, not generic placeholder pages.
+Public pages form their own coherent "public family" alongside login: top-bar-less, centered, with the full brand lockup. They do NOT get the `BrandedTopBar` — that would blur the line between unauthenticated pages and the authenticated app shell. The theme toggle is a viewport-fixed quiet `IconButton` in the top-right corner (never scrolls away, including on long legal documents), matching login.
 
-**ScreenShell** gains two parameters: `verticalArrangement: Arrangement.Vertical` (default `Top`) and `scrollable: Boolean` (default `false`). This lets legal pages use `Top` + `scrollable = true` while the callback uses `Center` + `scrollable = false`.
+**Callback screen** (`/enable-banking-callback`) mirrors the login page's visual weight. Structure: logo icon (48dp, theme-aware variant) + "BankTeller" wordmark (Fraunces `headlineMedium`) centered at top — the same lockup as login. Below the lockup, the status content sits in a **status card**: `OutlinedCard` with 3dp corners, 1dp `outlineVariant` hairline, and a brass double-rule accent line across its top edge (ledger motif). Inside the card:
+- **Success**: emerald status badge (emerald container + verification-dot icon), headline in `onSurface` with emerald-accented subtitle, session/redirect identifiers in JetBrains Mono `bodySmall`, brass `CircularProgressIndicator` at the card bottom during the 2s redirect (auth flow only).
+- **Error**: danger status badge, headline + body in `danger`, error details in JetBrains Mono inside a subtle code block. No redirect countdown.
+This gives readable-at-a-glance state during the 2-second flash and for a tab left open on a second device.
 
-**Legal pages (privacy, terms)** use `ScreenShell(maxWidth = Dimens.formMaxWidth, scrollable = true)` — the 400dp reading width is narrower than the 720dp content width because legal text is dense; a narrower column improves readability. Content hierarchy: title in Fraunces `headlineMedium`, optional last-updated date in Inter `bodySmall` `onSurfaceVariant`, section headers in `titleMedium` (Inter, primary), body in `bodyMedium` (Inter) with `lineHeight` override for legal reading comfort. A "BankTeller" wordmark footer in `bodySmall` `onSurfaceVariant` anchors the page to the product. The actual legal text content is out of scope (placeholder remains) — this change defines the layout vessel, not the copy.
+**Legal pages** (`/privacy`, `/terms`) get a **letterhead header**: 32dp logo + "BankTeller" wordmark (Fraunces) at the top of the reading column, followed by a hairline brass double-rule (`brass` at 30% opacity) separating letterhead from content — a formal bank-letter feel. The reading column widens to a new `Dimens.readingMaxWidth = 640.dp` (400dp was too narrow for legal text; 720dp makes lines too long). Content hierarchy: title in Fraunces `headlineLarge`, "Last updated" date in JetBrains Mono (`bodySmall`, `onSurfaceVariant`), section headers in Inter `titleMedium` with a 2dp `primary` left border tick, body in Inter `bodyLarge` with `lineHeight` ~1.6 for legal reading. Footer: compact legal line in JetBrains Mono `labelSmall` (copyright/disclosure) — replaces the old "BankTeller" wordmark footer, since the letterhead now carries the branding. Actual legal text content remains out of scope (placeholder stays).
 
-**Callback screen** uses `ScreenShell(maxWidth = Dimens.formMaxWidth, verticalArrangement = Center)` — it's a transient status screen, not a reading page. Two states with semantic color weight:
-- **Success**: headline in Fraunces `headlineMedium` with an emerald accent (emerald = verified, per `DESIGN-LANGUAGE.md` §3), body in Inter `bodyMedium`, `CircularProgressIndicator` in `brass` during the 2s redirect countdown (auth flow only), "BankTeller" wordmark footer. The emerald accent signals "this worked" without being a full emerald wash — a colored icon or a short accent line under the headline.
-- **Error**: headline in `danger` color, body in `danger` color, no redirect countdown, no footer wordmark (error is terminal, not a branded moment).
+`ScreenShell` keeps its `verticalArrangement` / `scrollable` params; legal pages use `Top` + `scrollable = true`, callback uses `Center` + `scrollable = false`.
 
-**Alternative considered**: Use the full 720dp content width for legal pages. Rejected — legal text at 720dp creates long lines that are hard to read; 400dp is the established form/reading width.
+**Alternative considered**: `BrandedTopBar` on all public pages (app-chrome direction). Rejected — unauthenticated pages should stay visually distinct from the authenticated shell; the centered lockup + bottom toggle already form a coherent public identity anchored by login.
 
 ### D14: App logo — "Sovereign Ledger" icon
 
