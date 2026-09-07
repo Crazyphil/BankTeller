@@ -34,6 +34,39 @@ Use the run button in your IDE's editor gutter, or run tests using Gradle tasks:
     - Wasm target: `./gradlew :app:shared:wasmJsTest`
     - JS target: `./gradlew :app:shared:jsTest`
 
+### Building the container image
+
+Host prerequisites:
+
+- JDK 21
+- On Debian/Ubuntu: `libatomic1` (required by the Kotlin/JS Node toolchain during the build):
+  `sudo apt-get install libatomic1`
+
+Build the deployment image with a single command:
+
+```bash
+scripts/build-image.sh
+```
+
+This builds the fat JAR on the host (`./gradlew :server:shadowJar`), builds the
+`bankteller:latest` container image (Podman preferred, Docker fallback), and
+automatically prunes dangling (untagged) images after each successful build, so
+repeated rebuilds do not accumulate stale container layers.
+
+To reclaim historical storage beyond dangling images, prune manually:
+
+```bash
+podman system prune        # or: docker system prune
+podman volume prune        # or: docker volume prune
+```
+
+The image sets `JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"` so the JVM heap
+sizes relative to the container's memory limit. Override it via the environment
+(e.g. in `docker-compose.yml` or `docker run -e JAVA_TOOL_OPTIONS=...`).
+
+Browser tests are unaffected: they still run in their dedicated container image
+(`scripts/build-browser-tests-image.sh`, `./gradlew :app:web:containerJsBrowserTest`).
+
 ---
 
 Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html),

@@ -1,7 +1,10 @@
-# Build artifacts — copied into the image would waste ~640 MB and slow COPY.
-# The container's stage-1 `gradle:8.11-jdk21` rebuilds everything from source.
+# Build artifacts are excluded from the context, except the pre-built fat JAR
+# that the copy-only Dockerfile packages into the runtime image.
 build
 **/build
+!server/build
+!server/build/libs
+!server/build/libs/server-all.jar
 .gradle
 **/.gradle
 kotlin-js-store/.cache

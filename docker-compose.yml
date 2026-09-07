@@ -1,6 +1,8 @@
 services:
   bankteller:
+    image: bankteller:latest
     build: .
+    pull_policy: never
     container_name: bankteller
     ports:
       - "${SERVER_PORT:-8080}:8080"

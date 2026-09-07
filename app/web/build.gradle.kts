@@ -221,6 +221,16 @@ val containerWasmJsBrowserTest = containerBrowserTestTask(
     description = "Runs wasmJsBrowserTest inside the bankteller-browser-tests container (isolated Chrome)"
 )
 
+// The two container test tasks share build outputs on the repo mount
+// (app/web/build/compose/skiko-for-web-runtime, build/js/...). Running them
+// concurrently (possible with org.gradle.parallel=true) races on the shared
+// build dir — on fuse-backed filesystems this surfaces as "could not set file
+// mode" / ".fuse_hidden" failures inside the containers. Force them to run
+// sequentially.
+containerWasmJsBrowserTest.configure {
+    mustRunAfter(containerJsBrowserTest)
+}
+
 // When running in container mode (the default), wire the container tasks into
 // `check` so a normal `./gradlew test` / `check` exercises them.
 if (runBrowserTestsInContainer) {

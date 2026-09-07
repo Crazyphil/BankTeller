@@ -44,7 +44,7 @@ A small bash script (mirroring the style of `scripts/build-browser-tests-image.s
 ### 4. Opportunistic build optimizations (same files, folded in)
 Three small optimizations adopted alongside the restructure:
 
-1. **`org.gradle.parallel=true`** in `gradle.properties` — `:core`, `:server`, `:app:web` are separate modules that can build in parallel on multi-core hosts.
+1. **`org.gradle.parallel=true`** in `gradle.properties` — `:core`, `:server`, `:app:web` are separate modules that can build in parallel on multi-core hosts. Carve-out: the two container test tasks (`containerJsBrowserTest` / `containerWasmJsBrowserTest`) are serialized via `mustRunAfter` because they share build outputs on the repo mount (`app/web/build/compose/skiko-for-web-runtime`, `build/js`); running them concurrently races on the shared build dir, which fails on fuse-backed filesystems ("could not set file mode", `.fuse_hidden` artifacts).
 2. **`pull_policy: never`** on the `bankteller` compose service — the image is local-only (`bankteller:latest`); this makes `compose up` deterministic across Docker and Podman-compose (no registry lookup attempts).
 3. **Container-aware JVM defaults** in the image — `ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"` so the heap sizes to container limits rather than host RAM. Appropriate for a self-hosted single-user app; overridable by overriding the env var.
 
