@@ -492,4 +492,5 @@ The current codebase has no theme layer, no design tokens, and no shared compone
 ## Reference
 
 - **Product vision**: `VISION.md` — product requirements and deployment architecture.
-- **Previous proposal**: `DESIGN-SYSTEM-DARK-OBSIDIAN.md` — archived "Dark Obsidian Precision" direction. Superseded by this document.
+
+This document is the single source of truth for visual and interaction design.
