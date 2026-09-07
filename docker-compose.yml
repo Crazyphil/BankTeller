@@ -1,6 +1,5 @@
 services:
   bankteller:
-    image: bankteller:latest
     build: .
     container_name: bankteller
     ports:

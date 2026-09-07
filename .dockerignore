@@ -1,11 +1,7 @@
 # Build artifacts — copied into the image would waste ~640 MB and slow COPY.
-# The copy-only runtime image needs just the pre-built fat JAR, so the
-# server build directory is re-included below.
+# The container's stage-1 `gradle:8.11-jdk21` rebuilds everything from source.
 build
 **/build
-!server/build
-!server/build/libs
-!server/build/libs/server-all.jar
 .gradle
 **/.gradle
 kotlin-js-store/.cache
