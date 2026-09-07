@@ -1,5 +1,6 @@
 package it.kapfer.bankteller.onboarding
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
@@ -37,7 +38,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -55,9 +55,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.FilterQuality
-import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.SpanStyle
@@ -78,7 +78,16 @@ import it.kapfer.bankteller.createHttpClient
 
 import it.kapfer.bankteller.openUrlInNewTab
 import it.kapfer.bankteller.redirectTo
-import it.kapfer.bankteller.robotoMonoFamily
+import it.kapfer.bankteller.jetBrainsMonoFamily
+import it.kapfer.bankteller.ui.components.BrandedTopBar
+import it.kapfer.bankteller.ui.components.DecisionBox
+import it.kapfer.bankteller.ui.components.QuietButton
+import it.kapfer.bankteller.ui.components.ScreenShell
+import it.kapfer.bankteller.ui.components.ThemeToggle
+import it.kapfer.bankteller.ui.components.WizardProgressIndicator
+import it.kapfer.bankteller.ui.components.WizardScaffold
+import it.kapfer.bankteller.ui.theme.Dimens
+import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import io.ktor.client.request.get
 import io.ktor.client.statement.readRawBytes
 import io.ktor.http.encodeURLParameter
@@ -89,18 +98,27 @@ import androidx.compose.ui.graphics.toComposeImageBitmap
  * Root composable for the Enable Banking onboarding flow.
  *
  * Dispatches to the appropriate step composable based on [viewModel.onboardingStep].
- * Tasks 7.3 – 7.7.
+ * Tasks 7.3 – 7.7. App chrome (task 11.5): a [BrandedTopBar] with the theme toggle
+ * as the FIRST actions item, then logout — replacing ad-hoc logout buttons buried
+ * in individual wizard steps.
  */
 @Composable
 fun OnboardingScreen(viewModel: AppViewModel) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .safeContentPadding()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top,
+    ScreenShell(
+        maxWidth = Dimens.contentMaxWidth,
+        scrollable = true,
+        topBar = {
+            BrandedTopBar(
+                actions = {
+                    ThemeToggle()
+                    TextButton(
+                        onClick = { viewModel.logout() },
+                    ) {
+                        Text("Logout")
+                    }
+                },
+            )
+        },
     ) {
         when (viewModel.onboardingStep) {
             OnboardingStep.EmailEntry -> EmailEntryStep(viewModel)
@@ -147,88 +165,64 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
         }
     }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "Enable Banking setup",
-                style = MaterialTheme.typography.headlineSmall,
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text(
-                text = "Enter your Enable Banking email to begin. BankTeller will send a login link to that address.",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            OutlinedTextField(
-                value = email,
-                onValueChange = {
-                    email = it
-                    emailError = null
-                },
-                label = { Text("Email") },
-                singleLine = true,
-                isError = emailError != null,
-                supportingText = emailError?.let { err -> { Text(err) } },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { submit() }),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(emailFocusRequester),
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Display the derived redirect URL as informational text
-            val derivedUrl = viewModel.onboardingDerivedRedirectUrl
-            if (derivedUrl != null) {
-                Text(
-                    text = buildAnnotatedString {
-                        append("BankTeller will use ")
-                        withStyle(SpanStyle(fontFamily = robotoMonoFamily())) {
-                            append(derivedUrl)
-                        }
-                        append(" for the email-link redirect — fix your reverse proxy config if this looks wrong.")
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                Text(
-                    text = "Loading redirect URL…",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-                onClick = submit,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
+    WizardScaffold(
+        eyebrow = "STEP 1 OF 8",
+        title = "Enable Banking setup",
+        oneLiner = "Enter your Enable Banking email to begin. BankTeller will send a login link to that address.",
+        progress = { WizardProgressIndicator(currentStep = 0, totalSteps = 8) },
+        onBack = null,
+        forward = {
+            Button(onClick = submit) {
                 Text("Send login email")
             }
+        },
+    ) {
+        OutlinedTextField(
+            value = email,
+            onValueChange = {
+                email = it
+                emailError = null
+            },
+            label = { Text("Email") },
+            singleLine = true,
+            isError = emailError != null,
+            supportingText = emailError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) } },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { submit() }),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(emailFocusRequester),
+        )
 
-            // Show error from server
-            viewModel.onboardingError?.let { error ->
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = error,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+        // Display the derived redirect URL as informational text
+        val derivedUrl = viewModel.onboardingDerivedRedirectUrl
+        if (derivedUrl != null) {
+            Text(
+                text = buildAnnotatedString {
+                    append("BankTeller will use ")
+                    withStyle(SpanStyle(fontFamily = jetBrainsMonoFamily())) {
+                        append(derivedUrl)
+                    }
+                    append(" for the email-link redirect — fix your reverse proxy config if this looks wrong.")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = "Loading redirect URL…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        // Show error from server
+        viewModel.onboardingError?.let { error ->
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }
@@ -243,36 +237,25 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
  */
 @Composable
 private fun WaitingStep(viewModel: AppViewModel) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally,
+    WizardScaffold(
+        eyebrow = "STEP 2 OF 8",
+        title = "Check your email",
+        oneLiner = "We sent a login email to ${viewModel.onboardingEmail}. Click the link in that email to continue. You can click the link on another device — this tab will auto-advance.",
+        progress = { WizardProgressIndicator(currentStep = 1, totalSteps = 8) },
+        onBack = { viewModel.resetOnboarding() },
+        backLabel = "Start over",
+        forward = null,
     ) {
-        Text(
-            text = "Check your email",
-            style = MaterialTheme.typography.headlineSmall,
+        CircularProgressIndicator(
+            color = LocalBankTellerColors.current.brass,
         )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Text(
-            text = buildAnnotatedString {
-                append("We sent a login email to ")
-                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                    append(viewModel.onboardingEmail)
-                }
-                append(". Click the link in that email to continue. You can click the link on another device — this tab will auto-advance.")
-            },
-            style = MaterialTheme.typography.bodyMedium,
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
 
         val derivedUrl = viewModel.onboardingDerivedRedirectUrl
         if (derivedUrl != null) {
             Text(
                 text = buildAnnotatedString {
                     append("Redirect URL in use: ")
-                    withStyle(SpanStyle(fontFamily = robotoMonoFamily())) {
+                    withStyle(SpanStyle(fontFamily = jetBrainsMonoFamily())) {
                         append(derivedUrl)
                     }
                 },
@@ -292,16 +275,6 @@ private fun WaitingStep(viewModel: AppViewModel) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        CircularProgressIndicator()
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        TextButton(onClick = { viewModel.cancelOnboarding() }) {
-            Text("Start over")
         }
     }
 }
@@ -348,40 +321,34 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
         }
     }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "Review registration",
-                style = MaterialTheme.typography.headlineSmall,
-            )
-
-            // Show retryable error banner so the user knows what to fix
-            viewModel.onboardingError?.let { error ->
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = error,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
+    WizardScaffold(
+        eyebrow = "STEP 3 OF 8",
+        title = "Review registration",
+        oneLiner = "Review the registration details before submitting.",
+        progress = { WizardProgressIndicator(currentStep = 2, totalSteps = 8) },
+        onBack = { viewModel.resetOnboarding() },
+        backLabel = "Back to email",
+        forward = {
+            Button(onClick = submit) {
+                Text("Register")
             }
+        },
+    ) {
+        // Show retryable error banner so the user knows what to fix
+        viewModel.onboardingError?.let { error ->
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // --- Environment radio group ---
+        // --- Environment radio group ---
+        Column(verticalArrangement = Arrangement.spacedBy(Dimens.sm)) {
             Text(
                 text = "Environment",
                 style = MaterialTheme.typography.titleSmall,
             )
-
-            Spacer(modifier = Modifier.height(8.dp))
 
             EnvironmentOption(
                 label = "PRODUCTION",
@@ -394,8 +361,6 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                 onClick = { environment = "PRODUCTION" },
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
-
             EnvironmentOption(
                 label = "SANDBOX",
                 description = "For testing against simulated banks with test data. Auto-activated, " +
@@ -405,36 +370,32 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                 selected = environment == "SANDBOX",
                 onClick = { environment = "SANDBOX" },
             )
+        }
 
-            Spacer(modifier = Modifier.height(16.dp))
+        // --- Redirect URL ---
+        OutlinedTextField(
+            value = redirectUrl,
+            onValueChange = {
+                redirectUrl = it
+                urlError = null
+                viewModel.clearOnboardingError()
+            },
+            label = { Text("Redirect URL") },
+            singleLine = true,
+            isError = urlError != null,
+            supportingText = urlError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) } },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { submit() }),
+            modifier = Modifier.fillMaxWidth(),
+        )
 
-            // --- Redirect URL ---
-            OutlinedTextField(
-                value = redirectUrl,
-                onValueChange = {
-                    redirectUrl = it
-                    urlError = null
-                    viewModel.clearOnboardingError()
-                },
-                label = { Text("Redirect URL") },
-                singleLine = true,
-                isError = urlError != null,
-                supportingText = urlError?.let { err -> { Text(err) } },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { submit() }),
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            // --- Production field overrides (only shown for PRODUCTION) ---
-            if (environment == "PRODUCTION") {
-                Spacer(modifier = Modifier.height(16.dp))
-
+        // --- Production field overrides (only shown for PRODUCTION) ---
+        if (environment == "PRODUCTION") {
+            Column(verticalArrangement = Arrangement.spacedBy(Dimens.sm)) {
                 Text(
                     text = "Production field overrides",
                     style = MaterialTheme.typography.titleSmall,
                 )
-
-                Spacer(modifier = Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = description,
@@ -449,8 +410,6 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                Spacer(modifier = Modifier.height(8.dp))
-
                 OutlinedTextField(
                     value = gdprEmail,
                     onValueChange = {
@@ -463,8 +422,6 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     keyboardActions = KeyboardActions(onDone = { submit() }),
                     modifier = Modifier.fillMaxWidth(),
                 )
-
-                Spacer(modifier = Modifier.height(8.dp))
 
                 OutlinedTextField(
                     value = privacyUrl,
@@ -479,8 +436,6 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                Spacer(modifier = Modifier.height(8.dp))
-
                 OutlinedTextField(
                     value = termsUrl,
                     onValueChange = {
@@ -493,16 +448,6 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     keyboardActions = KeyboardActions(onDone = { submit() }),
                     modifier = Modifier.fillMaxWidth(),
                 )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // --- Submit button ---
-            Button(
-                onClick = submit,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Register")
             }
         }
     }
@@ -518,37 +463,26 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
  */
 @Composable
 private fun VerifyingStep(viewModel: AppViewModel) {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally,
+    WizardScaffold(
+        eyebrow = "STEP 4 OF 8",
+        title = "Verifying…",
+        oneLiner = null,
+        progress = { WizardProgressIndicator(currentStep = 3, totalSteps = 8) },
+        onBack = null,
+        forward = null,
     ) {
-        Text(
-            text = "Verifying…",
-            style = MaterialTheme.typography.headlineSmall,
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Text(
-            text = "Registering your Enable Banking application. This may take a few seconds.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
         if (viewModel.onboardingError == null) {
-            CircularProgressIndicator()
+            CircularProgressIndicator(
+                color = LocalBankTellerColors.current.brass,
+            )
         }
 
         viewModel.onboardingError?.let { error ->
-            Spacer(modifier = Modifier.height(16.dp))
             Text(
                 text = error,
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,
             )
-
-            Spacer(modifier = Modifier.height(12.dp))
 
             Button(onClick = { viewModel.cancelOnboarding() }) {
                 Text("Restart onboarding")
@@ -563,54 +497,52 @@ private fun VerifyingStep(viewModel: AppViewModel) {
 
 /**
  * Explains the two-step bank setup process (account linking in a new tab + session auth in current tab).
- * Provides a primary button to start bank setup, as well as logout and restart options.
+ * Provides a primary button to start bank setup and a restart option.
+ * Logout lives in the BrandedTopBar (task 11.5) — the back slot is not repurposed.
  */
 @Composable
 private fun ActivationGuideStep(viewModel: AppViewModel) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "Complete Bank Setup",
-                style = MaterialTheme.typography.headlineSmall,
+    WizardScaffold(
+        eyebrow = "STEP 5 OF 8",
+        title = "Complete bank setup",
+        oneLiner = "Bank setup requires a two-step authorization process with your bank.",
+        progress = { WizardProgressIndicator(currentStep = 4, totalSteps = 8) },
+        onBack = null,
+        extraActions = {
+            QuietButton(
+                onClick = { viewModel.resetOnboarding() },
+                label = "Restart onboarding",
             )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text(
-                text = "Bank setup requires a two-step authorization process with your bank:\n\n" +
-                        "1. Account linking — connects Enable Banking to your financial institution in a new browser tab.\n" +
-                        "2. Session authorization — grants active session permissions in this tab.\n\n" +
-                        "Both steps are required to provide free access to your accounts.",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Button(
-                onClick = { viewModel.startBankSetup() },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
+        },
+        forward = {
+            Button(onClick = { viewModel.startBankSetup() }) {
                 Text("Start Bank Setup")
             }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            TextButton(onClick = { viewModel.logout() }) {
-                Text("Logout")
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            TextButton(onClick = { viewModel.resetOnboarding() }) {
-                Text("Restart onboarding")
-            }
+        },
+    ) {
+        // Two-step explanation as Tier 2 groups
+        Column(verticalArrangement = Arrangement.spacedBy(Dimens.sm)) {
+            Text(
+                text = "1. Account linking",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                text = "Connects Enable Banking to your financial institution in a new browser tab.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = "2. Session authorization",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                text = "Grants active session permissions in this tab.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                text = "Both steps are required to provide free access to your accounts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -654,28 +586,29 @@ private val countryCodeToNameMap = mapOf(
     "GB" to "United Kingdom",
 )
 
-private val avatarBackgroundColors = listOf(
-    Color(0xFF6366F1), // Indigo
-    Color(0xFF4F46E5), // Darker Indigo
-    Color(0xFF10B981), // Emerald
-    Color(0xFF0D9488), // Teal
-    Color(0xFF0284C7), // Sky Blue
-    Color(0xFF2563EB), // Royal Blue
-    Color(0xFF7C3AED), // Violet
-    Color(0xFF9333EA), // Purple
-    Color(0xFFC026D3), // Fuchsia
-    Color(0xFFDB2777), // Pink
-    Color(0xFFD97706), // Amber
-    Color(0xFFEA580C), // Orange
-)
+@Composable
+private fun themedAvatarBackgroundColors(): List<Color> {
+    val primary = MaterialTheme.colorScheme.primary
+    val brass = LocalBankTellerColors.current.brass
+    val emerald = LocalBankTellerColors.current.emerald
+    val error = MaterialTheme.colorScheme.error
+    val onSurface = MaterialTheme.colorScheme.onSurface
+    return listOf(
+        primary, brass, emerald, error,
+        lerp(primary, brass, 0.5f), lerp(primary, emerald, 0.5f),
+        lerp(brass, emerald, 0.5f), lerp(primary, error, 0.5f),
+        lerp(primary, onSurface, 0.4f), lerp(brass, onSurface, 0.4f),
+        lerp(emerald, onSurface, 0.4f), lerp(error, onSurface, 0.4f),
+    )
+}
 
 /**
  * Deterministic background color from BIC hash or bank name.
  */
-private fun getAvatarBackgroundColor(key: String): Color {
+private fun getAvatarBackgroundColor(key: String, palette: List<Color>): Color {
     val hash = key.hashCode()
-    val index = (hash and 0x7FFFFFFF) % avatarBackgroundColors.size
-    return avatarBackgroundColors[index]
+    val index = (hash and 0x7FFFFFFF) % palette.size
+    return palette[index]
 }
 
 /**
@@ -685,7 +618,10 @@ private fun getAvatarBackgroundColor(key: String): Color {
 private fun BankAvatar(bankName: String, bic: String?, modifier: Modifier = Modifier) {
     val initials = bankName.trim().take(2).uppercase()
     val bgKey = bic ?: bankName
-    val bgColor = remember(bgKey) { getAvatarBackgroundColor(bgKey) }
+    val bgColor = getAvatarBackgroundColor(bgKey, themedAvatarBackgroundColors())
+    // Relative luminance (Rec. 601) for contrast-safe initials.
+    val bgLum = 0.299f * bgColor.red + 0.587f * bgColor.green + 0.114f * bgColor.blue
+    val textColor = if (bgLum > 0.5f) Color.Black else Color.White
 
     Box(
         modifier = modifier
@@ -696,7 +632,7 @@ private fun BankAvatar(bankName: String, bic: String?, modifier: Modifier = Modi
     ) {
         Text(
             text = initials,
-            color = Color.White,
+            color = textColor,
             style = MaterialTheme.typography.titleMedium.copy(
                 fontWeight = FontWeight.Bold,
                 fontSize = 20.sp,
@@ -750,7 +686,7 @@ private fun BankLogo(bank: Aspssp, modifier: Modifier = Modifier) {
             contentDescription = "${bank.name} logo",
             modifier = modifier
                 .size(64.dp)
-                .clip(RoundedCornerShape(8.dp)),
+                .clip(RoundedCornerShape(Dimens.sm)),
             contentScale = ContentScale.Fit,
             filterQuality = FilterQuality.None,
         )
@@ -773,97 +709,96 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
 
     var searchQuery by remember { mutableStateOf("") }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
+    WizardScaffold(
+        eyebrow = "STEP 6 OF 8",
+        title = "Choose your bank",
+        oneLiner = "Search and select your bank.",
+        progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+        onBack = null,
+        forward = {
+            val selected = viewModel.selectedAspsp
+            if (selected != null) {
+                Button(onClick = { viewModel.linkAccounts() }) {
+                    Text("Connect ${selected.name}")
+                }
+            }
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "Select your bank",
-                style = MaterialTheme.typography.headlineSmall,
-            )
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            label = { Text("Search by name, BIC, or country") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
 
-            Spacer(modifier = Modifier.height(12.dp))
-
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                label = { Text("Search by name, BIC, or country") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            when (val state = viewModel.aspspsState) {
-                is AspspsState.Loading -> {
-                    CircularProgressIndicator()
-                    Spacer(modifier = Modifier.height(16.dp))
+        when (val state = viewModel.aspspsState) {
+            is AspspsState.Loading -> {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = Dimens.xxl),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
                 }
-                is AspspsState.Error -> {
+            }
+            is AspspsState.Error -> {
+                Text(
+                    text = state.message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Button(onClick = { viewModel.loadAspsps() }) {
+                    Text("Retry")
+                }
+            }
+            is AspspsState.Loaded -> {
+                val query = searchQuery.trim().lowercase()
+                val filtered = remember(query, state.aspsps) {
+                    if (query.isEmpty()) state.aspsps
+                    else state.aspsps.filter { bank ->
+                        val countryName = countryCodeToNameMap[bank.country.uppercase()]?.lowercase() ?: ""
+                        bank.name.lowercase().contains(query) ||
+                        bank.country.lowercase().contains(query) ||
+                        countryName.contains(query) ||
+                        (bank.bic?.lowercase()?.contains(query) == true)
+                    }
+                }
+
+                if (filtered.isEmpty()) {
                     Text(
-                        text = state.message,
-                        color = MaterialTheme.colorScheme.error,
+                        text = "No banks found matching your search.",
                         style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(onClick = { viewModel.loadAspsps() }) {
-                        Text("Retry")
-                    }
-                    Spacer(modifier = Modifier.height(16.dp))
-                }
-                is AspspsState.Loaded -> {
-                    val query = searchQuery.trim().lowercase()
-                    val filtered = remember(query, state.aspsps) {
-                        if (query.isEmpty()) state.aspsps
-                        else state.aspsps.filter { bank ->
-                            val countryName = countryCodeToNameMap[bank.country.uppercase()]?.lowercase() ?: ""
-                            bank.name.lowercase().contains(query) ||
-                            bank.country.lowercase().contains(query) ||
-                            countryName.contains(query) ||
-                            (bank.bic?.lowercase()?.contains(query) == true)
-                        }
-                    }
-
-                    if (filtered.isEmpty()) {
-                        Text(
-                            text = "No banks found matching your search.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                    } else {
-                        Text(
-                            text = "${filtered.size} banks",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val listState = rememberLazyListState()
-                        Box(
+                } else {
+                    Text(
+                        text = "${filtered.size} banks",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    val listState = rememberLazyListState()
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 400.dp)
+                    ) {
+                        LazyColumn(
+                            state = listState,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 400.dp)
+                                .padding(end = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(Dimens.sm),
                         ) {
-                            LazyColumn(
-                                state = listState,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(end = 12.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                items(
-                                    items = filtered,
-                                    key = { bank -> "${bank.name}-${bank.country}" },
-                                ) { bank ->
+                            items(
+                                items = filtered,
+                                key = { bank -> "${bank.name}-${bank.country}" },
+                            ) { bank ->
                                 val isSelected = viewModel.selectedAspsp?.name == bank.name &&
                                         viewModel.selectedAspsp?.country == bank.country
-                                Card(
+                                OutlinedCard(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
@@ -874,23 +809,28 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                 viewModel.selectPsuType(defaultPsu)
                                             }
                                         },
-                                    colors = if (isSelected) {
-                                        CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.primaryContainer
-                                        )
-                                    } else {
-                                        CardDefaults.cardColors()
-                                    }
+                                    shape = MaterialTheme.shapes.medium,
+                                    border = BorderStroke(
+                                        width = if (isSelected) 2.dp else 1.dp,
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                    ),
+                                    colors = CardDefaults.outlinedCardColors(
+                                        containerColor = if (isSelected) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceContainer
+                                        }
+                                    ),
                                 ) {
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(12.dp),
+                                            .padding(Dimens.md),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
                                         BankLogo(bank = bank)
 
-                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Spacer(modifier = Modifier.width(Dimens.md))
 
                                         Column(
                                             modifier = Modifier.weight(1f),
@@ -902,10 +842,11 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                             ) {
                                                 Text(
                                                     text = bank.name,
-                                                    style = MaterialTheme.typography.bodyLarge.copy(fontWeight = FontWeight.Bold),
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    color = MaterialTheme.colorScheme.onSurface,
                                                     modifier = Modifier.weight(1f, fill = false),
                                                 )
-                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Spacer(modifier = Modifier.width(Dimens.sm))
                                                 val countryName = countryCodeToNameMap[bank.country.uppercase()]
                                                 val displayCountry = if (countryName != null) {
                                                     "${bank.country.uppercase()} · $countryName"
@@ -914,24 +855,24 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                 }
                                                 Text(
                                                     text = displayCountry,
-                                                    style = MaterialTheme.typography.bodySmall,
+                                                    style = MaterialTheme.typography.labelSmall,
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 )
                                             }
 
                                             if (bank.bic != null) {
-                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Spacer(modifier = Modifier.height(Dimens.xs))
                                                 Text(
                                                     text = "BIC: ${bank.bic}",
-                                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = robotoMonoFamily()),
+                                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = jetBrainsMonoFamily()),
                                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 )
                                             }
 
                                             if (bank.psuTypes.isNotEmpty()) {
-                                                Spacer(modifier = Modifier.height(8.dp))
+                                                Spacer(modifier = Modifier.height(Dimens.sm))
                                                 Row(
-                                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
                                                 ) {
                                                     bank.psuTypes.sortedBy { if (it == "personal") 0 else 1 }.forEach { psu ->
                                                         val psuSelected = isSelected && viewModel.selectedPsuType == psu
@@ -944,21 +885,23 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                             label = {
                                                                 Text(
                                                                     text = psu.capitalizeFirstLetter(),
-                                                                    color = if (psuSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
-                                                                    fontWeight = if (psuSelected) FontWeight.Bold else FontWeight.Normal,
+                                                                    style = MaterialTheme.typography.labelSmall,
                                                                 )
                                                             },
+                                                            shape = MaterialTheme.shapes.small,
                                                             colors = FilterChipDefaults.filterChipColors(
                                                                 selectedContainerColor = MaterialTheme.colorScheme.primary,
                                                                 selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
                                                                 containerColor = MaterialTheme.colorScheme.surface,
-                                                                labelColor = MaterialTheme.colorScheme.onSurface,
+                                                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
                                                             ),
                                                             border = FilterChipDefaults.filterChipBorder(
                                                                 enabled = true,
                                                                 selected = psuSelected,
                                                                 borderColor = MaterialTheme.colorScheme.outline,
                                                                 selectedBorderColor = MaterialTheme.colorScheme.primary,
+                                                                borderWidth = 1.dp,
+                                                                selectedBorderWidth = 1.dp,
                                                             ),
                                                         )
                                                     }
@@ -968,36 +911,24 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                     }
                                 }
                             }
-                            }
-                            VerticalScrollbar(
-                                adapter = rememberScrollbarAdapter(listState),
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .align(Alignment.TopEnd),
-                            )
                         }
-                        Spacer(modifier = Modifier.height(16.dp))
+                        VerticalScrollbar(
+                            adapter = rememberScrollbarAdapter(listState),
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .align(Alignment.TopEnd),
+                        )
                     }
                 }
             }
+        }
 
-            viewModel.linkError?.let { err ->
-                Text(
-                    text = err,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-            }
-
-            val selected = viewModel.selectedAspsp
-            Button(
-                onClick = { viewModel.linkAccounts() },
-                enabled = selected != null && !viewModel.isLoading,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(if (selected != null) "Connect ${selected.name}" else "Select a bank")
-            }
+        viewModel.linkError?.let { err ->
+            Text(
+                text = err,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
@@ -1012,143 +943,98 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
 
     val linkUrl = viewModel.linkAuthorizationUrl
 
-    // In resume mode, auto-open the tab when relinkAccount() sets a new URL.
-    // In fresh mode, the user clicks "Open linking page" manually.
-    LaunchedEffect(linkUrl, isResumeMode) {
-        if (linkUrl != null && isResumeMode) {
+    // Open the linking tab automatically in resume mode, or after the user
+    // explicitly requested a fresh linking URL via "Re-open linking page".
+    var pendingAutoOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(linkUrl, isResumeMode, pendingAutoOpen) {
+        if (linkUrl != null && (isResumeMode || pendingAutoOpen)) {
             openUrlInNewTab(linkUrl)
             viewModel.consumeLinkAuthorizationUrl()
+            pendingAutoOpen = false
         }
     }
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
+    WizardScaffold(
+        eyebrow = "STEP 7 OF 8",
+        title = "Linking your account",
+        oneLiner = if (isResumeMode) {
+            "Account linking was started in a previous session. " +
+                    "If you've completed linking in the Enable Banking control panel, " +
+                    "click below to continue to authorization."
+        } else {
+            "You'll be redirected to Enable Banking's control panel to link your account. " +
+                    "This verifies your identity so BankTeller can securely access your bank accounts."
+        },
+        progress = { WizardProgressIndicator(currentStep = 6, totalSteps = 8) },
+        onBack = { viewModel.cancelLinking() },
+        backLabel = "Back to bank list",
+        forward = {
+            Button(
+                onClick = { viewModel.checkLinkStatus() },
+                enabled = !viewModel.linkStatusChecking && !viewModel.isLoading,
+            ) {
+                Text("I've completed linking")
+            }
+        },
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
+        if (!isResumeMode) {
             Text(
-                text = "Complete account linking",
-                style = MaterialTheme.typography.headlineSmall,
+                text = "After completing the linking process, close that tab and return here to continue.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
 
-            Spacer(modifier = Modifier.height(12.dp))
-
+        viewModel.authError?.let { err ->
             Text(
-                text = if (isResumeMode) {
-                    "Account linking was started in a previous session. " +
-                            "If you've completed linking in the Enable Banking control panel, " +
-                            "click below to continue to authorization."
-                } else {
-                    "You'll be redirected to Enable Banking's control panel to link your account. " +
-                            "This verifies your identity so BankTeller can securely access your bank accounts."
-                },
+                text = err,
+                color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,
             )
-
-            if (!isResumeMode) {
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = "After completing the linking process, close that tab and return here to continue.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Button(onClick = { viewModel.checkLinkStatus() }) {
+                Text("Retry")
             }
+        }
 
-            Spacer(modifier = Modifier.height(16.dp))
+        viewModel.linkError?.let { err ->
+            Text(
+                text = err,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
 
-            viewModel.authError?.let { err ->
-                Text(
-                    text = err,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-            }
+        if (viewModel.linkStatusChecking) {
+            CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
+        }
 
-            viewModel.linkError?.let { err ->
-                Text(
-                    text = err,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-            }
-
-            if (viewModel.linkStatusChecking) {
-                CircularProgressIndicator()
-                Spacer(modifier = Modifier.height(16.dp))
-            }
-
-            if (isResumeMode) {
-                Button(
-                    onClick = { viewModel.checkLinkStatus() },
-                    enabled = !viewModel.linkStatusChecking && !viewModel.isLoading,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Continue to authorization")
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "If you haven't completed linking yet, you can re-open the linking tab.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = { viewModel.relinkAccount() },
-                    enabled = !viewModel.isLoading,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Re-open linking tab")
-                }
-            } else {
-                if (linkUrl != null) {
-                    Button(
-                        onClick = {
-                            openUrlInNewTab(linkUrl)
-                            viewModel.consumeLinkAuthorizationUrl()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("Open linking page")
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Click the button above to open the Enable Banking control panel in a new tab.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    OutlinedButton(
-                        onClick = { viewModel.checkLinkStatus() },
-                        enabled = !viewModel.linkStatusChecking && !viewModel.isLoading,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("I've completed linking, authorize now")
-                    }
-                } else {
-                    Button(
-                        onClick = {
-                            viewModel.checkLinkStatus()
-                        },
-                        enabled = !viewModel.linkStatusChecking && !viewModel.isLoading,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("I've completed linking, authorize now")
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = { viewModel.cancelLinking() },
-                modifier = Modifier.fillMaxWidth(),
+        if (linkUrl != null) {
+            Button(
+                onClick = {
+                    openUrlInNewTab(linkUrl)
+                    viewModel.consumeLinkAuthorizationUrl()
+                },
             ) {
-                Text("Back to bank list")
+                Text("Open linking page")
             }
+            Text(
+                text = "Click the button above to open the Enable Banking control panel in a new tab.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = "If you closed the tab by accident, you can re-open the linking page.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            QuietButton(
+                onClick = {
+                    pendingAutoOpen = true
+                    viewModel.relinkAccount()
+                },
+                label = "Re-open linking page",
+                enabled = !viewModel.isLoading,
+            )
         }
     }
 }
@@ -1161,88 +1047,79 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
 private fun AuthProgressStep(viewModel: AppViewModel) {
     val authRedirectUrl = viewModel.authRedirectUrl
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = "Authorizing session",
-                style = MaterialTheme.typography.headlineSmall,
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text(
-                text = "You'll be redirected to your bank's secure page to grant account access. " +
-                        "Here's what to expect:",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            OutlinedCard(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.outlinedCardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "Your bank's consent page",
-                        style = MaterialTheme.typography.labelLarge,
-                    )
-
-                    HorizontalDivider()
-
-                    Text(
-                        text = "Make sure all three access categories are checked:",
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-
-                    ConsentItem("Accounts", "Access to your account information")
-                    ConsentItem("Account balances", "Access to view your balances")
-                    ConsentItem("Transactions", "Access to your transaction history")
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    Text(
-                        text = "Then select the accounts you want to connect and click \"Grant authorization\".",
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "After approving, you'll be redirected back here automatically.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Spacer(modifier = Modifier.height(24.dp))
-
+    WizardScaffold(
+        eyebrow = "STEP 8 OF 8",
+        title = "Authorizing session",
+        oneLiner = "You'll be redirected to your bank's secure page to grant account access. " +
+                "Here's what to expect:",
+        progress = { WizardProgressIndicator(currentStep = 7, totalSteps = 8) },
+        onBack = null,
+        forward = {
             if (authRedirectUrl != null) {
                 Button(
                     onClick = {
                         redirectTo(authRedirectUrl)
                         viewModel.consumeAuthRedirectUrl()
                     },
-                    modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("Continue to your bank")
                 }
             } else {
-                CircularProgressIndicator()
+                CircularProgressIndicator(
+                    color = LocalBankTellerColors.current.brass,
+                    modifier = Modifier.size(Dimens.xxl),
+                )
             }
+        },
+    ) {
+        OutlinedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            colors = CardDefaults.outlinedCardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            ),
+        ) {
+            Column(
+                modifier = Modifier.padding(Dimens.md),
+                verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+            ) {
+                Text(
+                    text = "Your bank's consent page",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+
+                HorizontalDivider()
+
+                Text(
+                    text = "Make sure all three access categories are checked:",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                ConsentItem("Accounts", "Access to your account information")
+                ConsentItem("Account balances", "Access to view your balances")
+                ConsentItem("Transactions", "Access to your transaction history")
+
+                Spacer(modifier = Modifier.height(Dimens.xs))
+
+                Text(
+                    text = "Then select the accounts you want to connect and click \"Grant authorization\".",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        DecisionBox(
+            tint = LocalBankTellerColors.current.emerald.copy(alpha = 0.12f),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                text = "BankTeller will never transfer money without your explicit approval.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
@@ -1257,7 +1134,7 @@ private fun ConsentItem(title: String, description: String) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.primary,
         )
-        Spacer(modifier = Modifier.width(8.dp))
+        Spacer(modifier = Modifier.width(Dimens.sm))
         Column {
             Text(
                 text = title,
@@ -1300,7 +1177,7 @@ private fun EnvironmentOption(
             selected = selected,
             onClick = onClick,
         )
-        Spacer(modifier = Modifier.width(8.dp))
+        Spacer(modifier = Modifier.width(Dimens.sm))
         Column {
             Text(
                 text = label,

@@ -185,11 +185,15 @@ The system SHALL detect onboarding status on login and expose it to the SPA. The
 - **THEN** it checks onboarding status via `GET /api/onboarding/status` and routes to the appropriate gate step
 
 ### Requirement: SPA ActivationGuide step
-The SPA SHALL update the `ActivationGuide` step (shown after registration, before `BankSelection`) to explain that what follows is a **two-step process** where the user authorizes with their bank **twice**: (1) **Account linking** — connects Enable Banking / BankTeller to the user's financial institution in a new browser tab; (2) **Session authorization** — grants active session permissions in the current tab. Both are required to provide free access to their accounts. The screen SHALL show a primary "Start Bank Setup" button that advances the onboarding state to `BankSelection`, and a secondary "Logout" button. The screen SHALL reuse the existing `Card` container, `headlineSmall` header, and `bodyMedium` body conventions from `OnboardingScreen.kt`.
+The SPA SHALL update the `ActivationGuide` step (shown after registration, before `BankSelection`) to explain that what follows is a **two-step process** where the user authorizes with their bank **twice**: (1) **Account linking** — connects Enable Banking / BankTeller to the user's financial institution in a new browser tab; (2) **Session authorization** — grants active session permissions in the current tab. Both are required to provide free access to their accounts. The screen SHALL show a primary "Start Bank Setup" button (label from the spec: "Start Bank Setup") that advances the onboarding state to `BankSelection`. The `ActivationGuide` step SHALL render inside the `WizardScaffold` (per `design-system-theme` shell requirement) with the flow-level frame grammar: headline at the top of the frame, error message (if any) below the headline, and the primary action as a full-width pill button at the bottom of the frame. The "Continue to your bank" action description from `AuthProgress` does not apply here. The screen content moves off `Card` containers entirely (per spec's shell screens migration requirement).
 
 #### Scenario: Two-step explanation shown
 - **WHEN** the `ActivationGuide` step is shown
-- **THEN** it explains both steps (linking in a new tab, then session authorization in the current tab) and shows a "Start Bank Setup" button
+- **THEN** it explains both steps (linking in a new tab, then session authorization in the current tab) and shows the "Start Bank Setup" button in the wizard frame
+
+#### Scenario: Wizard frame present
+- **WHEN** the `ActivationGuide` step is shown
+- **THEN** it renders inside `WizardScaffold` with `WizardProgressIndicator` below the top bar and the primary action as a full-width pill button at the bottom of the frame
 
 #### Scenario: User starts bank setup
 - **WHEN** the user clicks "Start Bank Setup"
@@ -312,7 +316,7 @@ The system SHALL expose an authenticated `GET /api/onboarding/state` endpoint th
 - **THEN** a 401 error is returned
 
 ### Requirement: SPA BankSelection step
-The SPA SHALL add a `BankSelection` screen to the onboarding flow (after `ActivationGuide`). The screen SHALL fetch the full bank list from `GET /api/aspsps` (all banks, no server-side filters), filter it **client-side** by the user's search text (matching bank name, country, or BIC), display the filtered banks in a searchable list, and allow the user to select a bank and PSU type. On selection, the SPA SHALL collect `aspsp_name`, `aspsp_country`, and `psu_type` and advance to `LinkingProgress` (triggering `POST /api/link-accounts`). The screen SHALL handle loading, empty, and error states with styled UI consistent with the existing onboarding screens' Material 3 theme, using the patterns specified in the design.md UI Design section (`Card` container, `OutlinedTextField` search, `LazyColumn` with country badge / bank name / BIC / PSU-type `FilterChip`, `CircularProgressIndicator` during load).
+The SPA SHALL use the `WizardScaffold` frame for the `BankSelection` step (per `design-system-theme` shell requirement): the screen content moves off `Card` containers, the headline sits at the top of the frame, and the step uses the flow-level error presentation (banner-style `DecisionBox` at the top of the frame, not per-field text). Client-side search, country filtering, PSU-type chips, and the selectable bank list continue to render within the frame. The `LazyColumn` bank list SHALL include `key = { "${it.name}|${it.country}" }` so Compose properly tracks items. The step SHALL display the error from `OnboardingViewModel`'s flow-level state (not local screen state) so errors survive the flow's state resets.
 
 #### Scenario: Bank list loads successfully
 - **WHEN** the `BankSelection` screen mounts
@@ -324,12 +328,18 @@ The SPA SHALL add a `BankSelection` screen to the onboarding flow (after `Activa
 
 #### Scenario: Bank list fails to load
 - **WHEN** `GET /api/aspsps` returns an error
-- **THEN** a styled error state is shown with a retry option
+- **THEN** a styled error state is shown with a retry option, consistent with the flow-level error presentation pattern (banner-style `DecisionBox` at the top of the frame)
+
+#### Scenario: Unified back affordance
+- **WHEN** the user is on `BankSelection` after previous steps
+- **THEN** the `WizardScaffold` provides the back button (not each step's implementation) and back navigation is consistently available at the flow level
 
 ### Requirement: SPA LinkingProgress step
 The SPA SHALL add a `LinkingProgress` screen to the onboarding flow (after `BankSelection`). After `POST /api/link-accounts` returns `authorization_url` and `psu_id_hash`, the SPA SHALL store the `psu_id_hash` in viewmodel state and show an explanatory message with an "Open linking page" button that the user clicks to open `authorization_url` in a **new browser tab** (the Enable Banking control panel). After completing linking in the other tab, the user closes that tab and returns to BankTeller, then clicks "I've completed linking, authorize now". **No background polling.** When the button is clicked, the SPA SHALL call `GET /api/onboarding/link-status` **once** (a single on-demand check). On `linked: true`, the SPA SHALL transition to `AuthProgress`. On `linked: false`, the SPA SHALL show an error and let the user retry the check or re-initiate linking.
 
-The LinkingProgress screen SHALL also serve as the **resume point** when the SPA loads and `GET /api/onboarding/state` returns `(requires_relogin=false, linking_completed=true, auth_completed=false)`. This covers two cases: (a) the user opened a new tab while the original tab was at the bank's SCA page — the new tab shows the LinkingProgress screen with a "Continue to authorization" button so the user can re-initiate auth; (b) the auth callback failed (invalid code, bank denied, technical error) — the SPA shows the LinkingProgress screen with the `auth_error` message from the state endpoint and a "Continue to authorization" retry button. In both cases, clicking the button triggers `GET /api/onboarding/link-status` to verify linking was completed. On `linked: true`, the SPA then calls `POST /api/auth` to start a fresh authorization, passing the `selected_bank` fields (`aspsp_name`, `aspsp_country`, `psu_type`) from the state endpoint response as the request body. On `linked: false`, the SPA shows an error and offers a "Re-open linking tab" button to re-initiate linking. — the SPA does not have this info in viewmodel state after a reload. The server **clears `auth_error` from the user session at the start of that request**, so the error is shown exactly once and does not follow the user into the new attempt or appear in a subsequently opened tab. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message, primary `Button`, error `Text` on failure).
+The LinkingProgress screen SHALL also serve as the **resume point** when the SPA loads and `GET /api/onboarding/state` returns `(requires_relogin=false, linking_completed=true, auth_completed=false)`. This covers two cases: (a) the user opened a new tab while the original tab was at the bank's SCA page — the new tab shows the LinkingProgress screen with a "Continue to authorization" button so the user can re-initiate auth; (b) the auth callback failed (invalid code, bank denied, technical error) — the SPA shows the LinkingProgress screen with the `auth_error` message from the state endpoint and a "Continue to authorization" retry button. The SPA SHALL use the `WizardScaffold` frame for the `LinkingProgress` step: content moves off `Card` containers, the headline sits at the top of the frame, the error message (if any) displays below the headline, and the primary action ("Continue to authorization" / "I've completed linking, authorize now" per state) renders as a full-width pill button at the bottom of the frame. The step SHALL use the flow-level error presentation pattern (banner `DecisionBox` at the top of the frame, not per-field text). When the error is shown because auth previously failed, the user has a clear path forward within the same frame (resume button).
+
+After the user clicks **"Continue to authorization"**, the SPA calls `GET /api/onboarding/link-status` — on `linked: true` it triggers `POST /api/auth` with the bank fields from the resume scenarios below and redirects the current tab to the bank's SCA; on `linked: false` it shows an error and offers a "Re-open linking tab" button to re-initiate linking (per the Linking Open/Re-open Flow requirement). The server **clears `auth_error` from the user session at the start of that request**, so the error is shown exactly once and does not follow the user into the new attempt or appear in a subsequently opened tab. The step SHALL be rendered inside the `WizardScaffold` with eyebrow, title, one-liner, progress indicator, and unified back affordance ("Back to bank selection" returning to `BankSelection` via cancel-linking). The explanation that linking happens in a separate tab SHALL be placed adjacent to the "Open linking page" button (form grammar Tier 2), and the consequential "I've completed linking, authorize now" action SHALL sit in the wizard footer's forward slot. `auth_error` messages SHALL use the flow-level error pattern (`Text` in `danger` color with the retry button).
 
 #### Scenario: Open linking URL in a new tab
 - **WHEN** `POST /api/link-accounts` returns `authorization_url`
@@ -352,7 +362,11 @@ The LinkingProgress screen SHALL also serve as the **resume point** when the SPA
 - **THEN** the SPA shows the LinkingProgress screen with the error message (e.g. "Bank denied the authorization", "Invalid or expired code", "Technical error") and a "Continue to authorization" retry button
 
 ### Requirement: SPA AuthProgress step
-The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `LinkingProgress`). The screen SHALL show a consent preview explaining what the bank's consent page will ask for (accounts, balances, transactions), and a "Continue to your bank" button that triggers `POST /api/auth` and redirects the **current tab** (not a new tab) to the returned `url` (bank SCA for session). On return (callback with `code`+`state`, processed server-side) the SPA checks the callback result. If session authorization succeeded, the SPA SHALL forward to the existing dashboard (unchanged, out of scope for this change). On callback errors (invalid code, state mismatch, authorization failure), the SPA SHALL show the LinkingProgress screen with the error message and a "Continue to authorization" retry button (via the `GET /api/onboarding/state` resume flow). The missing-session-cookie case is handled server-side by a 302 redirect to login — the SPA does not render an error screen for it. The screen SHALL use the patterns specified in the design.md UI Design section (`Card` container, `headlineSmall` header, `bodyMedium` message; the redirect happens on user button click, not automatically).
+The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `LinkingProgress`). The screen SHALL show a consent preview explaining what the bank's consent page will ask for (accounts, balances, transactions), and a "Continue to your bank" button that triggers `POST /api/auth` and redirects the **current tab** (not a new tab) to the returned `url` (bank SCA for session). On return (callback with `code`+`state`, processed server-side) the SPA checks the callback result. If session authorization succeeded, the SPA SHALL forward to the existing dashboard (unchanged, out of scope for this change). On callback errors (invalid code, state mismatch, authorization failure), the SPA SHALL show the LinkingProgress screen with the error message and a "Continue to authorization" retry button (via the `GET /api/onboarding/state` resume flow). The missing-session-cookie case is handled server-side by a 302 redirect to login — the SPA does not render an error screen for it. The SPA SHALL use the `WizardScaffold` frame for the `AuthProgress` step: content moves off `Card` containers, headline at the top of the frame, error message (if any) below the headline, and the primary action ("Continue to your bank") at the bottom of the frame. The step SHALL include a `DecisionBox` with the consent-preview information and SHALL use the flow-level error pattern (banner `DecisionBox` at the top of the frame) for any authorization errors that return the user here.
+
+#### Scenario: Consent preview uses wizard frame and decision box
+- **WHEN** the `AuthProgress` step renders
+- **THEN** the consent preview is presented inside a `DecisionBox` (not a plain text paragraph) within the `WizardScaffold`, and a banner `DecisionBox` shows any auth error at the top of the frame
 
 #### Scenario: Redirect current tab to bank SCA for session
 - **WHEN** `POST /api/auth` returns `authorization_url`
@@ -365,3 +379,25 @@ The SPA SHALL add an `AuthProgress` screen to the onboarding flow (after `Linkin
 #### Scenario: Session authorization fails
 - **WHEN** the callback returns an error (invalid code, state mismatch, authorization failure)
 - **THEN** the SPA loads, calls `GET /api/onboarding/state`, sees `(linking_completed=true, auth_completed=false, auth_error="<reason>")`, and shows the LinkingProgress screen with the error message and a "Continue to authorization" retry button
+
+### Requirement: Consent Preview Info Box (Tier 4)
+The `AuthProgress` consent preview SHALL render inside the `DecisionBox` component (per design D15). The `DecisionBox` SHALL accept an optional trailing accessory content slot (`{ total() }`); `AuthProgress` places the secondary "Back to bank selection" pill button followed by a one-line "same-tab redirect" warning inside this slot. The info box SHALL be placed so it conforms to DESIGN-LANGUAGE §7 (outcome box position).
+
+#### Scenario: AuthProgress consent preview is a DecisionBox
+- **WHEN** the user reaches `AuthProgress`
+- **THEN** the consent-preview box is rendered with the design system `DecisionBox`, with the close-out watch-outs box replacing the previous separate `Card`-based info layout (OutcomeBox is removed; all usages migrated to `DecisionBox`)
+
+#### Scenario: DecisionBox trailing slot
+- **WHEN** the consumer supplies trailing accessory content
+- **THEN** the `DecisionBox` places it to the right of the item row on wide layouts (per D15), vertically stacked with the item row on the Form width
+
+### Requirement: Linking Open/Re-open Flow
+The `LinkingProgress` step SHALL treat opening the Enable Banking linking page and re-opening it as a single affordance inside `WizardScaffold`. Content SHALL explain that linking happens in **a new tab** (Tier 2 explanation) and provide an "Open linking page" (or "Re-open linking tab" if previously opened) button. The "I've completed linking, authorize now" action SHALL remain in the wizard footer's primary forward slot.
+
+#### Scenario: Open vs Re-open linking tab
+- **WHEN** the user is on `LinkingProgress`
+- **THEN** the wizard shows an "Open linking page" button if the linking tab has never been opened in this flow, and a "Re-open linking tab" button if the tab was previously opened (e.g. resume after an error or in a new browser tab)
+
+#### Scenario: Flow-level error banner placement
+- **WHEN** an authorization failure message (`auth_error`) is present
+- **THEN** it renders at the top of the `WizardScaffold` frame, below the headline and above the explanatory body text, using the design-system `DecisionBox` banner pattern

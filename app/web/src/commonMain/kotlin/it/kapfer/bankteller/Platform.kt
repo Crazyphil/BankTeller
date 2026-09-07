@@ -30,3 +30,12 @@ expect fun consoleLog(msg: String)
 
 /** Returns the browser's device pixel ratio (1, 2, 3, etc.). Returns 1 on non-web targets. */
 expect fun getDevicePixelRatio(): Int
+
+/** Reads a value from `window.localStorage`, or null if absent. Synchronous. */
+expect fun localStorageGet(key: String): String?
+
+/** Writes a value to `window.localStorage`. Synchronous. */
+expect fun localStorageSet(key: String, value: String)
+
+/** Removes a key from `window.localStorage`. Synchronous. */
+expect fun localStorageRemove(key: String)

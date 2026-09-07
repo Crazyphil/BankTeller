@@ -6,7 +6,7 @@
 - [x] 1.4 Create `LocalBankTellerColors` `CompositionLocal` with default light variant
 - [x] 1.5 Create `ui/theme/Shapes.kt` — `Shapes(small=3.dp, medium=4.dp, large=4.dp)`
 - [x] 1.6 Create `ui/theme/Dimens.kt` — `Dimens` object with spacing ladder (xs=4, sm=8, md=16, lg=24, xl=32, xxl=48) and layout tokens (contentMaxWidth=720, formMaxWidth=400, screenPadding=16, screenPaddingTablet=12, screenPaddingMobile=8)
-- [ ] 1.6a Add `readingMaxWidth = 640.dp` layout token to `Dimens` (letterhead legal pages — wider than forms, narrower than content)
+- [x] 1.6a Add `readingMaxWidth = 640.dp` layout token to `Dimens` (letterhead legal pages — wider than forms, narrower than content)
 
 ## 2. Typography & Fonts
 
@@ -32,9 +32,9 @@
 ## 5. Shared Components — ScreenShell & BrandedTopBar
 
 - [x] 5.1 Create `ui/components/ScreenShell.kt` — a layout wrapper composable that replaces the duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp), CenterHorizontally)` boilerplate. Accepts `maxWidth` param (default `Dimens.contentMaxWidth`), `verticalArrangement: Arrangement.Vertical` (default `Top`), `scrollable: Boolean` (default `false`), and `topBar: @Composable () -> Unit = {}` (optional, rendered at top of Column above content). Centers content horizontally, applies `safeContentPadding` + `Dimens.screenPadding`, constrains to `maxWidth`. When `scrollable = true`, wraps content in `verticalScroll(rememberScrollState())`. All spacing via `Dimens` tokens.
-- [ ] 5.2 Create `ui/components/BrandedTopBar.kt` — lightweight app chrome: `Row(fillMaxWidth, CenterVertically, SpaceBetween)` with logo icon (24dp, theme-aware `painterResource`) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and `actions: @Composable RowScope.() -> Unit` slot on the right. Transparent background, no elevation, no shadow. NOT an M3 `TopAppBar` — simple Row.
-- [ ] 5.3 Create `ui/components/ThemeToggle.kt` — quiet `IconButton` cycling System → Light → Dark → System on click, persisting via `rememberThemeMode` setter. Icon shows CURRENT mode: `Icons.Filled.Contrast` (System), `Icons.Filled.LightMode` (Light), `Icons.Filled.DarkMode` (Dark) from `compose.materialIconsExtended`, tinted `onSurfaceVariant`. No caption variant — on top-bar-less screens it is placed as a viewport-fixed corner icon; with a tooltip explaining the current mode.
-- [ ] 5.4 Add `implementation(compose.materialIconsExtended)` to the web module's `build.gradle.kts` (no custom SVG icon assets — Material Symbols cover theme icons)
+- [x] 5.2 Create `ui/components/BrandedTopBar.kt` — lightweight app chrome: `Row(fillMaxWidth, CenterVertically, SpaceBetween)` with logo icon (24dp, theme-aware `painterResource`) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and `actions: @Composable RowScope.() -> Unit` slot on the right. Transparent background, no elevation, no shadow. NOT an M3 `TopAppBar` — simple Row.
+- [x] 5.3 Create `ui/components/ThemeToggle.kt` — quiet `IconButton` cycling System → Light → Dark → System on click, persisting via `rememberThemeMode` setter. Icon shows CURRENT mode: `Icons.Filled.Contrast` (System), `Icons.Filled.LightMode` (Light), `Icons.Filled.DarkMode` (Dark) from `compose.materialIconsExtended`, tinted `onSurfaceVariant`. No caption variant — on top-bar-less screens it is placed as a viewport-fixed corner icon; with a tooltip explaining the current mode.
+- [x] 5.4 Add `implementation(compose.materialIconsExtended)` to the web module's `build.gradle.kts` (no custom SVG icon assets — Material Symbols cover theme icons)
 
 ## 6. Shared Components — WizardScaffold
 
@@ -51,19 +51,19 @@
 ## 9. Screen Migration — Login & Dashboard
 
 - [x] 9.1 Migrate `LoginScreen.kt` to `ScreenShell(maxWidth = Dimens.formMaxWidth)`, Fraunces headline, form-level error pattern (Text in danger color below form), Dimens tokens for all spacing
-- [ ] 9.1a Add `ThemeToggle` as a viewport-fixed quiet `IconButton` in the top-right corner of the login screen (overlays content, inside safe-area insets, `Dimens.screenPadding` offset) — reachable before authentication, no caption
+- [x] 9.1a Add `ThemeToggle` as a viewport-fixed quiet `IconButton` in the top-right corner of the login screen (overlays content, inside safe-area insets, `Dimens.screenPadding` offset) — reachable before authentication, no caption
 - [x] 9.2 Migrate `DashboardScreen.kt` to `ScreenShell` with `BrandedTopBar` (logo + wordmark + logout action in actions slot), Fraunces headline, Dimens tokens
-- [ ] 9.2a Add `ThemeToggle` as the first item in the dashboard's `BrandedTopBar` actions slot (before logout)
+- [x] 9.2a Add `ThemeToggle` as the first item in the dashboard's `BrandedTopBar` actions slot (before logout)
 
 ## 10. Screen Migration — Public Routes
 
 - [x] 10.1 Migrate `PrivacyScreen.kt` to `ScreenShell(maxWidth = Dimens.formMaxWidth, scrollable = true)` within `BankTellerTheme` — title in Fraunces `headlineMedium`, section headers in `titleMedium` (Inter, primary), body in `bodyMedium` (Inter) with `lineHeight` override for legal reading, "BankTeller" wordmark footer in `bodySmall` `onSurfaceVariant`, Dimens tokens for all spacing
 - [x] 10.2 Migrate `TermsScreen.kt` to `ScreenShell(maxWidth = Dimens.formMaxWidth, scrollable = true)` within `BankTellerTheme` — same hierarchy as privacy (title, section headers, body, wordmark footer)
 - [x] 10.3 Migrate `CallbackScreen.kt` to `ScreenShell(maxWidth = Dimens.formMaxWidth, verticalArrangement = Center)` within `BankTellerTheme` — success state: headline with emerald accent, `CircularProgressIndicator` in `brass` during 2s redirect countdown (auth flow only), "BankTeller" wordmark footer; error state: headline + body in `danger` color, no countdown, no wordmark footer
-- [ ] 10.4 Add `ThemeToggle` as a viewport-fixed quiet `IconButton` in the top-right corner of `PrivacyScreen.kt`, `TermsScreen.kt`, and `CallbackScreen.kt` — overlays the scrollable content so it stays visible on long legal documents, no caption
-- [ ] 10.5 Restyle `PrivacyScreen.kt` per Sovereign Letterhead (D13) — widen to `ScreenShell(maxWidth = Dimens.readingMaxWidth, scrollable = true)`; add letterhead header (32dp logo icon + "BankTeller" wordmark in Fraunces + brass double-rule hairline at 30% opacity); title upgrades to Fraunces `headlineLarge`; "Last updated" date in JetBrains Mono `bodySmall` `onSurfaceVariant`; section headers get 2dp `primary` left border tick; body upgrades to Inter `bodyLarge` with `lineHeight` ~1.6; replace "BankTeller" wordmark footer with compact legal line in JetBrains Mono `labelSmall`; theme toggle stays bottom-center below the footer
-- [ ] 10.6 Restyle `TermsScreen.kt` per Sovereign Letterhead (D13) — same structure as 10.5
-- [ ] 10.7 Restyle `CallbackScreen.kt` per Sovereign Letterhead (D13) — add login-style brand lockup (48dp logo + "BankTeller" wordmark in Fraunces `headlineMedium`) at top; wrap status content in a status card (`OutlinedCard`, 3dp corners, 1dp `outlineVariant` hairline, brass double-rule accent across the top edge); success state: emerald status badge (container + verification-dot icon), headline `onSurface` with emerald accent, session/redirect identifiers in JetBrains Mono `bodySmall`, brass `CircularProgressIndicator` at card bottom during 2s countdown; error state: danger status badge, headline + body `danger`, error details in JetBrains Mono code block, no countdown; brand lockup renders on BOTH states
+- [x] 10.4 Add `ThemeToggle` as a viewport-fixed quiet `IconButton` in the top-right corner of `PrivacyScreen.kt`, `TermsScreen.kt`, and `CallbackScreen.kt` — overlays the scrollable content so it stays visible on long legal documents, no caption
+- [x] 10.5 Restyle `PrivacyScreen.kt` per Sovereign Letterhead (D13) — widen to `ScreenShell(maxWidth = Dimens.readingMaxWidth, scrollable = true)`; add letterhead header (32dp logo icon + "BankTeller" wordmark in Fraunces + brass double-rule hairline at 30% opacity); title upgrades to Fraunces `headlineLarge`; "Last updated" date in JetBrains Mono `bodySmall` `onSurfaceVariant`; section headers get 2dp `primary` left border tick; body upgrades to Inter `bodyLarge` with `lineHeight` ~1.6; replace "BankTeller" wordmark footer with compact legal line in JetBrains Mono `labelSmall`; theme toggle stays bottom-center below the footer
+- [x] 10.6 Restyle `TermsScreen.kt` per Sovereign Letterhead (D13) — same structure as 10.5
+- [x] 10.7 Restyle `CallbackScreen.kt` per Sovereign Letterhead (D13) — add login-style brand lockup (48dp logo + "BankTeller" wordmark in Fraunces `headlineMedium`) at top; wrap status content in a status card (`OutlinedCard`, 3dp corners, 1dp `outlineVariant` hairline, brass double-rule accent across the top edge); success state: emerald status badge (container + verification-dot icon), headline `onSurface` with emerald accent, session/redirect identifiers in JetBrains Mono `bodySmall`, brass `CircularProgressIndicator` at card bottom during 2s countdown; error state: danger status badge, headline + body `danger`, error details in JetBrains Mono code block, no countdown; brand lockup renders on BOTH states
 
 ## 11. Screen Migration — Onboarding (Early Steps)
 
@@ -71,7 +71,7 @@
 - [x] 11.2 Migrate `WaitingStep` to `WizardScaffold` — eyebrow, title, one-liner, `CircularProgressIndicator` in brass, redirect-URL troubleshooting hint as Tier 2, `WizardProgressIndicator` at step 2
 - [x] 11.3 Migrate `RegistrationReviewStep` to `WizardScaffold` — eyebrow, title, one-liner, environment selector as Tier 1+Tier 2 (label above, helper below, grouped with section header), redirect URL field as Tier 1, production fields as Tier 1, forward slot for submit, back to email-entry, `WizardProgressIndicator` at step 3
 - [x] 11.4 Migrate `VerifyingStep` to `WizardScaffold` — eyebrow, title, one-liner, `CircularProgressIndicator` in brass, error → restart button, `WizardProgressIndicator` at step 4
-- [ ] 11.5 Wrap `OnboardingScreen` in `ScreenShell` with `BrandedTopBar` (logo + wordmark + `ThemeToggle` first in the actions slot, then logout action). Remove ad-hoc logout buttons from individual wizard step content (e.g., `ActivationGuideStep`'s secondary "Logout" button). The `onBack` slot in wizard steps returns to its intended purpose: navigating to the previous wizard step.
+- [x] 11.5 Wrap `OnboardingScreen` in `ScreenShell` with `BrandedTopBar` (logo + wordmark + `ThemeToggle` first in the actions slot, then logout action). Remove ad-hoc logout buttons from individual wizard step content (e.g., `ActivationGuideStep`'s secondary "Logout" button). The `onBack` slot in wizard steps returns to its intended purpose: navigating to the previous wizard step.
 
 ## 12. Screen Migration — Onboarding (Bank Setup Steps)
 
@@ -94,11 +94,11 @@
 
 ## 16. Branding — Logo & Favicon
 
-- [ ] 16.1 Verify `logo_light.svg` and `logo_dark.svg` exist in `composeResources/drawable/` (64x64 viewBox, Sovereign Ledger icon)
-- [ ] 16.2 Verify `favicon.svg` exists in `wasmJsMain/resources/` (16x16 simplified mark)
-- [ ] 16.3 Add `<link rel="icon" href="favicon.svg" type="image/svg+xml">` to `index.html`
-- [ ] 16.4 Add logo icon display to `LoginScreen.kt` — 48dp `Image(painterResource(Res.drawable.logo_light/logo_dark))` above "BankTeller" wordmark in Fraunces `headlineMedium`, centered, `Dimens.lg` spacing between icon and wordmark
-- [ ] 16.5 Add logo icon display to `CallbackScreen.kt` success state — 48dp icon above the headline
+- [x] 16.1 Verify `logo_light.svg` and `logo_dark.svg` exist in `composeResources/drawable/` (64x64 viewBox, Sovereign Ledger icon)
+- [x] 16.2 Verify `favicon.svg` exists in `wasmJsMain/resources/` (16x16 simplified mark)
+- [x] 16.3 Add `<link rel="icon" href="favicon.svg" type="image/svg+xml">` to `index.html`
+- [x] 16.4 Add logo icon display to `LoginScreen.kt` — 48dp `Image(painterResource(Res.drawable.logo_light/logo_dark))` above "BankTeller" wordmark in Fraunces `headlineMedium`, centered, `Dimens.lg` spacing between icon and wordmark
+- [x] 16.5 Add logo icon display to `CallbackScreen.kt` success state — 48dp icon above the headline
 
 ## 17. Verification
 
@@ -119,7 +119,7 @@
 - [x] 17.15 Verify BrandedTopBar appears on onboarding screens with logo + wordmark + logout action
 - [x] 17.16 Verify no ad-hoc logout buttons remain in wizard step content (logout is in the top bar)
 - [x] 17.17 Verify BrandedTopBar does NOT appear on login, legal pages, or callback (those screens have no top bar)
-- [ ] 17.18 Verify privacy/terms pages show the letterhead header (32dp logo + wordmark + brass double-rule at 30%), `readingMaxWidth` (640dp) column, Fraunces `headlineLarge` title, JetBrains Mono "Last updated", section headers with 2dp primary left tick, and compact Mono legal footer
-- [ ] 17.19 Verify callback shows the login-style brand lockup (48dp logo + wordmark) above a status card (hairline outline, brass double-rule top); success = emerald badge + mono identifiers + brass spinner; error = danger badge + mono error details, no countdown; lockup renders in BOTH states
-- [ ] 17.20 Verify `ThemeToggle` is a viewport-fixed top-right corner icon (no caption) on login, privacy, terms, callback — and stays visible while scrolling long legal content
-- [ ] 17.21 Verify `ThemeToggle` is first item in `BrandedTopBar` actions (before logout) on dashboard and onboarding
+- [x] 17.18 Verify privacy/terms pages show the letterhead header (32dp logo + wordmark + brass double-rule at 30%), `readingMaxWidth` (640dp) column, Fraunces `headlineLarge` title, JetBrains Mono "Last updated", section headers with 2dp primary left tick, and compact Mono legal footer
+- [x] 17.19 Verify callback shows the login-style brand lockup (48dp logo + wordmark) above a status card (hairline outline, brass double-rule top); success = emerald badge + mono identifiers + brass spinner; error = danger badge + mono error details, no countdown; lockup renders in BOTH states
+- [x] 17.20 Verify `ThemeToggle` is a viewport-fixed top-right corner icon (no caption) on login, privacy, terms, callback — and stays visible while scrolling long legal content
+- [x] 17.21 Verify `ThemeToggle` is first item in `BrandedTopBar` actions (before logout) on dashboard and onboarding

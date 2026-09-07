@@ -191,7 +191,13 @@ fun Application.module(
 
             if (AuthService.validateCredentials(request.username, request.password)) {
                 LoginRateLimiter.clearOnSuccess(ip)
-                call.sessions.set(UserSession(request.username))
+                    // Preserve any in-flight onboarding/linking state from the
+                    // existing cookie (task: login must not clobber ebSessionId,
+                    // accountsJson, psuIdHash, etc. — wiping them would strand a
+                    // user between linking and authorization).
+                    val existing = call.sessions.get<UserSession>()
+                    call.sessions.set(existing?.copy(username = request.username)
+                        ?: UserSession(request.username))
                 call.respond(HttpStatusCode.OK, mapOf("message" to "Login successful"))
             } else {
                 LoginRateLimiter.recordFailedAttempt(ip)

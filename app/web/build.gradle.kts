@@ -76,6 +76,7 @@ kotlin {
             implementation(libs.compose.runtime)
             implementation(libs.compose.foundation)
             implementation(compose.material3)
+            implementation(compose.materialIconsExtended) // Material Symbols for theme/status icons (task 5.4)
             implementation(libs.compose.ui)
             implementation(compose.components.resources)
             implementation(libs.compose.uiToolingPreview)

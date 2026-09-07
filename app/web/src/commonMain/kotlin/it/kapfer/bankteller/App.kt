@@ -1,10 +1,10 @@
 package it.kapfer.bankteller
 
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import it.kapfer.bankteller.onboarding.OnboardingScreen
+import it.kapfer.bankteller.ui.theme.BankTellerTheme
 
 /**
  * Root composable for the BankTeller SPA.
@@ -28,9 +28,9 @@ fun App() {
     // Render the composable for the matching path and return — skip
     // checkAuth() and session-cookie logic.
     when (getCurrentPathname()) {
-        "/privacy" -> { MaterialTheme { PrivacyScreen() }; return }
-        "/terms" -> { MaterialTheme { TermsScreen() }; return }
-        "/enable-banking-callback" -> { MaterialTheme { CallbackScreen() }; return }
+        "/privacy" -> { BankTellerTheme { PrivacyScreen() }; return }
+        "/terms" -> { BankTellerTheme { TermsScreen() }; return }
+        "/enable-banking-callback" -> { BankTellerTheme { CallbackScreen() }; return }
     }
 
     // Auth-gated flow (existing)
@@ -41,7 +41,7 @@ fun App() {
         viewModel.checkAuth()
     }
 
-    MaterialTheme {
+    BankTellerTheme {
         when (viewModel.currentScreen) {
             Screen.Login -> LoginScreen(viewModel)
             Screen.Onboarding -> OnboardingScreen(viewModel)

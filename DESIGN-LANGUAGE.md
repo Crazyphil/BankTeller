@@ -185,6 +185,21 @@ A tinted surface for consequential choices. Used when a control has financial or
 - Content: brief guarantee, warning, or implication text
 - Example: "BankTeller will never transfer money without your explicit approval." (emerald tint)
 
+### Tier 4: Info box
+
+`OutlinedCard`, `surfaceContainer` fill, 1dp `outline` border, 4dp corners (`shapes.medium`); used for gray-zone informational panels (e.g., consent preview) that are neither decisions nor groups.
+
+```
+┌────────────────────────────────────────────┐
+│  [content inside surfaceContainer fill]    │
+└────────────────────────────────────────────┘
+```
+
+- Background: `surfaceContainer`
+- Border: 1dp hairline in `outline`
+- Shape: `medium` (4 dp)
+- Content: informational panels, preview lists, guidance breakdowns
+
 ---
 
 ## 5. Wizard Shell

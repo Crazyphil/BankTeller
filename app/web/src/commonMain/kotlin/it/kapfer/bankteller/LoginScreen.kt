@@ -1,13 +1,9 @@
 package it.kapfer.bankteller
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeContentPadding
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
@@ -21,13 +17,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.unit.dp
+import it.kapfer.bankteller.ui.components.BrandLogo
+import it.kapfer.bankteller.ui.components.ScreenShell
+import it.kapfer.bankteller.ui.components.ThemeToggleOverlay
+import it.kapfer.bankteller.ui.theme.Dimens
 
 /**
  * Login screen with username / password fields, a submit button, error display,
@@ -47,79 +45,84 @@ fun LoginScreen(viewModel: AppViewModel) {
         usernameFocusRequester.requestFocus()
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .safeContentPadding()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text(
-            text = "BankTeller",
-            style = MaterialTheme.typography.headlineLarge,
-        )
+    // Viewport-fixed theme toggle in the top-right corner (task 9.1a): reachable
+    // before authentication, overlays content, safe-area aware.
+    ThemeToggleOverlay {
+        ScreenShell(
+            maxWidth = Dimens.formMaxWidth,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            // Brand lockup (task 16.4): 48dp theme-aware logo + wordmark in Fraunces headlineMedium.
+            BrandLogo(size = Dimens.xxl)
 
-        Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(Dimens.lg))
 
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it },
-            label = { Text("Username") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-            keyboardActions = KeyboardActions(onNext = { passwordFocusRequester.requestFocus() }),
-            modifier = Modifier
-                .fillMaxWidth()
-                .focusRequester(usernameFocusRequester),
-        )
+            Text(
+                text = "BankTeller",
+                style = MaterialTheme.typography.headlineMedium,
+            )
 
-        Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(Dimens.xl))
 
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Password") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-            keyboardActions = KeyboardActions(onDone = { viewModel.login(username, password) }),
-            modifier = Modifier
-                .fillMaxWidth()
-                .focusRequester(passwordFocusRequester),
-        )
+            OutlinedTextField(
+                value = username,
+                onValueChange = { username = it },
+                label = { Text("Username") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                keyboardActions = KeyboardActions(onNext = { passwordFocusRequester.requestFocus() }),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(usernameFocusRequester),
+            )
 
-        Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(Dimens.sm))
 
-        if (viewModel.isLoading) {
-            CircularProgressIndicator()
-        } else {
-            Button(
-                onClick = { viewModel.login(username, password) },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Login")
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Password") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { viewModel.login(username, password) }),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(passwordFocusRequester),
+            )
+
+            Spacer(modifier = Modifier.height(Dimens.md))
+
+            if (viewModel.isLoading) {
+                CircularProgressIndicator()
+            } else {
+                Button(
+                    onClick = { viewModel.login(username, password) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Login")
+                }
             }
-        }
 
-        // Non-rate-limited error
-        viewModel.loginError?.let { error ->
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = error,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
+            // Non-rate-limited error
+            viewModel.loginError?.let { error ->
+                Spacer(modifier = Modifier.height(Dimens.sm))
+                Text(
+                    text = error,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
 
-        // Rate-limit message
-        if (viewModel.isRateLimited) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "Too many login attempts. Please wait before retrying.",
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
+            // Rate-limit message
+            if (viewModel.isRateLimited) {
+                Spacer(modifier = Modifier.height(Dimens.sm))
+                Text(
+                    text = "Too many login attempts. Please wait before retrying.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
     }
 }

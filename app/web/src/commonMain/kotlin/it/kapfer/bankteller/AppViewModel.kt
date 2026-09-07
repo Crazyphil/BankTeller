@@ -269,8 +269,13 @@ class AppViewModel(
                 selectedBankFromState = state.selectedBank
                 authError = state.authError
             } else {
+                // Nothing linked or authorized yet — an "active" application is
+                // NOT sufficient for the Dashboard; it only means the EB
+                // application was registered/activated. Send the user to bank
+                // selection to continue onboarding.
                 if (status.active == true) {
-                    currentScreen = Screen.Dashboard
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.BankSelection
                 } else {
                     currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.ActivationGuide
@@ -558,6 +563,23 @@ class AppViewModel(
             } else {
                 linkError = "Failed to check link status. Please try again."
             }
+        }
+    }
+
+    /**
+     * Continue directly to authorization when linking is already confirmed
+     * complete (per persisted onboarding state), skipping the link-status poll.
+     * Uses the bank selected this session, falling back to the bank stored in
+     * the server-side onboarding state (resume flow).
+     */
+    fun continueToAuthorization() {
+        val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
+        val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
+        val psuType = selectedPsuType.ifEmpty { selectedBankFromState?.psuType ?: "personal" }
+        if (aspspName != null && aspspCountry != null) {
+            startAuth(aspspName, aspspCountry, psuType)
+        } else {
+            linkError = "Bank information missing."
         }
     }
 

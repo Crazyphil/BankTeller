@@ -25,6 +25,55 @@ options:
     - Wasm target (faster, modern browsers): `./gradlew :app:webApp:wasmJsBrowserDevelopmentRun`
     - JS target (slower, supports older browsers): `./gradlew :app:webApp:jsBrowserDevelopmentRun`
 
+### Building the container image
+
+The deployment image is a copy-only runtime image: the fat JAR is built on the
+host (reusing the `~/.gradle` cache across rebuilds) and then copied into a
+slim JRE image. This avoids re-downloading Gradle dependencies and the Kotlin/JS
+Node toolchain into fresh container layers on every rebuild.
+
+**Host prerequisites**
+
+- JDK 21 (the Gradle wrapper pins the build).
+- On Debian/Ubuntu, `libatomic1` (required by Node.js, used by the Kotlin/JS and
+  wasmJs webpack tasks):
+
+  ```sh
+  sudo apt-get install -y libatomic1
+  ```
+
+- Podman (preferred) or Docker.
+
+**One-command flow**
+
+```sh
+scripts/build-image.sh
+```
+
+This runs `./gradlew :server:shadowJar --no-daemon`, builds the image tagged
+`bankteller:latest`, and automatically prunes dangling (untagged) images so
+repeated rebuilds cannot accumulate unbounded overlay storage. Then start the
+app with:
+
+```sh
+docker compose up -d
+```
+
+`docker compose up` uses the image produced by the build script. If you prefer
+to run the steps manually (e.g. on a shared daemon where you don't want the
+automatic prune), build the jar first and then build the image:
+
+```sh
+./gradlew :server:shadowJar --no-daemon
+docker compose build
+```
+
+To reclaim historical storage, run `podman system prune` (or `docker system
+prune`) and prune volumes manually as needed.
+
+Browser tests are unaffected: they still run via their dedicated container image
+(`localhost/bankteller-browser-tests`).
+
 ### Running tests
 
 Use the run button in your IDE's editor gutter, or run tests using Gradle tasks:

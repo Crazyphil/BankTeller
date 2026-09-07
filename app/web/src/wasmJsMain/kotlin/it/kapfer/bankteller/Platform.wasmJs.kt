@@ -96,6 +96,19 @@ private external fun getDevicePixelRatioJs(): Int
 
 actual fun getDevicePixelRatio(): Int = getDevicePixelRatioJs()
 
+@JsFun("(key) => window.localStorage.getItem(key)")
+private external fun localStorageGetJs(key: String): String?
+
+@JsFun("(key, value) => window.localStorage.setItem(key, value)")
+private external fun localStorageSetJs(key: String, value: String)
+
+@JsFun("(key) => window.localStorage.removeItem(key)")
+private external fun localStorageRemoveJs(key: String)
+
+actual fun localStorageGet(key: String): String? = localStorageGetJs(key)
+actual fun localStorageSet(key: String, value: String) { localStorageSetJs(key, value) }
+actual fun localStorageRemove(key: String) { localStorageRemoveJs(key) }
+
 /**
  * JS interop: takes a Uint8Array of PNG bytes, pre-scales the image using
  * browser canvas with smoothing, and returns a Uint8Array of scaled PNG bytes.

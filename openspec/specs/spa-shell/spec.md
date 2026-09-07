@@ -5,7 +5,7 @@ Compose Multiplatform wasmJs/JS web frontend for BankTeller — the browser-deli
 ## Requirements
 
 ### Requirement: Login screen
-The SPA SHALL present a login screen with username and password fields and a submit button. The login screen SHALL be the default route when no authenticated session exists.
+The SPA SHALL present a login screen with username and password fields and a submit button. The login screen SHALL be the default route when no authenticated session exists. The login screen SHALL render inside `BankTellerTheme` and use the theme mode persisted in browser storage (defaulting to the system preference). It SHALL use the ScreenShell layout with width `Form` and display the brand logo lockup above the credentials form. The login screen SHALL have no top app bar (per DESIGN-LANGUAGE §5.1); the theme toggle SHALL float at the top-end corner over the content, not in a top bar. The submit button SHALL be styled as a pill (fully rounded) primary action per the design system's button standards.
 
 #### Scenario: Unauthenticated user sees login
 - **WHEN** a user navigates to the application without an authenticated session
@@ -23,12 +23,36 @@ The SPA SHALL present a login screen with username and password fields and a sub
 - **WHEN** the login endpoint returns HTTP 429
 - **THEN** the SPA displays a message indicating the user should wait before retrying
 
+#### Scenario: Login screen respects theme preference before server contact
+- **WHEN** an unauthenticated user opens the login screen
+- **THEN** the screen renders in the theme mode resolved from browser storage / system preference without waiting for any server response
+
+#### Scenario: Login uses ScreenShell with form width
+- **WHEN** the login screen renders
+- **THEN** `ScreenShell(widthMode = Form, showLogo = true)` is used, the logo lockup is visible above the form, and no top bar is present
+
+#### Scenario: Login screen has theme toggle
+- **WHEN** the login screen renders
+- **THEN** a theme toggle is visible at the top-end corner over the content (not in a top bar)
+
+#### Scenario: Dashboard top bar has theme toggle and logout
+- **WHEN** the dashboard renders
+- **THEN** the `BrandedTopBar` actions row contains the `ThemeToggle` followed by the logout control and nothing else
+
+#### Scenario: Onboarding top bar has theme toggle and logout
+- **WHEN** the onboarding gate renders
+- **THEN** the `BrandedTopBar` actions row contains the `ThemeToggle` followed by the logout control and nothing else
+
 ### Requirement: Welcome dashboard
-The SPA SHALL present a simple welcome dashboard as the post-login landing page. The dashboard SHALL display a welcome message. No navigation items or business data are included — future changes add screens and navigation incrementally. The dashboard SHALL be shown only after Enable Banking onboarding is complete (credentials present, verified, and `active: true`); while onboarding is pending, invalid, or the application is not yet active, the SPA SHALL render the onboarding gate instead of the dashboard.
+The SPA SHALL present a simple welcome dashboard as the post-login landing page. The SPA SHALL render the dashboard inside `BankTellerTheme` using ScreenShell with a BrandedTopBar containing the brand logo, the theme toggle, and the logout action. The dashboard SHALL display a headline-style welcome message with embossed typography per DESIGN-LANGUAGE §4.4. No navigation items or business data are included — future changes add screens and navigation incrementally. The dashboard SHALL be shown only after Enable Banking onboarding is complete (credentials present, verified, and `active: true`); while onboarding is pending, invalid, or the application is not yet active, the SPA SHALL render the onboarding gate instead of the dashboard.
 
 #### Scenario: Authenticated user with completed onboarding sees welcome dashboard
 - **WHEN** an authenticated user with valid and active Enable Banking credentials lands on the dashboard after login
 - **THEN** the SPA displays a welcome message
+
+#### Scenario: Dashboard uses ScreenShell with branded top bar
+- **WHEN** the dashboard renders
+- **THEN** `ScreenShell` with `BrandedTopBar` is used and the welcome message uses `headlineArtSong` with embossed shadow in light mode
 
 #### Scenario: Authenticated user with missing Enable Banking credentials sees onboarding gate
 - **WHEN** an authenticated user logs in and `/api/onboarding/status` reports `enableBankingConfigured: false`
@@ -75,6 +99,10 @@ The SPA SHALL render a transient onboarding gate screen when Enable Banking cred
 - **WHEN** the SPA loads after login and `/api/onboarding/status` reports `active: false`
 - **THEN** the onboarding gate screen is rendered at the activation guide step, showing the link to the Enable Banking control panel
 
+#### Scenario: Early onboarding steps use wizard frame
+- **WHEN** the onboarding gate renders the ActivationGuide / BankSelection / AuthProgress steps
+- **THEN** each step uses `WizardScaffold` inside `ScreenShell(widthMode = Form)` with `WizardProgressIndicator` below the top bar
+
 #### Scenario: Start onboarding — email entry only
 - **WHEN** the user is on the entry step and submits a valid email
 - **THEN** the SPA calls `POST /api/onboarding/enable-banking/start` with the email (no environment, redirect URL, or production fields), stores the returned `state` token, displays the server-derived redirect URL as informational text, and enters a "waiting for authentication…" state that polls the wait endpoint
@@ -108,11 +136,31 @@ The SPA SHALL render a transient onboarding gate screen when Enable Banking cred
 - **THEN** the SPA displays the error message; for retryable registration failures (EB validation error, transient error), the SPA returns the user to the RegistrationReview step with the error banner (the cached idToken is still valid for ~1hr, so resubmission does NOT require a new email link); for non-retryable failures (expired idToken, auth failure), the SPA offers a "restart onboarding" action that returns the user to the email-entry step
 
 ### Requirement: Public routes rendered by the SPA without auth gate
-The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The SPA's `App()` composable SHALL include a single early-return at the top (before any auth check) that inspects `window.location.pathname`: if the path is one of the three public routes, the SPA renders the corresponding composable (`PrivacyScreen`, `TermsScreen`, or `CallbackScreen`) wrapped in `MaterialTheme` and returns; otherwise, the SPA falls through to the existing auth-gated flow. This mechanism extends the foundation's existing enum-based state router with a public-route branch — it SHALL NOT introduce a routing library (Decompose, Voyager, Jetbrains Navigation-Compose, or similar). The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change; public routes are not authenticated feature screens and do not require navigation infrastructure.
+The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-banking-callback` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The SPA's `App()` composable SHALL include a single early-return at the top (before any auth check) that inspects `window.location.pathname`: if the path is one of the three public routes, the SPA renders the corresponding composable (`PrivacyScreen`, `TermsScreen`, or `CallbackScreen`) wrapped in `BankTellerTheme` and returns; otherwise, the SPA falls through to the existing auth-gated flow. This mechanism extends the foundation's existing enum-based state router with a public-route branch — it SHALL NOT introduce a routing library (Decompose, Voyager, Jetbrains Navigation-Compose, or similar). The navigation component (drawer/bottom-nav/tab-bar for switching between authenticated feature screens) stays deferred to the bank-connection change; public routes are not authenticated feature screens and do not require navigation infrastructure. All three public screens SHALL use `ScreenShell(showLogo = )` with a floating `ThemeToggle` at top-end; the previous direct `MaterialTheme` wrapping is replaced by `BankTellerTheme` so the screens pick up the design system. Screens MAY read document URL parameters for content context (e.g. CallbackScreen) but SHALL NOT make API calls.
+
+The public legal screens (`/privacy`, `/terms`) SHALL use a letterhead layout per DESIGN-LANGUAGE §7: `maxContentWidth` set to the legal/reading width (readable line length, narrower than Form), header zone with brand name + logo and doc title in a display-serif font with embossed treatment in light mode, body text in the reading font style with paragraph spacing, sections separated by the horizontal ledger ornament rule (§4.6), closing signature with an italic sign-off and ledger-rule flourish, and page totals footer with the ledger ornament.
+
+The callback screen SHALL use `ScreenShell(widthMode = Form, showLogo = )` with a floating `ThemeToggle` and no top bar. On success (server captured the oobCode), it SHALL display the brand logo lockup (large), a display-serif "BankTeller" wordmark with embossed treatment in light mode, a headline confirmation message with embossed treatment in light mode, body text explaining next steps, and a status card (`DecisionBox`) with the emerald success status. On error (invalid state or missing oobCode), it SHALL display the same frame with a `DecisionBox` using the danger status.
 
 #### Scenario: Public route bypasses auth gate
 - **WHEN** the SPA loads at `/privacy`, `/terms`, or `/enable-banking-callback` (e.g., Enable Banking's reviewer visits the privacy URL, or the user's email-link click lands on the callback URL on device B)
-- **THEN** the SPA renders the corresponding public composable (`PrivacyScreen` / `TermsScreen` / `CallbackScreen`) styled consistently with the app's Material 3 theme, WITHOUT calling `checkAuth()` and WITHOUT requiring a BankTeller session cookie
+- **THEN** the SPA renders the corresponding public composable (`PrivacyScreen` / `TermsScreen` / `CallbackScreen`) styled consistently with the app's design system, WITHOUT calling `checkAuth()` and WITHOUT requiring a BankTeller session cookie
+
+#### Scenario: Public screens use themed shell
+- **WHEN** the SPA loads at `/privacy`, `/terms`, or `/enable-banking-callback`
+- **THEN** the corresponding composable renders inside `ScreenShell(showLogo = true)` with a floating `ThemeToggle` at top-end (no top app bar on any of the three)
+
+#### Scenario: Legal pages use letterhead layout
+- **WHEN** the SPA renders `/privacy` or `/terms`
+- **THEN** the content column uses the legal/reading width, the header shows brand + doc title in display-serif with embossed treatment in light mode, sections are separated by ledger rules, and the finale includes a styled sign-off and ledger-rule flourish
+
+#### Scenario: Callback success shows brand lockup and status card
+- **WHEN** the SPA renders `/enable-banking-callback` after the server captured a valid oobCode
+- **THEN** the screen shows the logo lockup + serif "BankTeller" wordmark, an embossed display-serif headline, and a `DecisionBox` with the emerald success status
+
+#### Scenario: Callback error shows danger status card
+- **WHEN** the SPA renders `/enable-banking-callback` after an invalid state or missing oobCode
+- **THEN** the screen shows a `DecisionBox` with the danger status explaining the error
 
 #### Scenario: CallbackScreen reads query for context only
 - **WHEN** the SPA loads at `/enable-banking-callback?oobCode=...&state=...` (after the server-side Ktor handler has already captured the oobCode synchronously and persisted it before serving the bundle)
@@ -125,3 +173,22 @@ The SPA SHALL render three public routes — `/privacy`, `/terms`, and `/enable-
 #### Scenario: Non-public path falls through to auth-gated flow
 - **WHEN** the SPA loads at any path other than `/privacy`, `/terms`, or `/enable-banking-callback` (e.g., `/`, `/login`, `/dashboard`)
 - **THEN** the public-route early-return does NOT fire; the SPA falls through to the existing `checkAuth()` + `when (viewModel.currentScreen)` flow, exactly as before this change
+
+### Requirement: Post-implementation Layout and Affordance Fixes
+The SPA SHALL apply the following corrections identified during code review of the initial implementation. These build on the Shell and Wizard requirements and SHALL override any conflicting patterns in pre-change specifications.
+
+#### Scenario: Login top-bar removed and toggle floated
+- **WHEN** the login screen renders
+- **THEN** there is no top app bar; the `ThemeToggle` floats at the top-end over the two-column form content, and the logo lockup is still visible within the ScreenShell
+
+#### Scenario: WizardScaffold owns back affordance
+- **WHEN** a `WizardScaffold` step renders with `onBack` provided
+- **THEN** the `WizardProgressIndicator` inside the scaffold shows a CircularProgressIndicator-guard back arrow and per-step `onBack` parameters (e.g., `OnboardingViewModel` state) are not duplicated at the App-level
+
+#### Scenario: Bank list error is surfaced during the flow
+- **WHEN** the user is on `BankSelection` and the bank list fetch fails
+- **THEN** the `OnboardingViewModel` displays the error via the design-system `DecisionBox` pattern (no silent failure) and does NOT use any previous per-screen error text convention
+
+#### Scenario: Auth-progress consent clears on navigation
+- **WHEN** the user reaches `AuthProgress` (consent preview + "Continue to your bank") and the flow is interrupted and re-entered
+- **THEN** the `DecisionBox` info for consent is shown for the current step information only (no state leakage from prior steps)
