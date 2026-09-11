@@ -1,0 +1,49 @@
+# Proposal: server-side-onboarding-state
+
+## Why
+
+Onboarding/linking progress (`psuIdHash`, selected bank, `ebSessionId`, `accountsJson`, `authError`) currently lives in the HMAC-signed **client-side session cookie**. Logging in replaces the cookie, so any re-login, cookie expiry, or application-volume reset silently discards that progress. The SPA then misroutes: a user who has completed linking and authorization can be bounced back to BankSelection/LinkingProgress, or conversely land on the Dashboard without a live authorized session, because the routing flags are derived from a cookie that does not survive the login lifecycle.
+
+The server — not the cookie — must be the source of truth for onboarding progress.
+
+## What Changes
+
+- The server becomes the source of truth for onboarding progress; the session cookie keeps **identity only** (username + one-shot `authError`).
+- Introduce **real domain storage** for authorized data-plane sessions: two new SQLDelight tables in `:core` —
+  - `eb_sessions(id INTEGER PK, session_id TEXT NOT NULL, aspsp_name TEXT, aspsp_country TEXT, psu_type TEXT, created_at INTEGER NOT NULL)` — one row per authorized data-plane session (a user may authorize multiple banks over time; re-authorization after expiry creates a new row);
+  - `accounts(id INTEGER PK, session_id INTEGER NOT NULL REFERENCES eb_sessions(id), iban TEXT, uid TEXT, currency TEXT, name TEXT)` — one row per account from the `POST /sessions` response.
+  The auth callback persists **structured rows** (no raw JSON blob) on `authorizeSession` success. IBAN/uid are not re-derivable for an account via list endpoints, so they must be captured at auth time; cross-session account matching is done by **IBAN** (a deliberate deviation from VISION.md's `identification_hash` — IBAN serves the same purpose once stored).
+  On re-authorization of a bank that already has an `eb_sessions` row, the callback inserts the new session row first, then merges accounts by IBAN (update mutable fields `uid`/`name`/`currency` and re-point `session_id` to the new session on match; insert a new row on no match — matching is by **IBAN only**; an account with no IBAN is inserted as a new row without attempting a match, a documented residual limitation (such rows may duplicate across re-auth; orphans from the old session are still cleaned by the session-deletion step, which is unaffected)), and only then deletes the previous session row(s) belonging to the SAME bank — matched by `aspsp_name` + `aspsp_country` equality with the new row — and their orphaned account rows (accounts that did not reappear — e.g. de-selected at the bank). Rows for other banks are never touched. The old session is never deleted before the new one is safely stored, so a failed re-auth cannot strand the user. Duplicate callbacks (a `session_id` already present — code already redeemed) are treated as success without duplication, and the merge is single-flighted — the `UNIQUE` constraint on `session_id` is the guard, so concurrent callbacks cannot interleave partial merges. `DatabaseFactory.init()` calls the SQLDelight `migrate()` for versioning so existing volumes upgrade in place. The tables carry **no `username` column** — this app is single-user by design (VISION.md §2/§4.3); future multi-user work would revisit this.
+- `GET /api/onboarding/state` derivation changes:
+  - `requires_relogin`: unchanged (refresh token absent from `system_config`).
+  - `linking_completed`: derived live from the control-plane `getApplication` call — true when the application is `active` AND `whitelisted_accounts` is non-empty. No longer read from a cookie `psuIdHash`.
+  - `selected_bank`: taken from the newest `whitelisted_accounts` entry's `aspsp.name` / `aspsp.country`, instead of the session cookie. Order whitelist entries by their `created` field descending and take the newest; if `created` is null/empty, fall back to the last list entry. Available only when whitelist entries exist — an application without completed linking yields no whitelist, so `selected_bank` stays null and routing goes to BankSelection. Resume aid only — never a navigation lock.
+  - `auth_completed`: derived from the `eb_sessions` table — true when at least one authorized session row exists. It does **not** perform a live data-plane session-status check.
+- **Onboarding gate (revised):** routing on login is decided from the whitelist + the `eb_sessions` table. The gate runs only at app load / fresh login via `checkOnboardingStatus`; mid-wizard navigation within a session is purely client-side (`AppViewModel.onboardingStep`) and never persisted server-side:
+  - EB application no longer `active` (detected via `getApplication.active == false`; the old auto-reset that wiped credentials is removed — credentials stay present so the user re-registers or fixes the app without re-entering the private key) → back to ONBOARDING even if previously completed (user must register a new application). This is the **only** condition that revokes completed onboarding.
+  - At least one linked account (whitelist non-empty) → **Dashboard**, regardless of whether the user ever authorized a session. Expired/revoked consent does NOT regress to onboarding — the dashboard will show re-auth affordances (handled by a future change). A linked-but-never-authorized user also goes to Dashboard: the top priority of onboarding is essentials, and adding/managing accounts happens in the dashboard anyway; the wizard merely ensured the user has data to see. This is a deliberate spec decision.
+  - Nothing linked → Onboarding (resume flow as before).
+  - The previous login-time live session-status check is dropped — it is unnecessary under this gate.
+- `GET /api/onboarding/link-status` derives from the control-plane only; the `psuIdHash` requirement is removed from that flow.
+- The live control-plane call used by the polled `/api/onboarding/state` derivation is **cached** (whitelisted accounts list ~60 s) via a small reusable TTL-cache abstraction (`TtlCache<K, V>`) shared with the existing status cache in `OnboardingService`, so the SPA's periodic state polling cannot poll-bomb the Enable Banking API. The cache is used ONLY by that polled derivation: `/api/onboarding/link-status` (user clicked "I've completed linking") MUST bypass/invalidate the cache and fetch fresh; on a fresh fetch that finds a match it primes the cache with the fresh result so downstream `/state` calls stay consistent.
+- The session-cookie payload shrinks to identity: `psuIdHash`, `aspspName`, `aspspCountry`, `psuType`, `ebSessionId`, `accountsJson` are removed from `UserSession`. `authError` **stays** in the cookie as the one-shot carrier for the callback-error → SPA display handoff (it is cleared on the next `POST /api/auth` / successful callback, as today).
+- SPA `checkOnboardingStatus` routing: Dashboard requires the whitelist to be non-empty (via the gate above); mid-wizard resume in a fresh session routes to the bank list with `selectedBank` pre-selected from the whitelisted account entry when the cookie no longer carries it (linked-but-incomplete auth; AuthProgress resumes only when a session row exists); the pre-selected bank card merges the whitelist entry with `/api/aspsps` catalog data (bic, logo, psu_types), with `psuType` defaulting to `"personal"` and a user-editable selector before submitting. On a transient Enable Banking failure the SPA keeps its current screen / existing state behavior (pre-existing behavior — unchanged by this change). LoginScreen → OnboardingScreen/BankSelection/… routing follows the existing state machine. SPA-side navigation back to BankSelection is always allowed (cancel-linking clears nothing but the one-shot `authError`).
+- Explicitly out of scope: private key regeneration / `system_config` schema beyond the existing keys; re-entering the bank-setup wizard from the dashboard (the three wizard steps BankSelection → Linking → Authorization are one reusable unit; dashboard re-entry is future work).
+
+## Capabilities
+
+### New Capabilities
+
+None.
+
+### Modified Capabilities
+
+- `onboarding` — "Onboarding state endpoint" (derivation becomes server-side from the whitelist + the new tables, with caching); "Link-completion check endpoint" (psuIdHash requirement removed, control-plane only); "Auth initiation endpoint" and the auth callback branch of "Email-link callback route" (persist an `eb_sessions` row + `accounts` rows on `authorizeSession` success, with IBAN-based account merge on re-authorization).
+- `auth` — "Session management via httpOnly cookies": session payload reduced to identity; onboarding-progress fields removed.
+
+## Impact
+
+- **Server**: `OnboardingService` (state derivation + whitelist cache via shared `TtlCache`), auth callback route (persistence of session + account rows incl. re-auth merge), `link-status`/`state`/`link-accounts` route handlers, `UserSession` model, new SQLDelight tables `eb_sessions` + `accounts` in `:core` (schema + queries + versioned migration).
+- **SPA**: `checkOnboardingStatus` gate + resume routing (selected bank now always comes from the state response).
+- **Behavior**: onboarding progress survives re-login, cookie expiry, and volume rebuilds (where the DB persists). Completed onboarding is only revoked when the EB application is no longer active — and the registration credentials are preserved (the auto-reset in `getStatus` is removed), so recovery is re-registration, not re-entering the private key. Slightly higher Enable Banking API traffic, bounded by the whitelist cache TTL.
+- **Breaking**: any client relying on progress fields being present in the session cookie (none intended; internal model only).
