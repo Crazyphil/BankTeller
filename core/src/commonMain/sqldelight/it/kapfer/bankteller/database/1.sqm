@@ -1,4 +1,5 @@
-CREATE TABLE system_config (
+-- Idempotent on purpose (see 2.sqm): IF NOT EXISTS makes re-running safe.
+CREATE TABLE IF NOT EXISTS system_config (
     key TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
 );

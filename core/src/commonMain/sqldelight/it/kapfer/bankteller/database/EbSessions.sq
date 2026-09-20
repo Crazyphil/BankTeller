@@ -1,0 +1,80 @@
+-- Enable Banking session + account storage (server-side onboarding state).
+--
+-- Cross-session account matching is by IBAN ONLY (a deliberate simplification
+-- relative to the VISION.md identification-hash design): when a new session's
+-- account carries an IBAN that already exists in `accounts`, the existing row
+-- is updated in place (uid/currency/name refreshed) and re-pointed at the new
+-- session row. Accounts arriving WITHOUT an IBAN are always inserted as new
+-- rows — they may duplicate an older null-IBAN account of the same logical
+-- bank account. Those orphans are cleaned up automatically when the session
+-- they belonged to is deleted (see mergeSessionAccounts below), so blast
+-- radius is limited.
+
+CREATE TABLE eb_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL UNIQUE,
+    aspsp_name TEXT,
+    aspsp_country TEXT,
+    psu_type TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+    iban TEXT,
+    uid TEXT,
+    currency TEXT,
+    name TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- eb_sessions queries
+-- ---------------------------------------------------------------------------
+
+insertSession:
+INSERT INTO eb_sessions(session_id, aspsp_name, aspsp_country, psu_type, created_at)
+VALUES (?, ?, ?, ?, ?);
+
+selectSessionBySessionId:
+SELECT * FROM eb_sessions WHERE session_id = ?;
+
+selectSessionsByBank:
+SELECT * FROM eb_sessions WHERE aspsp_name = ? AND aspsp_country = ?;
+
+selectAllSessions:
+SELECT * FROM eb_sessions ORDER BY created_at DESC;
+
+deleteSessionByIds:
+DELETE FROM eb_sessions WHERE id IN ?;
+
+countSessions:
+SELECT COUNT(*) FROM eb_sessions;
+
+-- ---------------------------------------------------------------------------
+-- accounts queries
+-- ---------------------------------------------------------------------------
+
+insertAccount:
+INSERT INTO accounts(session_id, iban, uid, currency, name)
+VALUES (?, ?, ?, ?, ?);
+
+selectAccountsByIban:
+SELECT * FROM accounts WHERE iban = ?;
+
+selectAccountsBySessionIds:
+SELECT * FROM accounts WHERE session_id IN ?;
+
+updateAccountSessionAndFields:
+UPDATE accounts
+SET session_id = ?, uid = ?, currency = ?, name = ?
+WHERE id = ?;
+
+deleteAccountsByIds:
+DELETE FROM accounts WHERE id IN ?;
+
+countAccounts:
+SELECT COUNT(*) FROM accounts;
+
+hasAnySession:
+SELECT COUNT(*) > 0 FROM eb_sessions;

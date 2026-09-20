@@ -1,0 +1,22 @@
+-- Idempotent on purpose: CREATE TABLE IF NOT EXISTS makes re-running this
+-- migration safe on databases where the tables already exist (e.g. an interim
+-- image created them via a swallow-on-failure Schema.create() that never
+-- wrote user_version). DatabaseFactory.init() infers the effective version
+-- from the tables present and may re-run this migration on such databases.
+CREATE TABLE IF NOT EXISTS eb_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL UNIQUE,
+    aspsp_name TEXT,
+    aspsp_country TEXT,
+    psu_type TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+    iban TEXT,
+    uid TEXT,
+    currency TEXT,
+    name TEXT
+);

@@ -199,4 +199,64 @@ class OnboardingRoutesTest {
         assertTrue(body.contains("redirectUrl"))
         assertFalse(body.contains("private", ignoreCase = true))
     }
+
+    // =====================================================================
+    // RegistrationReview pre-fill endpoint
+    // =====================================================================
+
+    @Test
+    fun `GET api onboarding registration-info without session returns 401`() = testApplication {
+        application { module() }
+        val response = client.get("/api/onboarding/registration-info")
+        assertEquals(HttpStatusCode.Unauthorized, response.status)
+    }
+
+    @Test
+    fun `GET api onboarding registration-info returns stored values`() {
+        // Use a shared temp-file DB so the rows seeded here are visible to the
+        // module's own DatabaseFactory.init() (same pattern as AccountLinkingRoutesTest).
+        val dbFile = java.io.File.createTempFile("bt-registration-info", ".db")
+        dbFile.deleteOnExit()
+        System.setProperty("database.path", dbFile.absolutePath)
+        val db = it.kapfer.bankteller.server.DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
+        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://app.example.com/cb")
+
+        testApplication {
+            application { module() }
+            val sessionClient = createClient {
+                install(HttpCookies)
+            }
+            val loginResponse = sessionClient.post("/api/login") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"username":"admin","password":"changeme"}""")
+            }
+            assertEquals(HttpStatusCode.OK, loginResponse.status)
+
+            val response = sessionClient.get("/api/onboarding/registration-info")
+            assertEquals(HttpStatusCode.OK, response.status)
+            val body = response.bodyAsText()
+            assertTrue(body.contains("stored@example.com"), "Expected stored email, got: $body")
+            assertTrue(body.contains("https://app.example.com/cb"), "Expected stored redirect URL, got: $body")
+        }
+    }
+
+    @Test
+    fun `GET api onboarding registration-info returns nulls when absent`() = testApplication {
+        application { module() }
+        val sessionClient = createClient {
+            install(HttpCookies)
+        }
+        val loginResponse = sessionClient.post("/api/login") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"username":"admin","password":"changeme"}""")
+        }
+        assertEquals(HttpStatusCode.OK, loginResponse.status)
+
+        val response = sessionClient.get("/api/onboarding/registration-info")
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = response.bodyAsText()
+        assertTrue(body.contains("\"email\":null"), "Expected null email, got: $body")
+        assertTrue(body.contains("\"redirectUrl\":null"), "Expected null redirectUrl, got: $body")
+    }
 }

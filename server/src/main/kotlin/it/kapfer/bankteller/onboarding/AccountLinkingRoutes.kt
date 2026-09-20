@@ -16,11 +16,87 @@ import it.kapfer.bankteller.enablebanking.GetApplicationResult
 import it.kapfer.bankteller.enablebanking.IdTokenRefreshResult
 import it.kapfer.bankteller.enablebanking.LinkAccountsResult
 import it.kapfer.bankteller.enablebanking.StartAuthResult
+import it.kapfer.bankteller.enablebanking.WhitelistedAccountEntry
 import it.kapfer.bankteller.server.UserSession
+import it.kapfer.bankteller.util.TtlCache
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.time.Instant
+
+// Whitelist caches shared by /api/onboarding/state (cached read) and
+// /api/onboarding/link-status (forced refresh, primes the cache).
+//
+// Per D7: positive results are cached for 60 s; negative results (control-plane
+// fetch failures) are cached too, but only for 10 s so user actions converge
+// quickly. Without the failure cache, an Enable Banking outage would turn every
+// polled /state call into a live control-plane round trip — poll-bombing the
+// control plane exactly when it is struggling.
+private data class WhitelistSnapshot(
+    val active: Boolean,
+    val entries: List<WhitelistedAccountEntry>,
+)
+
+private val whitelistCache = TtlCache<String, WhitelistSnapshot>(60_000L)
+private val whitelistFailureCache = TtlCache<String, Unit>(10_000L)
+
+/** Test hook: clears the shared whitelist caches so tests start cold. */
+internal fun clearWhitelistCacheForTests() {
+    whitelistCache.clear()
+    whitelistFailureCache.clear()
+}
+
+/**
+ * Fetches the application state (active flag + whitelisted accounts) from the
+ * Enable Banking control plane, with caching per D7.
+ *
+ * @param forceRefresh When true, bypasses both caches and always hits the
+ *   control plane (used by link-status — the user clicked, data must be
+ *   fresh); a successful fetch primes the positive cache, a failed fetch
+ *   primes the short-TTL failure cache.
+ * @return The snapshot, or null when Enable Banking is not configured
+ *   (missing/blank refresh token or application id — a cheap local check,
+ *   not cached) or the refresh/getApplication call failed (cached for 10 s).
+ */
+private suspend fun fetchWhitelist(
+    controlPlaneClient: EnableBankingControlPlaneClient,
+    database: BankTellerDatabase,
+    forceRefresh: Boolean,
+): WhitelistSnapshot? {
+    if (!forceRefresh) {
+        whitelistCache.get("whitelist")?.let { return it }
+        // Recent failure — do not hammer the control plane (D7).
+        whitelistFailureCache.get("whitelist")?.let { return null }
+    }
+
+    val refreshToken = database.systemConfigQueries
+        .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+    if (refreshToken.isNullOrBlank()) return null
+
+    val applicationId = database.systemConfigQueries
+        .selectValue("enable_banking_application_id").executeAsOneOrNull()
+    if (applicationId.isNullOrBlank()) return null
+
+    val idToken = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
+        is IdTokenRefreshResult.Ok -> refresh.idToken
+        is IdTokenRefreshResult.Error -> {
+            whitelistFailureCache.put("whitelist", Unit)
+            return null
+        }
+    }
+
+    return when (val result = controlPlaneClient.getApplication(idToken, applicationId)) {
+        is GetApplicationResult.Ok -> {
+            val snapshot = WhitelistSnapshot(active = result.active, entries = result.whitelistedAccounts)
+            whitelistCache.put("whitelist", snapshot)
+            snapshot
+        }
+        is GetApplicationResult.Error -> {
+            whitelistFailureCache.put("whitelist", Unit)
+            null
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Request DTOs
@@ -57,6 +133,7 @@ fun Route.accountLinkingRoutes(
     enableBankingClientFactory: () -> EnableBankingClient,
     stateJwt: StateJwt,
 ) {
+    val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
     // 3.3 — Bank listing (control-plane GET /api/aspsps proxy, unfiltered)
     //
@@ -140,14 +217,11 @@ fun Route.accountLinkingRoutes(
             idToken = idToken,
         )) {
             is LinkAccountsResult.Ok -> {
-                // Store psu_id_hash + selected bank info in the session — the state
-                // endpoint needs the bank info for the resume flow (POST /api/auth).
-                call.sessions.set(session.copy(
-                    psuIdHash = result.psuIdHash,
-                    aspspName = request.aspsp_name,
-                    aspspCountry = request.country,
-                    psuType = request.psu_type,
-                ))
+                // A new linking flow may change the whitelist — drop the cached
+                // copy (and any stale failure marker) so the next
+                // /api/onboarding/state read fetches fresh data.
+                whitelistCache.invalidate("whitelist")
+                whitelistFailureCache.invalidate("whitelist")
                 call.respond(buildJsonObject {
                     put("authorization_url", result.authorizationUrl)
                     put("psu_id_hash", result.psuIdHash)
@@ -242,11 +316,13 @@ fun Route.accountLinkingRoutes(
         val session = call.sessions.get<UserSession>()
             ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
 
-        val psuIdHash = session.psuIdHash
-        if (psuIdHash == null) {
-            return@get call.respond(buildJsonObject { put("linked", false) })
-        }
+        // Optional ASPSP name/country filters. When both are given, match the
+        // whitelist against them; when only one (or neither) is given, ignore
+        // them and report linked = whitelist non-empty.
+        val name = call.request.queryParameters["name"]
+        val country = call.request.queryParameters["country"]
 
+        // 503 when Enable Banking is not configured (missing refresh token / app id).
         val refreshToken = database.systemConfigQueries
             .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
         if (refreshToken.isNullOrBlank()) {
@@ -255,7 +331,6 @@ fun Route.accountLinkingRoutes(
                 mapOf("error" to "Enable Banking refresh token not configured"),
             )
         }
-
         val applicationId = database.systemConfigQueries
             .selectValue("enable_banking_application_id").executeAsOneOrNull()
         if (applicationId.isNullOrBlank()) {
@@ -265,29 +340,22 @@ fun Route.accountLinkingRoutes(
             )
         }
 
-        val idToken = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
-            is IdTokenRefreshResult.Ok -> refresh.idToken
-            is IdTokenRefreshResult.Error -> return@get call.respond(
+        // link-status always bypasses the cache (user clicked — fresh data); a
+        // successful fetch primes the cache for /api/onboarding/state. A null
+        // here (after the config checks above) means the refresh/getApplication
+        // call failed → 502.
+        val whitelist = fetchWhitelist(controlPlaneClient, database, forceRefresh = true)
+            ?: return@get call.respond(
                 HttpStatusCode.BadGateway,
-                mapOf("error" to refresh.message, "status" to (refresh.statusCode?.toString() ?: "network")),
+                mapOf("error" to "Failed to fetch Enable Banking application state"),
             )
-        }
 
-        when (val result = controlPlaneClient.getApplication(idToken, applicationId)) {
-            is GetApplicationResult.Ok -> {
-                // Match whitelisted_accounts entries by ASPSP name/country against the session's
-                // selected bank. This verifies the entry belongs to the current linking flow.
-                val linked = result.whitelistedAccounts.any { entry ->
-                    entry.aspsp?.name == session.aspspName &&
-                    entry.aspsp?.country == session.aspspCountry
-                }
-                call.respond(buildJsonObject { put("linked", linked) })
-            }
-            is GetApplicationResult.Error -> call.respond(
-                HttpStatusCode.BadGateway,
-                mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
-            )
+        val linked = when {
+            name != null && country != null ->
+                whitelist.entries.any { entry -> entry.aspsp?.name == name && entry.aspsp.country == country }
+            else -> whitelist.entries.isNotEmpty()
         }
+        call.respond(buildJsonObject { put("linked", linked) })
     }
 
     // -----------------------------------------------------------------------
@@ -300,36 +368,58 @@ fun Route.accountLinkingRoutes(
         val refreshToken = database.systemConfigQueries
             .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
 
-        val linkingCompleted = session.psuIdHash != null
+        // Cached whitelist read (60 s positive / 10 s failure TTL). On error treat
+        // as null — conservative: linking_completed=false, selected_bank=null.
+        // Never 5xx.
+        val whitelist = fetchWhitelist(controlPlaneClient, database, forceRefresh = false)
+
+        // Spec: linking_completed requires the application to be active AND have
+        // a non-empty whitelist. (EB currently returns an empty whitelist for
+        // inactive apps, but the active check makes this independent of that
+        // undocumented guarantee.)
+        val linkingCompleted = whitelist != null && whitelist.active && whitelist.entries.isNotEmpty()
+
+        val selectedBank = whitelist
+            ?.takeIf { linkingCompleted }
+            ?.let { snapshot ->
+                val entries = snapshot.entries
+                // Newest whitelist entry first: created is RFC3339 so string compare
+                // works; entries with null/blank created sort last. If all created are
+                // null/blank, fall back to the LAST entry in the list.
+                val newest = if (entries.any { !it.created.isNullOrBlank() }) {
+                    entries.sortedByDescending { it.created.orEmpty() }.first()
+                } else {
+                    entries.last()
+                }
+                val aspsp = newest.aspsp
+                if (aspsp?.name != null && aspsp.country != null) {
+                    buildJsonObject {
+                        put("aspsp_name", aspsp.name)
+                        put("aspsp_country", aspsp.country)
+                        put("psu_type", "personal")
+                    }
+                } else {
+                    kotlinx.serialization.json.JsonNull
+                }
+            } ?: kotlinx.serialization.json.JsonNull
+
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
             put("linking_completed", linkingCompleted)
-            put("auth_completed", session.ebSessionId != null && session.accountsJson != null)
+            put("auth_completed", ebSessionStore.hasAnySession())
             put("auth_error", session.authError)
-            if (linkingCompleted && session.aspspName != null && session.aspspCountry != null && session.psuType != null) {
-                put("selected_bank", buildJsonObject {
-                    put("aspsp_name", session.aspspName)
-                    put("aspsp_country", session.aspspCountry)
-                    put("psu_type", session.psuType)
-                })
-            } else {
-                put("selected_bank", kotlinx.serialization.json.JsonNull)
-            }
+            put("selected_bank", selectedBank)
         })
     }
 
-    // Cancel account linking — clears the linking-related session fields so the
-    // user can return to the bank list and start over with a different bank.
+    // Cancel account linking — clears the one-shot auth_error so the user can
+    // return to the bank list and start over with a different bank. Linking
+    // progress itself is server-side (whitelist + eb_sessions), so nothing else
+    // needs clearing here.
     post("/api/onboarding/cancel-linking") {
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
-        call.sessions.set(session.copy(
-            psuIdHash = null,
-            aspspName = null,
-            aspspCountry = null,
-            psuType = null,
-            authError = null,
-        ))
+        call.sessions.set(session.copy(authError = null))
         call.respond(mapOf("success" to true))
     }
 }

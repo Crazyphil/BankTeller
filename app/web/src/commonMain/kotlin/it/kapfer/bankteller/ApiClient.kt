@@ -143,7 +143,8 @@ open class ApiClient {
                 val configured = extractJsonBool(body, "enableBankingConfigured") ?: false
                 val verified = extractJsonBool(body, "verified")
                 val active = extractJsonBool(body, "active")
-                return OnboardingStatus(configured, verified, active)
+                val previouslyActive = extractJsonBool(body, "previouslyActive")
+                return OnboardingStatus(configured, verified, active, previouslyActive)
             }
             return null
         } catch (_: Exception) {
@@ -232,6 +233,26 @@ open class ApiClient {
             return CompleteResult(false, null, serverError ?: "Server returned ${response.status.value}", retryable)
         } catch (e: Exception) {
             return CompleteResult(false, null, "Network error: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    /**
+     * Fetch the preserved registration details (email + redirect URL) stored
+     * server-side for an app that needs re-registration. Returns null when
+     * nothing is stored or the call/network fails (tolerant like the other getters).
+     */
+    open suspend fun getRegistrationInfo(): RegistrationInfo? {
+        try {
+            val response = client.get("/api/onboarding/registration-info")
+            if (response.status.value == 200) {
+                val body = response.bodyAsText()
+                val email = extractJsonStringOrNull(body, "email")
+                val redirectUrl = extractJsonStringOrNull(body, "redirectUrl")
+                return RegistrationInfo(email = email, redirectUrl = redirectUrl)
+            }
+            return null
+        } catch (_: Exception) {
+            return null
         }
     }
 
@@ -343,9 +364,12 @@ open class ApiClient {
         }
     }
 
-    open suspend fun getLinkStatus(): Boolean? {
+    open suspend fun getLinkStatus(aspspName: String? = null, aspspCountry: String? = null): Boolean? {
         try {
-            val response = client.get("/api/onboarding/link-status")
+            val response = client.get("/api/onboarding/link-status") {
+                if (aspspName != null) parameter("name", aspspName)
+                if (aspspCountry != null) parameter("country", aspspCountry)
+            }
             if (response.status.value == 200) {
                 return extractJsonBool(response.bodyAsText(), "linked")
             }
@@ -537,7 +561,8 @@ open class ApiClient {
 data class OnboardingStatus(
     val enableBankingConfigured: Boolean,
     val verified: Boolean?,
-    val active: Boolean?
+    val active: Boolean?,
+    val previouslyActive: Boolean? = null,
 )
 
 /** Result of starting the enable-banking flow. */
@@ -555,6 +580,12 @@ data class CompleteResult(
     val active: Boolean?,
     val error: String?,
     val retryable: Boolean = false,
+)
+
+/** Preserved registration details for an inactive/deleted app. */
+data class RegistrationInfo(
+    val email: String? = null,
+    val redirectUrl: String? = null,
 )
 
 /** Result of a login attempt. */

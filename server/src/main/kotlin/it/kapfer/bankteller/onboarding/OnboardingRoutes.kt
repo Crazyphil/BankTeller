@@ -6,16 +6,18 @@ import io.ktor.server.response.*
 import io.ktor.server.request.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
+import it.kapfer.bankteller.database.BankTellerDatabase
 import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.Environment
 import it.kapfer.bankteller.server.UserSession
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.slf4j.LoggerFactory
+
+private val logger = LoggerFactory.getLogger("OnboardingRoutes")
 
 // ---------------------------------------------------------------------------
 // Request DTOs
@@ -52,11 +54,13 @@ data class ProductionFieldOverridesBody(
  * are reached first.
  */
 fun Route.onboardingRoutes(
+    database: BankTellerDatabase,
     service: OnboardingService,
     controlPlaneClient: EnableBankingControlPlaneClient, // retained for future use
     enableBankingClientFactory: (() -> EnableBankingClient)? = null,
     stateJwt: StateJwt? = null,
 ) {
+    val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
     // Unauthenticated routes (not under /api/, so SessionAuth does not apply)
     // -----------------------------------------------------------------------
@@ -70,8 +74,9 @@ fun Route.onboardingRoutes(
     //    session cookie IS expected. Missing/invalid cookie → 302 to the
     //    BankTeller login page, discarding the single-use `code`. On valid
     //    session the code is exchanged via authorizeSession; the result is
-    //    stored in the user session (session_id + accounts[] on success,
-    //    auth_error on failure) before the SPA bundle is served.
+    //    persisted server-side (eb_sessions/accounts via EbSessionStore on
+    //    success, auth_error in the cookie on failure) before the SPA bundle
+    //    is served.
     get("/enable-banking-callback") {
         val state = call.request.queryParameters["state"]
         val oobCode = call.request.queryParameters["oobCode"]
@@ -113,13 +118,25 @@ fun Route.onboardingRoutes(
                 try {
                     when (val result = client.authorizeSession(code)) {
                         is AuthorizeSessionResult.Ok -> {
-                            // Success — clear any stored auth_error (belt-and-suspenders;
-                            // POST /api/auth already clears it) and store the session.
-                            call.sessions.set(session.copy(
-                                ebSessionId = result.sessionId,
-                                accountsJson = Json.encodeToString(result.accounts),
-                                authError = null,
-                            ))
+                            // Phase 2 of the auth-callback handling: persist the
+                            // session + merge accounts server-side (phase 1 was
+                            // the authorizeSession() call above). On failure keep
+                            // the user logged in but surface a retryable error.
+                            try {
+                                ebSessionStore.mergeSession(
+                                    sessionId = result.sessionId,
+                                    aspspName = result.aspsp?.name,
+                                    aspspCountry = result.aspsp?.country,
+                                    psuType = result.psuType,
+                                    accounts = result.accounts.map {
+                                        EbSessionStore.MergedAccount(it.iban, it.uid, it.currency, it.name)
+                                    },
+                                )
+                                call.sessions.set(session.copy(authError = null))
+                            } catch (e: Exception) {
+                                logger.warn("Failed to persist EB session ${result.sessionId}", e)
+                                call.sessions.set(session.copy(authError = "Failed to persist session — please retry"))
+                            }
                         }
                         is AuthorizeSessionResult.Error -> {
                             call.sessions.set(session.copy(authError = result.message))
@@ -147,6 +164,18 @@ fun Route.onboardingRoutes(
     get("/api/onboarding/enable-banking/redirect-url") {
         val redirectUrl = call.deriveCallbackUrl()
         call.respond(mapOf("redirectUrl" to redirectUrl))
+    }
+
+    // RegistrationReview pre-fill — preserved Enable Banking credentials read
+    // from system_config. Email/redirectUrl may be null (absent or blank).
+    get("/api/onboarding/registration-info") {
+        val info = service.getRegistrationInfo()
+        call.respond(
+            buildJsonObject {
+                put("email", info.email)
+                put("redirectUrl", info.redirectUrl)
+            },
+        )
     }
 
     // 5.8 — Start onboarding
@@ -286,6 +315,14 @@ fun Route.onboardingRoutes(
                     put("retryable", true)
                 },
             )
+            is CompleteResult.ReregisterError -> call.respond(
+                HttpStatusCode.BadRequest,
+                buildJsonObject {
+                    put("success", false)
+                    put("error", result.message)
+                    put("retryable", true)
+                },
+            )
         }
     }
 
@@ -296,6 +333,7 @@ fun Route.onboardingRoutes(
             "enableBankingConfigured" to response.enableBankingConfigured,
             "verified" to response.verified,
             "active" to response.active,
+            "previouslyActive" to response.previouslyActive,
         ))
     }
 

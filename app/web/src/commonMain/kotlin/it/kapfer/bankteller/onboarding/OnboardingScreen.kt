@@ -299,13 +299,39 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
         if (derivedUrl != null) deriveHost(derivedUrl) else ""
     }
 
+    // Registration info arrives asynchronously (gate-routed users). Auto-fill the
+    // redirect URL / GDPR email while the user has not edited them; once the user
+    // types, their input wins and is never clobbered by a late-arriving value.
+    val infoRedirectUrl = viewModel.registrationInfoRedirectUrl
+    val infoEmail = viewModel.registrationInfoEmail
+
     var environment by remember { mutableStateOf("PRODUCTION") }
-    var redirectUrl by remember(derivedUrl) { mutableStateOf(derivedUrl ?: "") }
+    var hasEditedRedirectUrl by remember { mutableStateOf(false) }
+    var hasEditedGdprEmail by remember { mutableStateOf(false) }
+    var redirectUrl by remember {
+        mutableStateOf(infoRedirectUrl ?: derivedUrl ?: "")
+    }
     var urlError by remember { mutableStateOf<String?>(null) }
     var description by remember { mutableStateOf("BankTeller") }
-    var gdprEmail by remember { mutableStateOf(viewModel.onboardingEmail) }
+    var gdprEmail by remember {
+        mutableStateOf(infoEmail ?: viewModel.onboardingEmail)
+    }
     var privacyUrl by remember(host) { mutableStateOf(if (host.isNotEmpty()) "$host/privacy" else "") }
     var termsUrl by remember(host) { mutableStateOf(if (host.isNotEmpty()) "$host/terms" else "") }
+
+    // Apply late-arriving registration info (async fetch) unless the user edited.
+    LaunchedEffect(infoRedirectUrl, derivedUrl) {
+        if (!hasEditedRedirectUrl && !infoRedirectUrl.isNullOrEmpty()) {
+            redirectUrl = infoRedirectUrl
+        } else if (!hasEditedRedirectUrl && redirectUrl.isEmpty() && !derivedUrl.isNullOrEmpty()) {
+            redirectUrl = derivedUrl
+        }
+    }
+    LaunchedEffect(infoEmail) {
+        if (!hasEditedGdprEmail && !infoEmail.isNullOrEmpty()) {
+            gdprEmail = infoEmail
+        }
+    }
 
     val submit = {
         if (!redirectUrl.startsWith("http://") && !redirectUrl.startsWith("https://")) {
@@ -377,6 +403,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
             value = redirectUrl,
             onValueChange = {
                 redirectUrl = it
+                hasEditedRedirectUrl = true
                 urlError = null
                 viewModel.clearOnboardingError()
             },
@@ -414,6 +441,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     value = gdprEmail,
                     onValueChange = {
                         gdprEmail = it
+                        hasEditedGdprEmail = true
                         viewModel.clearOnboardingError()
                     },
                     label = { Text("GDPR email") },
@@ -707,203 +735,421 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
         }
     }
 
-    var searchQuery by remember { mutableStateOf("") }
-
-    WizardScaffold(
-        eyebrow = "STEP 6 OF 8",
-        title = "Choose your bank",
-        oneLiner = "Search and select your bank.",
-        progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
-        onBack = null,
-        forward = {
-            val selected = viewModel.selectedAspsp
-            if (selected != null) {
-                Button(onClick = { viewModel.linkAccounts() }) {
-                    Text("Connect ${selected.name}")
-                }
-            }
-        },
-    ) {
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            label = { Text("Search by name, BIC, or country") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        when (val state = viewModel.aspspsState) {
+    if (viewModel.isResumeMode) {
+        // Enrichment state gates the card: while the /api/aspsps fetch is in
+        // flight the card waits (logo/BIC may still arrive); if the fetch
+        // failed, the card cannot be enriched, so surface the same error +
+        // retry affordance as the bank list — the user can retry or pick
+        // "Choose a different bank" below, which needs the list anyway.
+        when (viewModel.aspspsState) {
             is AspspsState.Loading -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = Dimens.xxl),
-                    contentAlignment = Alignment.Center,
+                WizardScaffold(
+                    eyebrow = "STEP 6 OF 8",
+                    title = "Choose your bank",
+                    oneLiner = "Confirm your account type to continue.",
+                    progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+                    onBack = null,
+                    forward = {},
                 ) {
-                    CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
-                }
-            }
-            is AspspsState.Error -> {
-                Text(
-                    text = state.message,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-                Button(onClick = { viewModel.loadAspsps() }) {
-                    Text("Retry")
-                }
-            }
-            is AspspsState.Loaded -> {
-                val query = searchQuery.trim().lowercase()
-                val filtered = remember(query, state.aspsps) {
-                    if (query.isEmpty()) state.aspsps
-                    else state.aspsps.filter { bank ->
-                        val countryName = countryCodeToNameMap[bank.country.uppercase()]?.lowercase() ?: ""
-                        bank.name.lowercase().contains(query) ||
-                        bank.country.lowercase().contains(query) ||
-                        countryName.contains(query) ||
-                        (bank.bic?.lowercase()?.contains(query) == true)
-                    }
-                }
-
-                if (filtered.isEmpty()) {
-                    Text(
-                        text = "No banks found matching your search.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    Text(
-                        text = "${filtered.size} banks",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    val listState = rememberLazyListState()
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(max = 400.dp)
+                            .padding(vertical = Dimens.xxl),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        LazyColumn(
-                            state = listState,
+                        CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
+                    }
+                }
+            }
+            is AspspsState.Error -> {
+                WizardScaffold(
+                    eyebrow = "STEP 6 OF 8",
+                    title = "Choose your bank",
+                    oneLiner = "Confirm your account type to continue.",
+                    progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+                    onBack = null,
+                    forward = {},
+                ) {
+                    Text(
+                        text = (viewModel.aspspsState as AspspsState.Error).message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Button(onClick = { viewModel.loadAspsps() }) {
+                        Text("Retry")
+                    }
+                    Spacer(modifier = Modifier.height(Dimens.xs))
+                    QuietButton(
+                        onClick = { viewModel.dismissResumeCard() },
+                        label = "Choose a different bank",
+                    )
+                }
+            }
+            else -> {
+                val bankName = viewModel.selectedAspsp?.name ?: viewModel.selectedBankFromState?.aspspName ?: "Selected Bank"
+        val bankCountry = viewModel.selectedAspsp?.country ?: viewModel.selectedBankFromState?.aspspCountry ?: ""
+        val aspsp = viewModel.selectedAspsp
+        val psuTypes = aspsp?.psuTypes?.ifEmpty { listOf("personal", "business") } ?: listOf("personal", "business")
+
+        WizardScaffold(
+            eyebrow = "STEP 6 OF 8",
+            title = "Choose your bank",
+            oneLiner = "Confirm your account type to continue.",
+            progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+            onBack = null,
+            forward = {
+                Button(
+                    onClick = { viewModel.continueResumeWithBank() },
+                    enabled = viewModel.selectedPsuType.isNotEmpty() && !viewModel.isLoading,
+                ) {
+                    Text("Continue with $bankName")
+                }
+            },
+        ) {
+            OutlinedCard(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.medium,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                colors = CardDefaults.outlinedCardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                ),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(Dimens.lg),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (aspsp != null) {
+                            BankLogo(bank = aspsp)
+                        } else {
+                            BankAvatar(bankName = bankName, bic = null)
+                        }
+
+                        Spacer(modifier = Modifier.width(Dimens.md))
+
+                        Column(
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = bankName,
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.weight(1f, fill = false),
+                                )
+                                Spacer(modifier = Modifier.width(Dimens.sm))
+                                val countryName = countryCodeToNameMap[bankCountry.uppercase()]
+                                val displayCountry = if (countryName != null) {
+                                    "${bankCountry.uppercase()} · $countryName"
+                                } else {
+                                    bankCountry.uppercase()
+                                }
+                                Text(
+                                    text = displayCountry,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+
+                            if (aspsp?.bic != null) {
+                                Spacer(modifier = Modifier.height(Dimens.xs))
+                                Text(
+                                    text = "BIC: ${aspsp.bic}",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = jetBrainsMonoFamily()),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(Dimens.lg))
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+
+                    Spacer(modifier = Modifier.height(Dimens.md))
+
+                    Text(
+                        text = "Account type",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+
+                    Spacer(modifier = Modifier.height(Dimens.sm))
+
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+                    ) {
+                        psuTypes.sortedBy { if (it == "personal") 0 else 1 }.forEach { psu ->
+                            val psuSelected = viewModel.selectedPsuType == psu
+                            FilterChip(
+                                selected = psuSelected,
+                                onClick = {
+                                    viewModel.selectPsuType(psu)
+                                },
+                                label = {
+                                    Text(
+                                        text = psu.capitalizeFirstLetter(),
+                                        style = MaterialTheme.typography.labelMedium,
+                                    )
+                                },
+                                shape = MaterialTheme.shapes.small,
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                                    containerColor = MaterialTheme.colorScheme.surface,
+                                    labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
+                                border = FilterChipDefaults.filterChipBorder(
+                                    enabled = true,
+                                    selected = psuSelected,
+                                    borderColor = MaterialTheme.colorScheme.outline,
+                                    selectedBorderColor = MaterialTheme.colorScheme.primary,
+                                    borderWidth = 1.dp,
+                                    selectedBorderWidth = 1.dp,
+                                ),
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(Dimens.xs))
+
+                    val isPsuConfirmed = viewModel.selectedPsuType.isNotEmpty()
+                    val hasValidationErr = viewModel.linkError != null && !isPsuConfirmed
+                    Text(
+                        text = "Confirm your account type to continue",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (hasValidationErr) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(Dimens.xs))
+
+            QuietButton(
+                onClick = { viewModel.dismissResumeCard() },
+                label = "Choose a different bank",
+            )
+
+            viewModel.linkError?.takeIf { viewModel.selectedPsuType.isNotEmpty() }?.let { err ->
+                Text(
+                    text = err,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+            }
+        }
+    } else {
+        var searchQuery by remember { mutableStateOf("") }
+
+        WizardScaffold(
+            eyebrow = "STEP 6 OF 8",
+            title = "Choose your bank",
+            oneLiner = "Search and select your bank.",
+            progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+            onBack = null,
+            forward = {
+                val selected = viewModel.selectedAspsp
+                if (selected != null) {
+                    Button(
+                        onClick = { viewModel.linkAccounts() },
+                        enabled = !viewModel.isLoading,
+                    ) {
+                        Text("Connect ${selected.name}")
+                    }
+                }
+            },
+        ) {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                label = { Text("Search by name, BIC, or country") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            when (val state = viewModel.aspspsState) {
+                is AspspsState.Loading -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = Dimens.xxl),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
+                    }
+                }
+                is AspspsState.Error -> {
+                    Text(
+                        text = state.message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Button(onClick = { viewModel.loadAspsps() }) {
+                        Text("Retry")
+                    }
+                }
+                is AspspsState.Loaded -> {
+                    val query = searchQuery.trim().lowercase()
+                    val filtered = remember(query, state.aspsps) {
+                        if (query.isEmpty()) state.aspsps
+                        else state.aspsps.filter { bank ->
+                            val countryName = countryCodeToNameMap[bank.country.uppercase()]?.lowercase() ?: ""
+                            bank.name.lowercase().contains(query) ||
+                            bank.country.lowercase().contains(query) ||
+                            countryName.contains(query) ||
+                            (bank.bic?.lowercase()?.contains(query) == true)
+                        }
+                    }
+
+                    if (filtered.isEmpty()) {
+                        Text(
+                            text = "No banks found matching your search.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Text(
+                            text = "${filtered.size} banks",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        val listState = rememberLazyListState()
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(end = 12.dp),
-                            verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+                                .heightIn(max = 400.dp)
                         ) {
-                            items(
-                                items = filtered,
-                                key = { bank -> "${bank.name}-${bank.country}" },
-                            ) { bank ->
-                                val isSelected = viewModel.selectedAspsp?.name == bank.name &&
-                                        viewModel.selectedAspsp?.country == bank.country
-                                OutlinedCard(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable {
-                                            val defaultPsu = if (bank.psuTypes.contains("personal")) "personal"
-                                            else bank.psuTypes.firstOrNull()
-                                            viewModel.selectAspsp(bank)
-                                            if (defaultPsu != null) {
-                                                viewModel.selectPsuType(defaultPsu)
-                                            }
-                                        },
-                                    shape = MaterialTheme.shapes.medium,
-                                    border = BorderStroke(
-                                        width = if (isSelected) 2.dp else 1.dp,
-                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
-                                    ),
-                                    colors = CardDefaults.outlinedCardColors(
-                                        containerColor = if (isSelected) {
-                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
-                                        } else {
-                                            MaterialTheme.colorScheme.surfaceContainer
-                                        }
-                                    ),
-                                ) {
-                                    Row(
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(end = 12.dp),
+                                verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+                            ) {
+                                items(
+                                    items = filtered,
+                                    key = { bank -> "${bank.name}-${bank.country}" },
+                                ) { bank ->
+                                    val isSelected = viewModel.selectedAspsp?.name == bank.name &&
+                                            viewModel.selectedAspsp?.country == bank.country
+                                    OutlinedCard(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(Dimens.md),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        BankLogo(bank = bank)
-
-                                        Spacer(modifier = Modifier.width(Dimens.md))
-
-                                        Column(
-                                            modifier = Modifier.weight(1f),
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically,
-                                            ) {
-                                                Text(
-                                                    text = bank.name,
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    color = MaterialTheme.colorScheme.onSurface,
-                                                    modifier = Modifier.weight(1f, fill = false),
-                                                )
-                                                Spacer(modifier = Modifier.width(Dimens.sm))
-                                                val countryName = countryCodeToNameMap[bank.country.uppercase()]
-                                                val displayCountry = if (countryName != null) {
-                                                    "${bank.country.uppercase()} · $countryName"
-                                                } else {
-                                                    bank.country.uppercase()
+                                            .clickable {
+                                                val defaultPsu = if (bank.psuTypes.contains("personal")) "personal"
+                                                else bank.psuTypes.firstOrNull()
+                                                viewModel.selectAspsp(bank)
+                                                if (defaultPsu != null) {
+                                                    viewModel.selectPsuType(defaultPsu)
                                                 }
-                                                Text(
-                                                    text = displayCountry,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                )
+                                            },
+                                        shape = MaterialTheme.shapes.medium,
+                                        border = BorderStroke(
+                                            width = if (isSelected) 2.dp else 1.dp,
+                                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                        ),
+                                        colors = CardDefaults.outlinedCardColors(
+                                            containerColor = if (isSelected) {
+                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceContainer
                                             }
+                                        ),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(Dimens.md),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            BankLogo(bank = bank)
 
-                                            if (bank.bic != null) {
-                                                Spacer(modifier = Modifier.height(Dimens.xs))
-                                                Text(
-                                                    text = "BIC: ${bank.bic}",
-                                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = jetBrainsMonoFamily()),
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                )
-                                            }
+                                            Spacer(modifier = Modifier.width(Dimens.md))
 
-                                            if (bank.psuTypes.isNotEmpty()) {
-                                                Spacer(modifier = Modifier.height(Dimens.sm))
+                                            Column(
+                                                modifier = Modifier.weight(1f),
+                                            ) {
                                                 Row(
-                                                    horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically,
                                                 ) {
-                                                    bank.psuTypes.sortedBy { if (it == "personal") 0 else 1 }.forEach { psu ->
-                                                        val psuSelected = isSelected && viewModel.selectedPsuType == psu
-                                                        FilterChip(
-                                                            selected = psuSelected,
-                                                            onClick = {
-                                                                viewModel.selectAspsp(bank)
-                                                                viewModel.selectPsuType(psu)
-                                                            },
-                                                            label = {
-                                                                Text(
-                                                                    text = psu.capitalizeFirstLetter(),
-                                                                    style = MaterialTheme.typography.labelSmall,
-                                                                )
-                                                            },
-                                                            shape = MaterialTheme.shapes.small,
-                                                            colors = FilterChipDefaults.filterChipColors(
-                                                                selectedContainerColor = MaterialTheme.colorScheme.primary,
-                                                                selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
-                                                                containerColor = MaterialTheme.colorScheme.surface,
-                                                                labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                            ),
-                                                            border = FilterChipDefaults.filterChipBorder(
-                                                                enabled = true,
+                                                    Text(
+                                                        text = bank.name,
+                                                        style = MaterialTheme.typography.titleMedium,
+                                                        color = MaterialTheme.colorScheme.onSurface,
+                                                        modifier = Modifier.weight(1f, fill = false),
+                                                    )
+                                                    Spacer(modifier = Modifier.width(Dimens.sm))
+                                                    val countryName = countryCodeToNameMap[bank.country.uppercase()]
+                                                    val displayCountry = if (countryName != null) {
+                                                        "${bank.country.uppercase()} · $countryName"
+                                                    } else {
+                                                        bank.country.uppercase()
+                                                    }
+                                                    Text(
+                                                        text = displayCountry,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    )
+                                                }
+
+                                                if (bank.bic != null) {
+                                                    Spacer(modifier = Modifier.height(Dimens.xs))
+                                                    Text(
+                                                        text = "BIC: ${bank.bic}",
+                                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = jetBrainsMonoFamily()),
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    )
+                                                }
+
+                                                if (bank.psuTypes.isNotEmpty()) {
+                                                    Spacer(modifier = Modifier.height(Dimens.sm))
+                                                    Row(
+                                                        horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+                                                    ) {
+                                                        bank.psuTypes.sortedBy { if (it == "personal") 0 else 1 }.forEach { psu ->
+                                                            val psuSelected = isSelected && viewModel.selectedPsuType == psu
+                                                            FilterChip(
                                                                 selected = psuSelected,
-                                                                borderColor = MaterialTheme.colorScheme.outline,
-                                                                selectedBorderColor = MaterialTheme.colorScheme.primary,
-                                                                borderWidth = 1.dp,
-                                                                selectedBorderWidth = 1.dp,
-                                                            ),
-                                                        )
+                                                                onClick = {
+                                                                    viewModel.selectAspsp(bank)
+                                                                    viewModel.selectPsuType(psu)
+                                                                },
+                                                                label = {
+                                                                    Text(
+                                                                        text = psu.capitalizeFirstLetter(),
+                                                                        style = MaterialTheme.typography.labelSmall,
+                                                                    )
+                                                                },
+                                                                shape = MaterialTheme.shapes.small,
+                                                                colors = FilterChipDefaults.filterChipColors(
+                                                                    selectedContainerColor = MaterialTheme.colorScheme.primary,
+                                                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+                                                                    containerColor = MaterialTheme.colorScheme.surface,
+                                                                    labelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                ),
+                                                                border = FilterChipDefaults.filterChipBorder(
+                                                                    enabled = true,
+                                                                    selected = psuSelected,
+                                                                    borderColor = MaterialTheme.colorScheme.outline,
+                                                                    selectedBorderColor = MaterialTheme.colorScheme.primary,
+                                                                    borderWidth = 1.dp,
+                                                                    selectedBorderWidth = 1.dp,
+                                                                ),
+                                                            )
+                                                        }
                                                     }
                                                 }
                                             }
@@ -911,24 +1157,24 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                     }
                                 }
                             }
+                            VerticalScrollbar(
+                                adapter = rememberScrollbarAdapter(listState),
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .align(Alignment.TopEnd),
+                            )
                         }
-                        VerticalScrollbar(
-                            adapter = rememberScrollbarAdapter(listState),
-                            modifier = Modifier
-                                .fillMaxHeight()
-                                .align(Alignment.TopEnd),
-                        )
                     }
                 }
             }
-        }
 
-        viewModel.linkError?.let { err ->
-            Text(
-                text = err,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
+            viewModel.linkError?.let { err ->
+                Text(
+                    text = err,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
         }
     }
 }
@@ -939,7 +1185,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
 
 @Composable
 private fun LinkingProgressStep(viewModel: AppViewModel) {
-    val isResumeMode = viewModel.selectedBankFromState != null || viewModel.selectedAspsp == null
+    val isResumeMode = viewModel.isResumeMode
 
     val linkUrl = viewModel.linkAuthorizationUrl
 

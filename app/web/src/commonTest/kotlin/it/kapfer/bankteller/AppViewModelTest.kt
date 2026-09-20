@@ -100,25 +100,25 @@ class AppViewModelTest {
     }
 
     @Test
-    fun checkAuth_whenAuthenticatedAndConfiguredButInactive_showsOnboardingActivationGuide() = runTest(testDispatcher) {
+    fun checkAuth_whenAuthenticatedAndConfiguredButInactive_routesToRegistrationReview() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        // active=false → activation guide (task 8.10-SPA state-machine level)
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        // active=false + previouslyActive=true (deleted app), state=null → RegistrationReview
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(Screen.Onboarding, vm.currentScreen)
-        assertEquals(OnboardingStep.ActivationGuide, vm.onboardingStep)
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
     }
 
     @Test
-    fun checkAuth_whenAuthenticatedAndConfiguredButActiveAbsent_showsOnboardingActivationGuide() = runTest(testDispatcher) {
+    fun checkAuth_whenAuthenticatedAndConfiguredButActiveAbsent_routesToBankSelection() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        // active=null (absent) → spec says treat as unknown/false → activation guide
+        // active=null (absent), state=null → bank selection as safe default
         fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = null)
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(Screen.Onboarding, vm.currentScreen)
-        assertEquals(OnboardingStep.ActivationGuide, vm.onboardingStep)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
     }
 
     @Test
@@ -575,6 +575,104 @@ class AppViewModelTest {
     }
 
     // ---------------------------------------------------------------
+    // Re-register flow: gate-routed RegistrationReview with no token (task "reregister")
+    // ---------------------------------------------------------------
+
+    @Test
+    fun submitRegistration_reregister_noToken_successActive_transitionsToDashboard() = runTest(testDispatcher) {
+        // Gate-routed: deleted app (active=false, previouslyActive=true) → RegistrationReview with null onboardingStateToken.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertNull(vm.onboardingStateToken)
+
+        fakeApi.nextCompleteResult = CompleteResult(success = true, active = true, error = null)
+        vm.submitRegistration(
+            environment = "PRODUCTION",
+            redirectUrl = "https://saved.example.com/cb",
+            productionOverrides = null,
+        )
+        advanceUntilIdle()
+
+        // Server treats "reregister" as the sentinel → re-register with stored refresh token.
+        assertEquals("reregister", fakeApi.completeCalls?.last()?.state)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertEquals(true, vm.onboardingResultActive)
+    }
+
+    @Test
+    fun submitRegistration_reregister_noToken_successInactive_transitionsToActivationGuide() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertNull(vm.onboardingStateToken)
+
+        fakeApi.nextCompleteResult = CompleteResult(success = true, active = false, error = null)
+        vm.submitRegistration(
+            environment = "PRODUCTION",
+            redirectUrl = "https://saved.example.com/cb",
+            productionOverrides = null,
+        )
+        advanceUntilIdle()
+
+        assertEquals("reregister", fakeApi.completeCalls?.last()?.state)
+        assertEquals(OnboardingStep.ActivationGuide, vm.onboardingStep)
+    }
+
+    @Test
+    fun submitRegistration_reregister_noToken_retryableError_staysOnRegistrationReview() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertNull(vm.onboardingStateToken)
+
+        fakeApi.nextCompleteResult = CompleteResult(
+            success = false, active = null,
+            error = "Enable Banking rejected the registration: bad url",
+            retryable = true,
+        )
+        vm.submitRegistration(
+            environment = "PRODUCTION",
+            redirectUrl = "https://saved.example.com/cb",
+            productionOverrides = null,
+        )
+        advanceUntilIdle()
+
+        assertEquals("reregister", fakeApi.completeCalls?.last()?.state)
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertEquals("Enable Banking rejected the registration: bad url", vm.onboardingError)
+        assertFalse(vm.onboardingIsVerifying)
+    }
+
+    @Test
+    fun submitRegistration_atRegistrationReview_withToken_passesTokenThrough() = runTest(testDispatcher) {
+        // Regression: a normal (non-gate) flow still passes the real token, not "reregister".
+        fakeApi.nextStartResult = StartResult.Success(state = "state-abc", redirectUrl = "https://example.com/cb")
+        fakeApi.waitStatusSequence = listOf(WaitStatus.Complete)
+        vm.startOnboarding("admin@example.com")
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertEquals("state-abc", vm.onboardingStateToken)
+
+        fakeApi.nextCompleteResult = CompleteResult(success = true, active = true, error = null)
+        vm.submitRegistration(
+            environment = "PRODUCTION",
+            redirectUrl = "https://example.com/cb",
+            productionOverrides = null,
+        )
+        advanceUntilIdle()
+
+        assertEquals("state-abc", fakeApi.completeCalls?.last()?.state)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    // ---------------------------------------------------------------
     // Account linking & state endpoint tests (tasks 7.3, 8.2, 8.3, 9.2-9.5, 10.1)
     // ---------------------------------------------------------------
 
@@ -598,7 +696,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateAuthCompleted_routesToDashboard() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -612,9 +710,11 @@ class AppViewModelTest {
     }
 
     @Test
-    fun checkAuth_stateLinkingCompleted_routesToLinkingProgress() = runTest(testDispatcher) {
+    fun checkAuth_stateActiveFalse_routesToRegistrationReview() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        // Deleted app: active=false + previouslyActive=true → RegistrationReview,
+        // takes precedence over linkingCompleted → Dashboard.
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
         val bank = SelectedBank("TestBank", "FI", "personal")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -625,10 +725,292 @@ class AppViewModelTest {
         )
         vm.checkAuth()
         advanceUntilIdle()
+        // App inactive → RegistrationReview (re-register with preserved credentials),
+        // takes precedence over linkingCompleted → Dashboard.
         assertEquals(Screen.Onboarding, vm.currentScreen)
-        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
-        assertEquals(bank, vm.selectedBankFromState)
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertNull(vm.selectedBankFromState)
         assertEquals("Bank denied authorization", vm.authError)
+    }
+
+    @Test
+    fun checkAuth_stateActiveFalseNeverActive_routesToActivationGuide() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        // Fresh PRODUCTION registration pending activation: active=false but the app
+        // was never seen active → ActivationGuide, NOT RegistrationReview.
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = false)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.ActivationGuide, vm.onboardingStep)
+        assertNull(vm.registrationInfoEmail)
+    }
+
+    @Test
+    fun checkAuth_fallbackActiveFalseNeverActive_routesToActivationGuide() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        // state == null fallback: fresh PRODUCTION app pending activation → ActivationGuide.
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = false)
+        fakeApi.nextOnboardingState = null
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.ActivationGuide, vm.onboardingStep)
+    }
+
+    @Test
+    fun checkAuth_inactiveGate_stateBranch_loadsRegistrationInfo() = runTest(testDispatcher) {
+        // state != null, active == false + previouslyActive=true → RegistrationReview + load registration info
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null
+        )
+        fakeApi.nextRegistrationInfo = RegistrationInfo(
+            email = "saved@example.com",
+            redirectUrl = "https://saved.example.com/cb",
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertEquals("saved@example.com", vm.registrationInfoEmail)
+        assertEquals("https://saved.example.com/cb", vm.registrationInfoRedirectUrl)
+    }
+
+    @Test
+    fun checkAuth_inactiveGate_fallbackBranch_loadsRegistrationInfo() = runTest(testDispatcher) {
+        // state == null fallback, active == false + previouslyActive=true → RegistrationReview + load info
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingState = null
+        fakeApi.nextRegistrationInfo = RegistrationInfo(
+            email = "saved@example.com",
+            redirectUrl = "https://saved.example.com/cb",
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+        assertEquals("saved@example.com", vm.registrationInfoEmail)
+        assertEquals("https://saved.example.com/cb", vm.registrationInfoRedirectUrl)
+    }
+
+    @Test
+    fun checkAuth_stateLinkingCompletedNotAuthorized_resumesAtBankListWithPreselection() = runTest(testDispatcher) {
+        // Gate revision (banner item g): linked but never authorized → resume at
+        // the resume card for the stored bank (NOT Dashboard) —
+        // onboarding counts as complete only after the first authorization.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        val bank = SelectedBank("TestBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank
+        )
+        // Catalog data for the enrichment (8.3): the resume card merges
+        // the whitelist entry with /api/aspsps data.
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        // The gate populates selectedBankFromState and resume mode is active.
+        assertEquals(bank, vm.selectedBankFromState)
+        assertEquals("TestBank", vm.selectedAspsp?.name)
+        assertEquals("BIC1", vm.selectedAspsp?.bic)
+        assertTrue(vm.isResumeMode)
+        assertEquals("", vm.selectedPsuType)
+    }
+
+    @Test
+    fun dismissResumeCard_abandonsCardAndRestoresDefaults() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        val bank = SelectedBank("TestBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.isResumeMode)
+        assertEquals("", vm.selectedPsuType)
+
+        // Dismissing resume card abandons resume mode permanently for the session
+        vm.dismissResumeCard()
+        assertFalse(vm.isResumeMode)
+        assertTrue(vm.resumeCardDismissed)
+        assertNull(vm.selectedAspsp)
+        assertEquals("personal", vm.selectedPsuType)
+    }
+
+    @Test
+    fun resumeCard_psuValidationAndAuthFlow() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        val bank = SelectedBank("TestBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.isResumeMode)
+        assertEquals("", vm.selectedPsuType)
+
+        // Attempting to continue without psu_type triggers validation error
+        vm.continueResumeWithBank()
+        assertEquals("Confirm your account type to continue", vm.linkError)
+
+        // Selecting a psu_type clears validation error
+        vm.selectPsuType("business")
+        assertNull(vm.linkError)
+        assertEquals("business", vm.selectedPsuType)
+
+        // Now continueResumeWithBank calls startAuth (bypassing LinkingProgress)
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.continueResumeWithBank()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("https://bank.com/sca", vm.authRedirectUrl)
+        assertNull(vm.linkAuthorizationUrl)
+    }
+
+    @Test
+    fun dismissResumeCard_selectDifferentBank_linksViaLinkingProgress() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        val bank = SelectedBank("OldBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank
+        )
+        val newBank = Aspssp("NewBank", "DE", "BICNEW", null, listOf("personal"), 86400L)
+        fakeApi.nextAspspsResult = AspspsResult.Ok(listOf(newBank))
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.isResumeMode)
+
+        // User chooses a different bank
+        vm.dismissResumeCard()
+        assertFalse(vm.isResumeMode)
+
+        // User selects the new bank and links accounts
+        vm.selectAspsp(newBank)
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth", "hash123")
+        vm.linkAccounts()
+        advanceUntilIdle()
+
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        assertEquals("https://enablebanking.com/auth", vm.linkAuthorizationUrl)
+        assertFalse(vm.isResumeMode)
+    }
+
+    @Test
+    fun checkAuth_stateLinkingCompletedNotAuthorized_noSelectedBank_routesToPlainBankSelection() = runTest(testDispatcher) {
+        // Linked but never authorized, and the whitelist entry carries no usable
+        // selected_bank (null) → plain BankSelection without pre-selection.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertNull(vm.selectedBankFromState)
+        assertNull(vm.selectedAspsp)
+    }
+
+    @Test
+    fun checkAuth_stateAuthCompletedDuringOutage_routesToDashboard() = runTest(testDispatcher) {
+        // D8: auth_completed is authoritative even when the whitelist fetch
+        // fails — the server derives it from the local eb_sessions table, so
+        // the state response reports linking_completed=false (conservative)
+        // but auth_completed=true. A previously-authorized user still lands on
+        // Dashboard during an EB outage.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = true,
+            authError = null,
+            selectedBank = null
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun checkAuth_stateLinkingCompletedAndAuthorized_routesToDashboard() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = null,
+            selectedBank = SelectedBank("TestBank", "FI", "personal")
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertNull(vm.selectedBankFromState)
+    }
+
+    @Test
+    fun checkAuth_stateWhitelistEmptyActiveTrue_routesToBankSelection() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertNull(vm.selectedBankFromState)
     }
 
     @Test
@@ -668,6 +1050,33 @@ class AppViewModelTest {
     }
 
     @Test
+    fun relinkAccount_inSessionSelection_reopensLinkingPage() = runTest(testDispatcher) {
+        // Normal wizard flow: bank selected in-session (selectedBankFromState null).
+        // After the user consumes the original linking URL, "Re-open linking page"
+        // must fall back to the in-session selection instead of failing.
+        val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth", "hash123")
+        vm.linkAccounts()
+        advanceUntilIdle()
+        vm.consumeLinkAuthorizationUrl()
+        assertNull(vm.selectedBankFromState)
+
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth-2", "hash456")
+        vm.relinkAccount()
+        advanceUntilIdle()
+        assertNull(vm.linkError)
+        assertEquals("https://enablebanking.com/auth-2", vm.linkAuthorizationUrl)
+    }
+
+    @Test
+    fun relinkAccount_withoutAnySelection_setsLinkError() = runTest(testDispatcher) {
+        vm.relinkAccount()
+        advanceUntilIdle()
+        assertEquals("Bank information missing.", vm.linkError)
+    }
+
+    @Test
     fun checkLinkStatus_linkedTrue_triggersStartAuth() = runTest(testDispatcher) {
         val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
         vm.selectAspsp(bank)
@@ -689,20 +1098,44 @@ class AppViewModelTest {
     }
 
     @Test
-    fun continueToAuthorization_usesSelectedBankFromState() = runTest(testDispatcher) {
-        fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
-        val bank = SelectedBank("TestBank", "FI", "business")
-        fakeApi.nextOnboardingState = OnboardingState(
-            requiresRelogin = false,
-            linkingCompleted = true,
-            authCompleted = false,
-            authError = null,
-            selectedBank = bank
-        )
-        vm.checkAuth()
+    fun checkLinkStatus_passesBankNameAndCountryWhenKnown() = runTest(testDispatcher) {
+        val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        fakeApi.nextLinkStatus = true
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.checkLinkStatus()
         advanceUntilIdle()
-        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        // The link-status call must carry the current bank identity as query params.
+        assertEquals(1, fakeApi.linkStatusCalls.size)
+        assertEquals("BankA" to "FI", fakeApi.linkStatusCalls.last())
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+    }
+
+    @Test
+    fun checkLinkStatus_passesSelectedBankFromStateWhenNoAspspSelected() = runTest(testDispatcher) {
+        // Mid-wizard resume scenario (8.2/8.3): the login gate populates
+        // selectedBankFromState only in the linked-but-never-authorized case;
+        // for this test we simulate the post-enrichment state directly by
+        // selecting the bank via the public API (as the BankSelection screen
+        // would after enrichResumeSelection).
+        val bank = Aspssp("TestBank", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+
+        fakeApi.nextLinkStatus = true
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.checkLinkStatus()
+        advanceUntilIdle()
+        // selectedAspsp provides the bank identity for the link-status call.
+        assertEquals(1, fakeApi.linkStatusCalls.size)
+        assertEquals("TestBank" to "FI", fakeApi.linkStatusCalls.last())
+    }
+
+    @Test
+    fun continueToAuthorization_usesSelectedBankFromState() = runTest(testDispatcher) {
+        // Mid-wizard resume scenario (8.2/8.3): select the bank via public API.
+        val bank = Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L)
+        vm.selectAspsp(bank)
+        vm.selectPsuType("business")
 
         fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
         vm.continueToAuthorization()
@@ -727,6 +1160,7 @@ private class FakeApiClient : ApiClient() {
     var completeCallDelayMs: Long = 0L
 
     var nextOnboardingState: OnboardingState? = null
+    var nextRegistrationInfo: RegistrationInfo? = null
     var nextAspspsResult: AspspsResult = AspspsResult.Ok(emptyList())
     var nextLinkAccountsResult: LinkAccountsResult = LinkAccountsResult.Error("not configured")
     var nextStartAuthResult: StartAuthResult = StartAuthResult.Error("not configured")
@@ -736,10 +1170,20 @@ private class FakeApiClient : ApiClient() {
     override suspend fun getAspsps(): AspspsResult = nextAspspsResult
     override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult = nextLinkAccountsResult
     override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult = nextStartAuthResult
-    override suspend fun getLinkStatus(): Boolean? = nextLinkStatus
+    override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {
+        linkStatusCalls.add(aspspName to aspspCountry)
+        return nextLinkStatus
+    }
 
     /** Sequence of poll results; if `waitStatusRepeat` is true, the last value repeats. */
     var waitStatusSequence: List<WaitStatus> = emptyList()
+        // Re-assigning the sequence starts a fresh poll run: without this reset,
+        // a second startOnboarding attempt in the same test would read past the
+        // end of the new sequence and poll Pending forever (infinite loop).
+        set(value) {
+            field = value
+            pollIndex = 0
+        }
     var waitStatusRepeat: Boolean = false
     private var pollIndex: Int = 0
 
@@ -747,6 +1191,7 @@ private class FakeApiClient : ApiClient() {
     var startCalls: MutableList<String> = mutableListOf()
     var pollCalls: MutableList<String> = mutableListOf()
     var completeCalls: MutableList<CompleteCall>? = mutableListOf()
+    var linkStatusCalls: MutableList<Pair<String?, String?>> = mutableListOf()
 
     data class CompleteCall(
         val state: String,
@@ -768,6 +1213,8 @@ private class FakeApiClient : ApiClient() {
     override suspend fun getOnboardingStatus(): OnboardingStatus? = nextOnboardingStatus
 
     override suspend fun getOnboardingRedirectUrl(): String? = nextRedirectUrl
+
+    override suspend fun getRegistrationInfo(): RegistrationInfo? = nextRegistrationInfo
 
     override suspend fun startOnboarding(email: String): StartResult {
         startCalls.add(email)

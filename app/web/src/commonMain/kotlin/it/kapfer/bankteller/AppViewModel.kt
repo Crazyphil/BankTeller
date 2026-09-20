@@ -108,6 +108,18 @@ class AppViewModel(
     var onboardingResultActive by mutableStateOf<Boolean?>(null)
         private set
 
+    /**
+     * Preserved registration email + redirect URL fetched from the server when
+     * the login gate routes an inactive-app user straight to
+     * [OnboardingStep.RegistrationReview] (no in-memory onboarding context).
+     * Null until [loadRegistrationInfo] completes.
+     */
+    var registrationInfoEmail by mutableStateOf<String?>(null)
+        private set
+
+    var registrationInfoRedirectUrl by mutableStateOf<String?>(null)
+        private set
+
     // ---------------------------------------------------------------
     // Account Linking & Auth state
     // ---------------------------------------------------------------
@@ -138,6 +150,12 @@ class AppViewModel(
 
     var selectedBankFromState: SelectedBank? by mutableStateOf(null)
         private set
+
+    var resumeCardDismissed: Boolean by mutableStateOf(false)
+        private set
+
+    val isResumeMode: Boolean
+        get() = selectedBankFromState != null && !resumeCardDismissed
 
     var authRedirectUrl: String? by mutableStateOf(null)
         private set
@@ -237,11 +255,25 @@ class AppViewModel(
      * Check the Enable Banking onboarding status and update [currentScreen]
      * and [onboardingStep] accordingly. Called after successful authentication.
      *
-     * Gate logic (task 7.8): [Screen.Onboarding] is ONLY set from here.
-     * - Not configured          → Onboarding / EmailEntry
-     * - Configured but invalid  → Onboarding / EmailEntry
-     * - Configured + active     → Dashboard
-     * - Configured + inactive   → Onboarding / ActivationGuide
+     * Login gate (task 8.1, D4): [Screen.Onboarding] is ONLY set from here.
+     * The gate runs only at app load / fresh login; mid-wizard navigation
+     * stays client-side ([onboardingStep]).
+     *
+     * - Not configured / not verified → Onboarding / EmailEntry
+     * - requires_relogin              → Onboarding / EmailEntry
+     * - App inactive + previously active (deleted app) → Onboarding / RegistrationReview
+     *   (credentials preserved, no email re-entry)
+     * - App inactive + never active (fresh PRODUCTION registration pending
+     *   control-panel activation) → Onboarding / ActivationGuide
+     * - auth_completed (≥1 eb_sessions row) → Dashboard. This is authoritative
+     *   even when the whitelist fetch fails (D8): eb_sessions is local, so a
+     *   previously-authorized user still lands on Dashboard during an EB
+     *   outage. Expired/revoked consent does not regress (rows persist).
+     * - linking_completed but never authorized → Onboarding resuming at the
+     *   bank list with the stored bank pre-selected (8.2 mechanics, now also
+     *   reachable from the login gate) — onboarding counts as complete only
+     *   after the first successful authorization.
+     * - Whitelist empty                → Onboarding / BankSelection
      */
     private suspend fun checkOnboardingStatus() {
         val status = apiClient.getOnboardingStatus()
@@ -258,37 +290,98 @@ class AppViewModel(
 
         val state = apiClient.getOnboardingState()
         if (state != null) {
+            authError = state.authError
             if (state.requiresRelogin) {
                 currentScreen = Screen.Onboarding
                 onboardingStep = OnboardingStep.EmailEntry
-            } else if (state.authCompleted) {
-                currentScreen = Screen.Dashboard
-            } else if (state.linkingCompleted) {
+            } else if (status.active == false) {
+                // App inactive. Two distinct cases (D4):
+                // - previously active → the app was deleted on the EB control
+                //   panel; re-register with preserved credentials (RegistrationReview).
+                // - never active → a fresh PRODUCTION registration pending
+                //   activation; keep the user in the activation guide flow.
                 currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.LinkingProgress
-                selectedBankFromState = state.selectedBank
-                authError = state.authError
-            } else {
-                // Nothing linked or authorized yet — an "active" application is
-                // NOT sufficient for the Dashboard; it only means the EB
-                // application was registered/activated. Send the user to bank
-                // selection to continue onboarding.
-                if (status.active == true) {
-                    currentScreen = Screen.Onboarding
-                    onboardingStep = OnboardingStep.BankSelection
+                if (status.previouslyActive == true) {
+                    onboardingStep = OnboardingStep.RegistrationReview
+                    loadRegistrationInfo()
                 } else {
-                    currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.ActivationGuide
                 }
+            } else if (state.authCompleted) {
+                // Authorized at least once (≥1 eb_sessions row) → Dashboard.
+                // Authoritative even during an EB outage: the server derives
+                // auth_completed from the local eb_sessions table, so the state
+                // call succeeds with auth_completed=true while the whitelist
+                // fetch fails (linking_completed=false). Expired/revoked
+                // consent does not regress — rows persist across expiry.
+                currentScreen = Screen.Dashboard
+            } else if (state.linkingCompleted) {
+                // Linked but never authorized → resume at the resume card for
+                // the stored bank (8.2 mechanics, now also the login-gate route).
+                // Onboarding counts as complete only after the first successful authorization.
+                currentScreen = Screen.Onboarding
+                val bank = state.selectedBank
+                if (bank != null) {
+                    selectedBankFromState = bank
+                    resumeCardDismissed = false
+                    selectedPsuType = ""
+                    onboardingStep = OnboardingStep.BankSelection
+                    enrichResumeSelection(bank)
+                } else {
+                    // No usable selected_bank (e.g. whitelist entry without
+                    // aspsp name/country) → plain bank selection.
+                    onboardingStep = OnboardingStep.BankSelection
+                }
+            } else {
+                // Whitelist empty + app active (or active unknown) → start
+                // onboarding at bank selection.
+                currentScreen = Screen.Onboarding
+                onboardingStep = OnboardingStep.BankSelection
             }
         } else {
             // Fallback to status-only routing if state endpoint call returns null
             if (status.active == true) {
                 currentScreen = Screen.Dashboard
-            } else {
+            } else if (status.active == false) {
                 currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.ActivationGuide
+                if (status.previouslyActive == true) {
+                    onboardingStep = OnboardingStep.RegistrationReview
+                    loadRegistrationInfo()
+                } else {
+                    onboardingStep = OnboardingStep.ActivationGuide
+                }
+            } else {
+                // active unknown → bank selection as safe default
+                currentScreen = Screen.Onboarding
+                onboardingStep = OnboardingStep.BankSelection
             }
+        }
+    }
+
+    /**
+     * Resume enrichment: when routing into [OnboardingStep.BankSelection] with a
+     * previously-linked bank, load the ASPSP list and enrich the matching bank
+     * (logo, BIC, psuTypes) for the resume card. PSU type starts unselected.
+     */
+    private fun enrichResumeSelection(bank: SelectedBank) {
+        viewModelScope.launch {
+            val result = apiClient.getAspsps()
+            aspspsState = when (result) {
+                is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
+                is AspspsResult.Error -> AspspsState.Error(result.message)
+            }
+            val match = (aspspsState as? AspspsState.Loaded)?.aspsps
+                ?.firstOrNull { it.name == bank.aspspName && it.country == bank.aspspCountry }
+            val aspsp = match ?: Aspssp(
+                name = bank.aspspName,
+                country = bank.aspspCountry,
+                bic = null,
+                logo = null,
+                psuTypes = listOf(bank.psuType),
+                maximumConsentValidity = null,
+            )
+            selectedAspsp = aspsp
+            selectedPsuType = ""
         }
     }
 
@@ -300,6 +393,19 @@ class AppViewModel(
     fun loadDerivedRedirectUrl() {
         viewModelScope.launch {
             onboardingDerivedRedirectUrl = apiClient.getOnboardingRedirectUrl()
+        }
+    }
+
+    /**
+     * Fetch the server-preserved registration details (email + redirect URL) and
+     * store them for [RegistrationReviewStep] pre-fill. Called from the login
+     * gate branches that route directly to [OnboardingStep.RegistrationReview].
+     */
+    private fun loadRegistrationInfo() {
+        viewModelScope.launch {
+            val info = apiClient.getRegistrationInfo()
+            registrationInfoEmail = info?.email
+            registrationInfoRedirectUrl = info?.redirectUrl
         }
     }
 
@@ -371,7 +477,12 @@ class AppViewModel(
         redirectUrl: String,
         productionOverrides: ProductionFieldOverrides?,
     ) {
-        val token = onboardingStateToken ?: return
+        // When the login gate routed an inactive-app user straight to
+        // RegistrationReview there is no in-memory onboarding token. The server
+        // accepts the "reregister" sentinel and re-registers using the stored
+        // refresh token, so we synthesize it in that specific case only.
+        val token = onboardingStateToken
+            ?: if (onboardingStep == OnboardingStep.RegistrationReview) "reregister" else return
         onboardingIsVerifying = true
         onboardingError = null
         onboardingStep = OnboardingStep.Verifying
@@ -469,11 +580,28 @@ class AppViewModel(
 
     fun selectPsuType(psuType: String) {
         selectedPsuType = psuType
+        if (linkError == "Confirm your account type to continue") {
+            linkError = null
+        }
+    }
+
+    /**
+     * Abandon the resume card and revert to standard full bank selection.
+     * Restores default PSU type ("personal") and clears any preselected ASPSP.
+     */
+    fun dismissResumeCard() {
+        resumeCardDismissed = true
+        selectedAspsp = null
+        selectedPsuType = "personal"
     }
 
     fun linkAccounts() {
         val aspsp = selectedAspsp ?: run {
             linkError = "No bank selected"
+            return
+        }
+        if (selectedPsuType.isEmpty()) {
+            linkError = "Confirm your account type to continue"
             return
         }
         isLoading = true
@@ -495,10 +623,17 @@ class AppViewModel(
     }
 
     fun relinkAccount() {
-        val bank = selectedBankFromState ?: run {
-            linkError = "Bank information missing."
-            return
-        }
+        // Prefer the login-gate resume selection (selectedBankFromState); fall
+        // back to the in-session selection from the bank list so the
+        // "Re-open linking page" affordance works in the normal wizard flow too.
+        val bank = selectedBankFromState
+            ?: selectedAspsp?.let {
+                SelectedBank(aspspName = it.name, aspspCountry = it.country, psuType = selectedPsuType)
+            }
+            ?: run {
+                linkError = "Bank information missing."
+                return
+            }
         isLoading = true
         linkError = null
         viewModelScope.launch {
@@ -524,6 +659,7 @@ class AppViewModel(
             linkError = null
             linkStatusChecking = false
             selectedBankFromState = null
+            resumeCardDismissed = false
             selectedAspsp = null
             selectedPsuType = "personal"
             authError = null
@@ -547,11 +683,11 @@ class AppViewModel(
         linkStatusChecking = true
         linkError = null
         viewModelScope.launch {
-            val linked = apiClient.getLinkStatus()
+            val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
+            val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
+            val linked = apiClient.getLinkStatus(aspspName, aspspCountry)
             linkStatusChecking = false
             if (linked == true) {
-                val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
-                val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
                 val psuType = selectedPsuType.ifEmpty { selectedBankFromState?.psuType ?: "personal" }
                 if (aspspName != null && aspspCountry != null) {
                     startAuth(aspspName, aspspCountry, psuType)
@@ -564,6 +700,25 @@ class AppViewModel(
                 linkError = "Failed to check link status. Please try again."
             }
         }
+    }
+
+    /**
+     * Continue from the resume card to authorization with the confirmed account type.
+     * Skips LinkingProgress since linking is already completed on the backend.
+     * Validates that an account type (psu_type) has been explicitly chosen.
+     */
+    fun continueResumeWithBank() {
+        val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
+        val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
+        if (aspspName == null || aspspCountry == null) {
+            linkError = "Bank information missing."
+            return
+        }
+        if (selectedPsuType.isEmpty()) {
+            linkError = "Confirm your account type to continue"
+            return
+        }
+        startAuth(aspspName, aspspCountry, selectedPsuType)
     }
 
     /**
@@ -614,9 +769,12 @@ class AppViewModel(
         onboardingError = null
         onboardingIsVerifying = false
         onboardingResultActive = null
+        registrationInfoEmail = null
+        registrationInfoRedirectUrl = null
         aspspsState = AspspsState.Loading
         selectedAspsp = null
         selectedPsuType = "personal"
+        resumeCardDismissed = false
         psuIdHash = null
         linkAuthorizationUrl = null
         linkError = null

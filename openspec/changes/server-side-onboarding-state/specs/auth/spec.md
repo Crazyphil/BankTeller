@@ -21,29 +21,15 @@ The system SHALL issue httpOnly, SameSite=Strict cookies containing an HMAC-SHA2
 - **WHEN** a cookie issued before this change (payload containing `psuIdHash`, `aspspName`, `ebSessionId`, `accountsJson`, …) is presented
 - **THEN** the session serializer (`Json { ignoreUnknownKeys = true }`) decodes it to `UserSession` defaults and the user is NOT forced to log out
 
-### Requirement: Email-link callback route
-The system SHALL expose an unauthenticated `GET /enable-banking-callback` route that handles two kinds of OAuth-style redirects: (1) the Enable Banking email-link redirect (`oobCode` + `state` query parameters present) and (2) the Enable Banking data-plane auth redirect (`code` + `state` query parameters present, `oobCode` absent). The route SHALL distinguish between the two by checking for the presence of `oobCode`.
+#### Scenario: Legacy cookie imported on first login
+- **WHEN** a user logs in successfully with an incoming cookie that still carries legacy progress fields (`ebSessionId`, `accountsJson`, `psuIdHash`, `aspsp*`, `psuType`) AND the `eb_sessions` table is empty
+- **THEN** the login handler imports the legacy state — one `eb_sessions` row (`session_id` = `ebSessionId`, `aspsp_name`/`aspsp_country`/`psu_type` from the old fields) plus `accounts` rows parsed from `accountsJson` (IBAN-based; `uid`/`currency`/`name` mapped 1:1) — inside the usual transaction semantics, and issues the slim identity-only cookie (legacy fields dropped). Any import error is logged and login still succeeds (best-effort, never a login blocker)
 
-**Email-link callback (oobCode + state present):** behavior unchanged — validates `state`, captures and exchanges `oobCode` synchronously, maintains context status for the wait endpoint, and serves the SPA bundle. It SHALL NOT require a BankTeller session cookie.
+#### Scenario: Legacy import is idempotent
+- **WHEN** a user logs in and the `eb_sessions` table is already non-empty
+- **THEN** no import runs — the legacy import only ever happens once per deployment
 
-**Auth callback (code + state present, oobCode absent):** The route SHALL require a valid BankTeller session cookie; on a missing/invalid cookie it SHALL 302 redirect to the BankTeller login page and discard the single-use `code`. On a valid session, the route SHALL decode the `state` JWT, call `EnableBankingClient.authorizeSession(code)`, and — on success — **persist one `eb_sessions` row (session_id, aspsp_name, aspsp_country, psu_type, created_at) and one `accounts` row per account (iban, uid, currency, name) parsed from the structured `AuthorizeSessionResult.Ok` payload** (no raw JSON blob). Re-authorization after expiry SHALL proceed in two phases: **Phase 1 — external gate, NOT transactional** — `authorizeSession(code)` touches nothing in the DB; on failure the old `eb_sessions` row and its account rows stay untouched and a retry is unaffected (the actual "must not strand the user" property). **Phase 2 — atomic merge** — once the new payload exists, all DB steps SHALL run inside ONE SQLDelight transaction: insert a NEW `eb_sessions` row rather than overwrite; merge the new session's accounts with existing account rows by IBAN (update `uid`/`name`/`currency` and re-point `session_id` on match; insert on no match; matching is by **IBAN only** — an account with no IBAN is inserted as a new row without attempting a match, a documented residual limitation: such rows may duplicate across re-auth, while orphans from the old session are still cleaned by the session-deletion step, which is unaffected); then delete the previous session row(s) belonging to the SAME bank — matched by `aspsp_name` + `aspsp_country` equality with the new row — and their orphaned account rows (rows for other banks are never touched) — committed or rolled back as a unit, with no partial merge states possible. The merge SHALL be idempotent and single-flighted: if the returned `session_id` already exists in `eb_sessions` (duplicate callback, code already redeemed), the route SHALL treat it as success without duplicating rows, and concurrent callbacks SHALL NOT interleave partial merges — the `UNIQUE` constraint on `session_id` is the guard (a concurrent duplicate insert fails on the constraint). The session_id and accounts SHALL NOT be stored in the session cookie. On success the route SHALL clear the one-shot `authError` from the session cookie and serve the SPA bundle. On `authorizeSession` failure or invalid/expired `code`, or on invalid `state`, the route SHALL set the error reason in the one-shot `authError` session field and serve the SPA bundle (existing UX unchanged).
+#### Scenario: Legacy cookie without ebSessionId imports nothing
+- **WHEN** a user logs in with an incoming legacy cookie that carries no `ebSessionId` (linked but never authorized before this change)
+- **THEN** nothing is imported and login proceeds with the slim identity-only cookie; the login gate routes via the linked-but-never-authorized branch
 
-#### Scenario: Auth callback success persists session and account rows
-- **WHEN** the auth callback branch of the callback route completes `authorizeSession` successfully
-- **THEN** the server SHALL insert one `eb_sessions` row and one `accounts` row per returned account (structured fields: iban, uid, currency, name), clear the one-shot `authError`, and SHALL NOT store them in the session cookie
-
-#### Scenario: Re-authorization creates a new session row and merges accounts
-- **WHEN** a user authorizes the same bank again after consent expiry
-- **THEN** all merge steps SHALL run inside ONE SQLDelight transaction — insert a new `eb_sessions` row, merge the new accounts with existing account rows by IBAN (update `uid`/`name`/`currency` and re-point `session_id` on match; insert on no match; matching is by **IBAN only** — an account with no IBAN is inserted as a new row without attempting a match, a documented residual limitation: such rows may duplicate across re-auth, while orphans from the old session are still cleaned by the session-deletion step, which is unaffected), then delete the previous session row(s) belonging to the SAME bank — matched by `aspsp_name` + `aspsp_country` equality with the new row — and their orphaned account rows (rows for other banks are never touched) — committed or rolled back as a unit, with no partial merge states
-
-#### Scenario: Duplicate callback is idempotent
-- **WHEN** `authorizeSession` returns a `session_id` that already exists in `eb_sessions` (duplicate callback — the single-use code was already redeemed)
-- **THEN** the route treats it as success without duplicating rows, and concurrent callbacks do not interleave partial merges (single-flighted)
-
-#### Scenario: Failed re-authorization does not strand the user
-- **WHEN** `authorizeSession` fails during a re-authorization of a bank that already has an `eb_sessions` row
-- **THEN** no DB rows are touched at all (Phase 1 is external and non-transactional): the old session row and its account rows stay intact and a retry is unaffected
-
-#### Scenario: Auth callback failure still surfaces via cookie
-- **WHEN** `authorizeSession` fails or the code/state is invalid
-- **THEN** the error reason is written to the one-shot `authError` session field (cookie) and the SPA displays it with a retry affordance

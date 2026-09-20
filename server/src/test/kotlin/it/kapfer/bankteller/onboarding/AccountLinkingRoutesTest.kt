@@ -30,9 +30,10 @@ class AccountLinkingRoutesTest {
 
     companion object {
         init {
-            val dbFile = java.io.File.createTempFile("bt-account-linking", ".db")
-            dbFile.deleteOnExit()
-            System.setProperty("database.path", dbFile.absolutePath)
+            // Fallback path; each test overrides it with a fresh per-test file
+            // (see freshDatabase) so eb_sessions/accounts/system_config state
+            // never leaks between tests.
+            System.setProperty("database.path", java.io.File.createTempFile("bt-account-linking", ".db").absolutePath)
         }
 
         private val testPrivateKey: java.security.PrivateKey =
@@ -42,6 +43,19 @@ class AccountLinkingRoutesTest {
             override fun credentials(): CredentialResult =
                 CredentialResult.Configured(applicationId = "app-123", privateKey = testPrivateKey)
         }
+    }
+
+    /**
+     * Each test gets a fresh temp-file database (the module and the test's own
+     * DatabaseFactory.init() share the file via the system property) and a cold
+     * whitelist cache, so server-side onboarding state never leaks between tests.
+     */
+    @org.junit.Before
+    fun freshDatabase() {
+        val dbFile = java.io.File.createTempFile("bt-account-linking", ".db")
+        dbFile.deleteOnExit()
+        System.setProperty("database.path", dbFile.absolutePath)
+        clearWhitelistCacheForTests()
     }
 
     // -----------------------------------------------------------------------
@@ -95,8 +109,18 @@ class AccountLinkingRoutesTest {
      *  - POST securetoken.googleapis.com/v1/token → fresh idToken
      *  - POST enablebanking.com/api/link_accounts → authorization_url + psu_id_hash
      *  - GET  enablebanking.com/api/applications → active field (configurable)
+     *
+     * @param whitelisted When true (and appActive), the application carries one
+     *   whitelisted account (Test Bank/DE); when false, an active application
+     *   with an empty whitelist (registered but nothing linked yet).
+     * @param whitelistAccountsJson When non-null, overrides the
+     *   `whitelisted_accounts` array content (for multi-entry scenarios).
      */
-    private fun controlPlaneEngine(appActive: Boolean = true): MockEngine = MockEngine { request ->
+    private fun controlPlaneEngine(
+        appActive: Boolean = true,
+        whitelisted: Boolean = true,
+        whitelistAccountsJson: String? = null,
+    ): MockEngine = MockEngine { request ->
         val url = request.url.toString()
         when {
             url.contains("securetoken.googleapis.com/v1/token") ->
@@ -113,8 +137,12 @@ class AccountLinkingRoutesTest {
                 )
             url.contains("enablebanking.com/api/applications") ->
                 respond(
-                    content = if (appActive) {
+                    content = if (whitelistAccountsJson != null) {
+                        """[{"kid":"test-app-id","active":true,"whitelisted_accounts":$whitelistAccountsJson}]"""
+                    } else if (appActive && whitelisted) {
                         """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]"""
+                    } else if (appActive) {
+                        """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[]}]"""
                     } else {
                         """[{"kid":"test-app-id","active":false}]"""
                     },
@@ -131,9 +159,13 @@ class AccountLinkingRoutesTest {
         }
     }
 
-    private fun controlPlaneClient(appActive: Boolean = true): EnableBankingControlPlaneClient =
+    private fun controlPlaneClient(
+        appActive: Boolean = true,
+        whitelisted: Boolean = true,
+        whitelistAccountsJson: String? = null,
+    ): EnableBankingControlPlaneClient =
         EnableBankingControlPlaneClient(
-            client = HttpClient(controlPlaneEngine(appActive)),
+            client = HttpClient(controlPlaneEngine(appActive, whitelisted, whitelistAccountsJson)),
             database = DatabaseFactory.init(),
         )
 
@@ -241,7 +273,7 @@ class AccountLinkingRoutesTest {
     }
 
     @Test
-    fun `6_6 link-accounts with session returns authorization_url and stores bank info in session`() = testApplication {
+    fun `6_6 link-accounts with session returns authorization_url and state derives linking from whitelist`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient()
         application {
@@ -260,7 +292,8 @@ class AccountLinkingRoutesTest {
         assertEquals("https://eb.example/auth", body["authorization_url"]?.jsonPrimitive?.content)
         assertEquals("hash-1", body["psu_id_hash"]?.jsonPrimitive?.content)
 
-        // Session must have gained psuIdHash + selected bank info (resume flow).
+        // linking_completed is now server-derived from the control-plane whitelist
+        // (the session no longer stores psuIdHash/bank info).
         val state = sessionClient.stateJson()
         assertEquals(true, state.bool("linking_completed"))
         val selectedBank = state["selected_bank"]?.jsonObject
@@ -582,7 +615,51 @@ class AccountLinkingRoutesTest {
     // =====================================================================
 
     @Test
-    fun `6_13 state endpoint reflects each onboarding state`() = testApplication {
+    fun `6_13 state reflects not-linked state`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(whitelisted = false),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // App registered + active but nothing linked yet — all flags false/null.
+        val stateJson = sessionClient.stateJson()
+        assertEquals(false, stateJson.bool("requires_relogin"))
+        assertEquals(false, stateJson.bool("linking_completed"))
+        assertEquals(false, stateJson.bool("auth_completed"))
+        assertTrue(stateJson.isNull("auth_error"))
+        assertTrue(stateJson.isNull("selected_bank"))
+    }
+
+    @Test
+    fun `6_13 state reflects linked state with selected_bank from whitelist`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // Whitelist carries Test Bank/DE → linking_completed=true, selected_bank populated.
+        val stateJson = sessionClient.stateJson()
+        assertEquals(true, stateJson.bool("linking_completed"))
+        val selectedBank = stateJson["selected_bank"]?.jsonObject
+        assertNotNull(selectedBank)
+        assertEquals("Test Bank", selectedBank["aspsp_name"]?.jsonPrimitive?.content)
+        assertEquals("DE", selectedBank["aspsp_country"]?.jsonPrimitive?.content)
+        assertEquals("personal", selectedBank["psu_type"]?.jsonPrimitive?.content)
+        assertEquals(false, stateJson.bool("auth_completed"))
+    }
+
+    @Test
+    fun `6_13 state reflects auth error`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient(
             aspspsResult = AspsspListResult.Ok(
@@ -603,28 +680,8 @@ class AccountLinkingRoutesTest {
         }
         val sessionClient = loggedInClient()
 
-        // 1. No progress — all flags false/null.
-        var stateJson = sessionClient.stateJson()
-        assertEquals(false, stateJson.bool("requires_relogin"))
-        assertEquals(false, stateJson.bool("linking_completed"))
-        assertEquals(false, stateJson.bool("auth_completed"))
-        assertTrue(stateJson.isNull("auth_error"))
-        assertTrue(stateJson.isNull("selected_bank"))
-
-        // 2. Linking done — linking_completed=true, selected_bank populated.
-        sessionClient.post("/api/link-accounts") {
-            contentType(ContentType.Application.Json)
-            setBody("""{"country":"DE","psu_type":"personal","aspsp_name":"Test Bank"}""")
-        }
-        stateJson = sessionClient.stateJson()
-        assertEquals(true, stateJson.bool("linking_completed"))
-        val selectedBank = stateJson["selected_bank"]?.jsonObject
-        assertNotNull(selectedBank)
-        assertEquals("Test Bank", selectedBank["aspsp_name"]?.jsonPrimitive?.content)
-        assertEquals("DE", selectedBank["aspsp_country"]?.jsonPrimitive?.content)
-        assertEquals("personal", selectedBank["psu_type"]?.jsonPrimitive?.content)
-
-        // 3. Linking done + auth error — auth_error set, selected_bank still populated.
+        // Linking done (whitelist populated) + auth error → auth_error set,
+        // selected_bank still populated, auth_completed=false.
         sessionClient.post("/api/auth") {
             contentType(ContentType.Application.Json)
             setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
@@ -634,30 +691,53 @@ class AccountLinkingRoutesTest {
             parameter("code", "bad-code")
             parameter("state", state)
         }
-        stateJson = sessionClient.stateJson()
+        val stateJson = sessionClient.stateJson()
         assertEquals("Invalid or expired code", stateJson.str("auth_error"))
         assertEquals(true, stateJson.bool("linking_completed"))
         assertEquals(false, stateJson.bool("auth_completed"))
         assertNotNull(stateJson["selected_bank"]?.jsonObject)
+    }
 
-        // 4. Both done — successful callback → auth_completed=true, auth_error cleared.
-        fake.authorizeSessionResult = AuthorizeSessionResult.Ok(
-            sessionId = "sess-1",
-            accounts = listOf(AccountResource(uid = "acc-1")),
-            aspsp = null,
-            psuType = null,
-            access = null,
+    @Test
+    fun `6_13 state reflects completed auth`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(
+                url = "https://bank.example/auth",
+                authorizationId = "auth-1",
+                psuIdHash = "hash-1",
+            ),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "sess-1",
+                accounts = listOf(AccountResource(uid = "acc-1")),
+                aspsp = null,
+                psuType = null,
+                access = null,
+            ),
         )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // Successful callback persists the EB session server-side →
+        // auth_completed=true, auth_error cleared, linking still completed.
         sessionClient.post("/api/auth") {
             contentType(ContentType.Application.Json)
             setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
         }
-        val goodState = fake.lastStartAuth!!.state
+        val state = fake.lastStartAuth!!.state
         sessionClient.get("/enable-banking-callback") {
             parameter("code", "good-code")
-            parameter("state", goodState)
+            parameter("state", state)
         }
-        stateJson = sessionClient.stateJson()
+        val stateJson = sessionClient.stateJson()
         assertEquals(true, stateJson.bool("auth_completed"))
         assertTrue(stateJson.isNull("auth_error"))
         assertEquals(true, stateJson.bool("linking_completed"))
@@ -682,5 +762,169 @@ class AccountLinkingRoutesTest {
         assertEquals(true, stateJson.bool("requires_relogin"))
         // The SPA routes via the flag, not string parsing — auth_error must stay null.
         assertTrue(stateJson.isNull("auth_error"), "auth_error must stay null, got: ${stateJson.str("auth_error")}")
+    }
+
+    // =====================================================================
+    // Task 6.13 — state endpoint resilience + selected_bank derivation
+    // =====================================================================
+
+    @Test
+    fun `6_13 state never returns 5xx on control-plane failure`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(MockEngine { request ->
+                        val url = request.url.toString()
+                        when {
+                            url.contains("securetoken.googleapis.com/v1/token") ->
+                                respond(
+                                    content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                                    status = HttpStatusCode.OK,
+                                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                                )
+                            url.contains("enablebanking.com/api/applications") ->
+                                respond(
+                                    content = """{"error":"boom"}""",
+                                    status = HttpStatusCode.InternalServerError,
+                                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                                )
+                            else -> error("Unexpected control-plane request: $url")
+                        }
+                    }),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        // Control-plane failure must NOT 5xx — conservative defaults instead.
+        val response = sessionClient.get("/api/onboarding/state")
+        assertEquals(HttpStatusCode.OK, response.status)
+        val stateJson = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertEquals(false, stateJson.bool("linking_completed"))
+        assertTrue(stateJson.isNull("selected_bank"))
+    }
+
+    @Test
+    fun `6_13 selected_bank picks newest whitelist entry by created desc`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    whitelistAccountsJson = """[
+                        {"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Old Bank","country":"DE"}},
+                        {"created":"2026-08-25T10:00:00.000Z","aspsp":{"name":"New Bank","country":"DE"}},
+                        {"created":null,"aspsp":{"name":"No Date Bank","country":"FR"}}
+                    ]""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val stateJson = sessionClient.stateJson()
+        assertEquals(true, stateJson.bool("linking_completed"))
+        val selectedBank = stateJson["selected_bank"]?.jsonObject
+        assertNotNull(selectedBank)
+        assertEquals("New Bank", selectedBank["aspsp_name"]?.jsonPrimitive?.content)
+        assertEquals("DE", selectedBank["aspsp_country"]?.jsonPrimitive?.content)
+        assertEquals("personal", selectedBank["psu_type"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `6_13 selected_bank falls back to last entry when all created are null`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    whitelistAccountsJson = """[
+                        {"created":null,"aspsp":{"name":"First Bank","country":"DE"}},
+                        {"created":null,"aspsp":{"name":"Last Bank","country":"FR"}}
+                    ]""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val stateJson = sessionClient.stateJson()
+        val selectedBank = stateJson["selected_bank"]?.jsonObject
+        assertNotNull(selectedBank)
+        assertEquals("Last Bank", selectedBank["aspsp_name"]?.jsonPrimitive?.content)
+        assertEquals("FR", selectedBank["aspsp_country"]?.jsonPrimitive?.content)
+        assertEquals("personal", selectedBank["psu_type"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `6_13 state does not hammer control plane during EB outage (failure cache)`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // Count control-plane application requests; every one answers 500 to
+        // simulate an Enable Banking outage.
+        var applicationRequests = 0
+        val outageEngine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") -> {
+                    applicationRequests++
+                    respond(
+                        content = """{"error":"EB down"}""",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(outageEngine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // First call: control-plane fetch fails → conservative defaults, never 5xx.
+        val first = sessionClient.stateJson()
+        assertEquals(false, first.bool("linking_completed"))
+        assertTrue(first.isNull("selected_bank"))
+
+        // Second call within the 10 s failure TTL: served from the failure cache —
+        // no additional control-plane round trip (D7 no-hammering).
+        val second = sessionClient.stateJson()
+        assertEquals(false, second.bool("linking_completed"))
+        assertTrue(second.isNull("selected_bank"))
+        assertEquals(1, applicationRequests)
+    }
+
+    @Test
+    fun `6_12 link-status with only name parameter ignores filter and reports whitelist non-empty`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // Only `name` given (country missing) → the name/country filter cannot
+        // apply; linked falls back to whitelist-non-empty.
+        val response = sessionClient.get("/api/onboarding/link-status?name=Test%20Bank")
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertEquals(true, body["linked"]?.jsonPrimitive?.boolean)
     }
 }
