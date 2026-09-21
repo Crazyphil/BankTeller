@@ -11,13 +11,18 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * The three possible screens in the SPA.
+ * The possible screens in the SPA.
  *
  * IMPORTANT (task 7.8): [Screen.Onboarding] is set ONLY from [checkOnboardingStatus].
  * No UI affordance (button, nav item) anywhere re-opens onboarding once active: true.
  * The gate is reachable only via the missing/invalid/inactive-credentials condition.
+ *
+ * [Screen.Loading] is the transient cold-start routing state (design D5): it is
+ * the initial value until [checkAuth] completes, and every branch of
+ * [checkAuth]/[checkOnboardingStatus] sets a concrete screen (Login/Dashboard/
+ * Onboarding), so Loading is never a resting state.
  */
-enum class Screen { Login, Onboarding, Dashboard }
+enum class Screen { Loading, Login, Onboarding, Dashboard }
 
 /** Steps within the Enable Banking onboarding flow. */
 enum class OnboardingStep {
@@ -65,7 +70,7 @@ class AppViewModel(
     // State
     // ---------------------------------------------------------------
 
-    var currentScreen: Screen by mutableStateOf(Screen.Login)
+    var currentScreen: Screen by mutableStateOf(Screen.Loading)
         private set
 
     var isAuthenticated: Boolean by mutableStateOf(false)
@@ -210,13 +215,16 @@ class AppViewModel(
 
         viewModelScope.launch {
             val result = apiClient.login(inputUsername, inputPassword)
-            isLoading = false
 
             when (result) {
                 LoginResult.Success -> {
                     isAuthenticated = true
                     username = inputUsername
                     loginError = null
+                    // Suspend call: runs the onboarding gate (further network
+                    // requests) and routes to the destination screen. isLoading
+                    // stays true through this so the login button remains
+                    // disabled until the redirect actually happens (D6).
                     checkOnboardingStatus()
                 }
                 LoginResult.RateLimited -> {
@@ -226,6 +234,9 @@ class AppViewModel(
                     loginError = result.message
                 }
             }
+            // Cleared only after the whole path (including routing on success)
+            // has completed — never between the login response and the redirect.
+            isLoading = false
         }
     }
 
@@ -424,6 +435,7 @@ class AppViewModel(
     fun startOnboarding(email: String) {
         onboardingEmail = email
         onboardingError = null  // clear stale error from a prior AuthFailed/retry
+        isLoading = true
         viewModelScope.launch {
             val result = apiClient.startOnboarding(email)
             when (result) {
@@ -437,6 +449,7 @@ class AppViewModel(
                     onboardingError = result.message
                 }
             }
+            isLoading = false
         }
     }
 
@@ -460,10 +473,12 @@ class AppViewModel(
     fun resetOnboarding() {
         waitPollJob?.cancel()
         waitPollJob = null
+        isLoading = true
         viewModelScope.launch {
             apiClient.resetOnboardingCredentials()
             resetOnboardingState()
             onboardingStep = OnboardingStep.EmailEntry
+            isLoading = false
         }
     }
 
@@ -486,6 +501,7 @@ class AppViewModel(
         onboardingIsVerifying = true
         onboardingError = null
         onboardingStep = OnboardingStep.Verifying
+        isLoading = true
         viewModelScope.launch {
             val result = apiClient.completeOnboarding(token, environment, redirectUrl, productionOverrides)
             onboardingIsVerifying = false
@@ -505,6 +521,7 @@ class AppViewModel(
                 }
                 // else: non-retryable — stay on Verifying (VerifyingStep shows error + "Restart onboarding")
             }
+            isLoading = false
         }
     }
 
@@ -562,12 +579,14 @@ class AppViewModel(
 
     fun loadAspsps() {
         aspspsState = AspspsState.Loading
+        isLoading = true
         viewModelScope.launch {
             val result = apiClient.getAspsps()
             aspspsState = when (result) {
                 is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
                 is AspspsResult.Error -> AspspsState.Error(result.message)
             }
+            isLoading = false
         }
     }
 
@@ -651,6 +670,7 @@ class AppViewModel(
     }
 
     fun cancelLinking() {
+        isLoading = true
         viewModelScope.launch {
             apiClient.cancelLinking()
             // Reset all linking-related state
@@ -664,6 +684,7 @@ class AppViewModel(
             selectedPsuType = "personal"
             authError = null
             onboardingStep = OnboardingStep.BankSelection
+            isLoading = false
         }
     }
 

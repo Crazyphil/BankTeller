@@ -1,9 +1,12 @@
 package it.kapfer.bankteller
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import it.kapfer.bankteller.onboarding.OnboardingScreen
+import it.kapfer.bankteller.ui.components.LocalActionBusy
+import it.kapfer.bankteller.ui.components.LoadingSplash
 import it.kapfer.bankteller.ui.theme.BankTellerTheme
 
 /**
@@ -42,10 +45,18 @@ fun App() {
     }
 
     BankTellerTheme {
-        when (viewModel.currentScreen) {
-            Screen.Login -> LoginScreen(viewModel)
-            Screen.Onboarding -> OnboardingScreen(viewModel)
-            Screen.Dashboard -> DashboardScreen(viewModel)
+        // Single source of truth for the global "one action at a time" busy
+        // state (design D1/D3): every ActionButton app-wide disables while any
+        // server request is in flight.
+        CompositionLocalProvider(
+            LocalActionBusy provides (viewModel.isLoading || viewModel.linkStatusChecking),
+        ) {
+            when (viewModel.currentScreen) {
+                Screen.Loading -> LoadingSplash()
+                Screen.Login -> LoginScreen(viewModel)
+                Screen.Onboarding -> OnboardingScreen(viewModel)
+                Screen.Dashboard -> DashboardScreen(viewModel)
+            }
         }
     }
 }

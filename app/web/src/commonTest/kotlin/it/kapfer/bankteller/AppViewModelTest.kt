@@ -159,7 +159,9 @@ class AppViewModelTest {
         advanceUntilIdle()
         assertFalse(vm.isAuthenticated)
         assertEquals("Invalid credentials", vm.loginError)
-        assertEquals(Screen.Login, vm.currentScreen)
+        // Login failure does not navigate — currentScreen stays at the initial
+        // cold-start Loading value (design D5) since no routing ran.
+        assertEquals(Screen.Loading, vm.currentScreen)
     }
 
     @Test
@@ -168,6 +170,151 @@ class AppViewModelTest {
         vm.login("admin", "changeme")
         advanceUntilIdle()
         assertTrue(vm.isRateLimited)
+    }
+
+    // ---------------------------------------------------------------
+    // Busy-state regressions (change: disable-actions-in-flight)
+    //
+    // isLoading is the single source of truth behind LocalActionBusy; these
+    // tests pin the in-flight windows of every server-action method so a
+    // button can never re-enable between a response and its routing.
+    // Mid-request state is observed via delay hooks on the fake + runCurrent()
+    // (StandardTestDispatcher runs the coroutine up to the first suspension).
+    // ---------------------------------------------------------------
+
+    @Test
+    fun login_holdsIsLoadingThroughRouting_untilDestinationIsSet() = runTest(testDispatcher) {
+        // Regression: login() used to clear isLoading right after the login
+        // response, re-enabling the Login button while checkOnboardingStatus()
+        // was still routing (visible as a disabled → enabled → redirect flash).
+        fakeApi.nextLoginResult = LoginResult.Success
+        fakeApi.nextOnboardingStatus =
+            OnboardingStatus(enableBankingConfigured = false, verified = null, active = null)
+        fakeApi.onboardingStatusCallDelayMs = 1_000L
+
+        vm.login("admin", "changeme")
+        runCurrent() // login response arrived; routing suspended inside getOnboardingStatus
+
+        // Still busy while routing is in flight — the button must stay disabled.
+        assertTrue(vm.isLoading)
+        // Authenticated, but routing hasn't completed: still on the transient
+        // loading screen, not yet on the destination.
+        assertTrue(vm.isAuthenticated)
+        assertEquals(Screen.Loading, vm.currentScreen)
+
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertTrue(vm.isAuthenticated)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+    }
+
+    @Test
+    fun login_failure_clearsIsLoadingImmediately() = runTest(testDispatcher) {
+        fakeApi.nextLoginResult = LoginResult.Failure("Invalid credentials")
+        vm.login("admin", "wrong")
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertNotNull(vm.loginError)
+    }
+
+    @Test
+    fun startOnboarding_setsIsLoadingDuringRequest() = runTest(testDispatcher) {
+        // Regression: "Send login email" never raised the busy flag, so the
+        // button stayed clickable while the start request was in flight.
+        fakeApi.nextStartResult = StartResult.Success(state = "state-abc", redirectUrl = "https://example.com/cb")
+        fakeApi.waitStatusSequence = listOf(WaitStatus.Complete) // poll terminates
+        fakeApi.startCallDelayMs = 1_000L
+
+        vm.startOnboarding("admin@example.com")
+        runCurrent() // suspended inside the start request
+
+        assertTrue(vm.isLoading)
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
+    }
+
+    @Test
+    fun startOnboarding_error_clearsIsLoading() = runTest(testDispatcher) {
+        fakeApi.nextStartResult = StartResult.Error("Server returned 500")
+        vm.startOnboarding("admin@example.com")
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertNotNull(vm.onboardingError)
+    }
+
+    @Test
+    fun loadAspsps_setsIsLoadingDuringRequest() = runTest(testDispatcher) {
+        // Regression: the ASPSP catalog fetch (incl. the Retry path) never
+        // raised the busy flag, leaving every other action button enabled.
+        fakeApi.nextAspspsResult = AspspsResult.Ok(emptyList())
+        fakeApi.aspspsCallDelayMs = 1_000L
+
+        vm.loadAspsps()
+        runCurrent() // suspended inside the fetch
+
+        assertTrue(vm.isLoading)
+        assertTrue(vm.aspspsState is AspspsState.Loading)
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertTrue(vm.aspspsState is AspspsState.Loaded)
+    }
+
+    @Test
+    fun submitRegistration_setsIsLoadingDuringRequest() = runTest(testDispatcher) {
+        // Regression: the complete-onboarding request never raised the busy
+        // flag, so sibling action buttons stayed enabled during registration.
+        fakeApi.nextStartResult = StartResult.Success(state = "state-abc", redirectUrl = "https://example.com/cb")
+        fakeApi.waitStatusSequence = listOf(WaitStatus.Complete)
+        vm.startOnboarding("admin@example.com")
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+
+        fakeApi.nextCompleteResult = CompleteResult(success = true, active = true, error = null)
+        fakeApi.completeCallDelayMs = 1_000L
+        vm.submitRegistration(
+            environment = "SANDBOX",
+            redirectUrl = "https://example.com/cb",
+            productionOverrides = null,
+        )
+        runCurrent() // suspended inside completeOnboarding
+
+        assertTrue(vm.isLoading)
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun resetOnboarding_setsIsLoadingDuringRequest() = runTest(testDispatcher) {
+        // Navigate-and-fire control ("Restart onboarding" / "Start over" /
+        // "Back to email" → POST reset): must disable while the POST runs.
+        fakeApi.resetCallDelayMs = 1_000L
+
+        vm.resetOnboarding()
+        runCurrent() // suspended inside the reset POST
+
+        assertTrue(vm.isLoading)
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertEquals(1, fakeApi.resetCallCount)
+        assertEquals(OnboardingStep.EmailEntry, vm.onboardingStep)
+    }
+
+    @Test
+    fun cancelLinking_setsIsLoadingDuringRequest() = runTest(testDispatcher) {
+        // Navigate-and-fire control ("Back to bank list" on LinkingProgress →
+        // POST cancel-linking): must disable while the POST runs.
+        fakeApi.cancelLinkingCallDelayMs = 1_000L
+
+        vm.cancelLinking()
+        runCurrent() // suspended inside the cancel POST
+
+        assertTrue(vm.isLoading)
+        advanceUntilIdle()
+        assertFalse(vm.isLoading)
+        assertEquals(1, fakeApi.cancelLinkingCallCount)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
     }
 
     // ---------------------------------------------------------------
@@ -393,7 +540,8 @@ class AppViewModelTest {
         // Screen stays whatever it was — submitRegistration doesn't change currentScreen
         // to Login; it only navigates to Dashboard if active==true, else stays Onboarding.
         // Since isAuthenticated was never set (no checkAuth/login call), currentScreen
-        // is still Login. In a real flow, the user would have already authenticated.
+        // is still Loading (the initial cold-start value). In a real flow, the user
+        // would have already authenticated.
         // We only assert the onboarding step here; currentScreen behavior is tested
         // implicitly via the startOnboarding → submitRegistration success+active path.
     }
@@ -493,8 +641,9 @@ class AppViewModelTest {
         advanceUntilIdle()
         // No API call made
         assertEquals(0, fakeApi.completeCalls?.size)
-        // No state change
-        assertEquals(Screen.Login, vm.currentScreen)
+        // No state change — currentScreen stays at the initial cold-start
+        // Loading value (design D5) since no routing ran.
+        assertEquals(Screen.Loading, vm.currentScreen)
     }
 
     @Test
@@ -1166,8 +1315,32 @@ private class FakeApiClient : ApiClient() {
     var nextStartAuthResult: StartAuthResult = StartAuthResult.Error("not configured")
     var nextLinkStatus: Boolean? = null
 
+    // Delay hooks for busy-state regression tests: when > 0, the corresponding
+    // API call suspends for this long, letting tests observe mid-request state
+    // (e.g. isLoading held true while routing is still in flight).
+    var onboardingStatusCallDelayMs: Long = 0L
+    var startCallDelayMs: Long = 0L
+    var aspspsCallDelayMs: Long = 0L
+    var resetCallDelayMs: Long = 0L
+    var cancelLinkingCallDelayMs: Long = 0L
+    var resetCallCount = 0
+    var cancelLinkingCallCount = 0
+
     override suspend fun getOnboardingState(): OnboardingState? = nextOnboardingState
-    override suspend fun getAspsps(): AspspsResult = nextAspspsResult
+    override suspend fun getAspsps(): AspspsResult {
+        if (aspspsCallDelayMs > 0) delay(aspspsCallDelayMs)
+        return nextAspspsResult
+    }
+    override suspend fun resetOnboardingCredentials(): Boolean {
+        if (resetCallDelayMs > 0) delay(resetCallDelayMs)
+        resetCallCount++
+        return true
+    }
+    override suspend fun cancelLinking(): Boolean {
+        if (cancelLinkingCallDelayMs > 0) delay(cancelLinkingCallDelayMs)
+        cancelLinkingCallCount++
+        return true
+    }
     override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult = nextLinkAccountsResult
     override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult = nextStartAuthResult
     override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {
@@ -1210,13 +1383,17 @@ private class FakeApiClient : ApiClient() {
 
     override suspend fun checkAuth(): AuthState = nextAuthState
 
-    override suspend fun getOnboardingStatus(): OnboardingStatus? = nextOnboardingStatus
+    override suspend fun getOnboardingStatus(): OnboardingStatus? {
+        if (onboardingStatusCallDelayMs > 0) delay(onboardingStatusCallDelayMs)
+        return nextOnboardingStatus
+    }
 
     override suspend fun getOnboardingRedirectUrl(): String? = nextRedirectUrl
 
     override suspend fun getRegistrationInfo(): RegistrationInfo? = nextRegistrationInfo
 
     override suspend fun startOnboarding(email: String): StartResult {
+        if (startCallDelayMs > 0) delay(startCallDelayMs)
         startCalls.add(email)
         return nextStartResult
     }

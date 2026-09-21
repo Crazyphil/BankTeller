@@ -8,27 +8,225 @@
     <link rel="preload" href="composeResources/font/JetBrainsMono.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <title>BankTeller</title>
+    <script>
+        // Apply the persisted manual theme override (if any) before first
+        // paint so the HTML splash matches the Compose theme from the start —
+        // no theme flash for users who forced light/dark in the app.
+        // Mirrors ui/theme/Theme.kt: "light" / "dark" override; anything else
+        // (including "system" / absent) falls back to prefers-color-scheme.
+        (function () {
+            try {
+                var t = localStorage.getItem("bankteller-theme");
+                if (t === "light" || t === "dark") {
+                    document.documentElement.classList.add("theme-" + t);
+                }
+            } catch (e) { /* localStorage unavailable — system preference applies */ }
+        })();
+    </script>
     <style>
+        :root {
+            --bg: #FAF8F3;
+            --text: #1A1A1A;
+            --brass: #A67C2E;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1A1714;
+                --text: #F0EDE5;
+                --brass: #D4A94E;
+            }
+        }
+
+        /* Manual theme override (localStorage["bankteller-theme"], applied by
+           the inline script below): class-based rules (0,1,1) outrank both the
+           :root (0,1,0) light rule and the media-query :root rule, so a forced
+           theme wins over the system preference. */
+        html.theme-light {
+            --bg: #FAF8F3;
+            --text: #1A1A1A;
+            --brass: #A67C2E;
+        }
+
+        html.theme-dark {
+            --bg: #1A1714;
+            --text: #F0EDE5;
+            --brass: #D4A94E;
+        }
+
+        @font-face {
+            font-family: "Fraunces";
+            src: url("composeResources/font/Fraunces-Variable.woff2") format("woff2");
+            font-weight: 100 900;
+            font-display: swap;
+        }
+
         html, body {
             margin: 0;
             padding: 0;
             width: 100%;
             height: 100%;
             overflow: hidden;
-            font-family: sans-serif;
+            background-color: var(--bg);
         }
+
         #loading {
             display: flex;
+            flex-direction: column;
             align-items: center;
-            justify-content: center;
+            justify-content: flex-start;
             width: 100vw;
             height: 100vh;
-            color: #666;
+            background-color: var(--bg);
+            box-sizing: border-box;
+            padding-top: 16px;
+        }
+
+        .logo {
+            width: 48px;
+            height: 48px;
+            display: block;
+        }
+
+        .logo-dark {
+            display: none;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .logo-light {
+                display: none;
+            }
+            .logo-dark {
+                display: block;
+            }
+        }
+
+        /* Manual theme override (localStorage["bankteller-theme"], set by the
+           inline script below): class-based rules outrank the media query, so
+           a forced light/dark theme also swaps the logo variant. */
+        .theme-light .logo-light {
+            display: block;
+        }
+        .theme-light .logo-dark {
+            display: none;
+        }
+        .theme-dark .logo-light {
+            display: none;
+        }
+        .theme-dark .logo-dark {
+            display: block;
+        }
+
+        .wordmark {
+            margin-top: 24px;
+            font-family: "Fraunces", Georgia, "Times New Roman", serif;
+            font-size: 28px;
+            font-weight: 900;
+            font-synthesis: none;
+            font-variation-settings: 'opsz' 28, 'wght' 900;
+            font-optical-sizing: auto;
+            line-height: 36px;
+            letter-spacing: -0.01em;
+            color: var(--text);
+            user-select: none;
+            -webkit-font-smoothing: subpixel-antialiased;
+        }
+
+        .spinner {
+            margin-top: 32px;
+            width: 24px;
+            height: 24px;
+            border: 2.5px solid transparent;
+            border-top-color: var(--brass);
+            border-right-color: var(--brass);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            box-sizing: border-box;
+        }
+
+        @keyframes spin {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
         }
     </style>
 </head>
 <body>
-    <div id="loading">Loading BankTeller…</div>
+    <div id="loading">
+        <!-- Sovereign Ledger Brand Icon (Light Variant) -->
+        <svg class="logo logo-light" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="48" height="48" aria-hidden="true">
+            <!-- Hardcover Bound Back (Leather Binding under pages) -->
+            <path d="M 6,19 C 19,13 32,19 32,19 C 32,19 45,13 58,19 L 58,55 C 45,49 32,55 32,55 C 32,55 19,49 6,55 Z" fill="#1B2A4A" stroke="#A67C2E" stroke-width="1.2" />
+
+            <!-- Stacked Paper Folio Edges -->
+            <path d="M 8,53 C 19,47 32,53 32,53 C 32,53 45,47 56,53" fill="none" stroke="#E6E0D4" stroke-width="2" />
+
+            <!-- Open Book Left Page -->
+            <path d="M 8,16 Q 20,11 32,17 L 32,50 Q 20,44 8,50 Z" fill="#FAF8F3" stroke="#1B2A4A" stroke-width="1.5" stroke-linejoin="round" />
+
+            <!-- Open Book Right Page -->
+            <path d="M 32,17 Q 44,11 56,16 L 56,50 Q 44,44 32,50 Z" fill="#FFFFFF" stroke="#1B2A4A" stroke-width="1.5" stroke-linejoin="round" />
+
+            <!-- Ledger Lines Left Page (Curved) -->
+            <path d="M 13,24 Q 22,21 28,22.2" stroke="#A67C2E" stroke-width="1.2" fill="none" opacity="0.9" stroke-linecap="round" />
+            <path d="M 13,30 Q 22,27 28,28.2" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 13,36 Q 22,33 28,34.2" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 13,42 Q 22,39 28,40.2" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+
+            <!-- Ledger Lines Right Page (Curved) -->
+            <path d="M 36,22.2 Q 42,21 51,24" stroke="#A67C2E" stroke-width="1.2" fill="none" opacity="0.9" stroke-linecap="round" />
+            <path d="M 36,28.2 Q 42,27 51,30" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 36,34.2 Q 42,33 51,36" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 36,40.2 Q 42,39 51,42" stroke="#1B2A4A" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+
+            <!-- Center Spine & Bookmark Ribbon -->
+            <line x1="32" y1="16" x2="32" y2="51" stroke="#A67C2E" stroke-width="2" />
+            <path d="M 30,50 L 30,58 L 32,56 L 34,58 L 34,50 Z" fill="#A67C2E" />
+
+            <!-- Emerald Verification Seal Dot -->
+            <circle cx="32" cy="32" r="3.5" fill="#2E7D5B" stroke="#FAF8F3" stroke-width="1" />
+        </svg>
+
+        <!-- Sovereign Ledger Brand Icon (Dark Variant) -->
+        <svg class="logo logo-dark" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="48" height="48" aria-hidden="true">
+            <!-- Hardcover Bound Back (Leather Binding under pages) -->
+            <path d="M 6,19 C 19,13 32,19 32,19 C 32,19 45,13 58,19 L 58,55 C 45,49 32,55 32,55 C 32,55 19,49 6,55 Z" fill="#C9D4E8" stroke="#D4A94E" stroke-width="1.2" />
+
+            <!-- Stacked Paper Folio Edges -->
+            <path d="M 8,53 C 19,47 32,53 32,53 C 32,53 45,47 56,53" fill="none" stroke="#3A342B" stroke-width="2" />
+
+            <!-- Open Book Left Page -->
+            <path d="M 8,16 Q 20,11 32,17 L 32,50 Q 20,44 8,50 Z" fill="#2E2922" stroke="#C9D4E8" stroke-width="1.5" stroke-linejoin="round" />
+
+            <!-- Open Book Right Page -->
+            <path d="M 32,17 Q 44,11 56,16 L 56,50 Q 44,44 32,50 Z" fill="#242019" stroke="#C9D4E8" stroke-width="1.5" stroke-linejoin="round" />
+
+            <!-- Ledger Lines Left Page (Curved) -->
+            <path d="M 13,24 Q 22,21 28,22.2" stroke="#D4A94E" stroke-width="1.2" fill="none" opacity="0.9" stroke-linecap="round" />
+            <path d="M 13,30 Q 22,27 28,28.2" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 13,36 Q 22,33 28,34.2" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 13,42 Q 22,39 28,40.2" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+
+            <!-- Ledger Lines Right Page (Curved) -->
+            <path d="M 36,22.2 Q 42,21 51,24" stroke="#D4A94E" stroke-width="1.2" fill="none" opacity="0.9" stroke-linecap="round" />
+            <path d="M 36,28.2 Q 42,27 51,30" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 36,34.2 Q 42,33 51,36" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+            <path d="M 36,40.2 Q 42,39 51,42" stroke="#F0EDE5" stroke-width="1" fill="none" opacity="0.35" stroke-linecap="round" />
+
+            <!-- Center Spine & Bookmark Ribbon -->
+            <line x1="32" y1="16" x2="32" y2="51" stroke="#D4A94E" stroke-width="2" />
+            <path d="M 30,50 L 30,58 L 32,56 L 34,58 L 34,50 Z" fill="#D4A94E" />
+
+            <!-- Emerald Verification Seal Dot -->
+            <circle cx="32" cy="32" r="3.5" fill="#4FAE87" stroke="#1A1714" stroke-width="1" />
+        </svg>
+
+        <div class="wordmark">BankTeller</div>
+        <div class="spinner" role="status" aria-label="Loading"></div>
+    </div>
     <script src="web.js"></script>
 </body>
 </html>

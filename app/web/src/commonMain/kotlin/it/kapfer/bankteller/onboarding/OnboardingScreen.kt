@@ -31,9 +31,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -79,6 +77,9 @@ import it.kapfer.bankteller.createHttpClient
 import it.kapfer.bankteller.openUrlInNewTab
 import it.kapfer.bankteller.redirectTo
 import it.kapfer.bankteller.jetBrainsMonoFamily
+import it.kapfer.bankteller.ui.components.ActionButton
+import it.kapfer.bankteller.ui.components.QuietActionButton
+import it.kapfer.bankteller.ui.components.WaitingIndicator
 import it.kapfer.bankteller.ui.components.BrandedTopBar
 import it.kapfer.bankteller.ui.components.DecisionBox
 import it.kapfer.bankteller.ui.components.QuietButton
@@ -172,9 +173,7 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 0, totalSteps = 8) },
         onBack = null,
         forward = {
-            Button(onClick = submit) {
-                Text("Send login email")
-            }
+            ActionButton(onClick = submit, label = "Send login email")
         },
     ) {
         OutlinedTextField(
@@ -244,11 +243,10 @@ private fun WaitingStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 1, totalSteps = 8) },
         onBack = { viewModel.resetOnboarding() },
         backLabel = "Start over",
+        backServerAction = true, // POST reset credentials — disable while in flight
         forward = null,
     ) {
-        CircularProgressIndicator(
-            color = LocalBankTellerColors.current.brass,
-        )
+        WaitingIndicator.Zone()
 
         val derivedUrl = viewModel.onboardingDerivedRedirectUrl
         if (derivedUrl != null) {
@@ -354,10 +352,9 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 2, totalSteps = 8) },
         onBack = { viewModel.resetOnboarding() },
         backLabel = "Back to email",
+        backServerAction = true, // POST reset credentials — disable while in flight
         forward = {
-            Button(onClick = submit) {
-                Text("Register")
-            }
+            ActionButton(onClick = submit, label = "Register")
         },
     ) {
         // Show retryable error banner so the user knows what to fix
@@ -500,9 +497,7 @@ private fun VerifyingStep(viewModel: AppViewModel) {
         forward = null,
     ) {
         if (viewModel.onboardingError == null) {
-            CircularProgressIndicator(
-                color = LocalBankTellerColors.current.brass,
-            )
+            WaitingIndicator.Zone()
         }
 
         viewModel.onboardingError?.let { error ->
@@ -537,15 +532,13 @@ private fun ActivationGuideStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 4, totalSteps = 8) },
         onBack = null,
         extraActions = {
-            QuietButton(
+            QuietActionButton(
                 onClick = { viewModel.resetOnboarding() },
                 label = "Restart onboarding",
             )
         },
         forward = {
-            Button(onClick = { viewModel.startBankSetup() }) {
-                Text("Start Bank Setup")
-            }
+            ActionButton(onClick = { viewModel.startBankSetup() }, label = "Start Bank Setup")
         },
     ) {
         // Two-step explanation as Tier 2 groups
@@ -751,14 +744,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                     onBack = null,
                     forward = {},
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = Dimens.xxl),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
-                    }
+                    WaitingIndicator.Zone()
                 }
             }
             is AspspsState.Error -> {
@@ -775,9 +761,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    Button(onClick = { viewModel.loadAspsps() }) {
-                        Text("Retry")
-                    }
+                    ActionButton(onClick = { viewModel.loadAspsps() }, label = "Retry")
                     Spacer(modifier = Modifier.height(Dimens.xs))
                     QuietButton(
                         onClick = { viewModel.dismissResumeCard() },
@@ -798,12 +782,11 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
             progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
             onBack = null,
             forward = {
-                Button(
+                ActionButton(
                     onClick = { viewModel.continueResumeWithBank() },
-                    enabled = viewModel.selectedPsuType.isNotEmpty() && !viewModel.isLoading,
-                ) {
-                    Text("Continue with $bankName")
-                }
+                    label = "Continue with $bankName",
+                    enabled = viewModel.selectedPsuType.isNotEmpty(),
+                )
             },
         ) {
             OutlinedCard(
@@ -960,12 +943,10 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
             forward = {
                 val selected = viewModel.selectedAspsp
                 if (selected != null) {
-                    Button(
+                    ActionButton(
                         onClick = { viewModel.linkAccounts() },
-                        enabled = !viewModel.isLoading,
-                    ) {
-                        Text("Connect ${selected.name}")
-                    }
+                        label = "Connect ${selected.name}",
+                    )
                 }
             },
         ) {
@@ -978,25 +959,16 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
             )
 
             when (val state = viewModel.aspspsState) {
-                is AspspsState.Loading -> {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = Dimens.xxl),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
-                    }
-                }
+            is AspspsState.Loading -> {
+                WaitingIndicator.Zone()
+            }
                 is AspspsState.Error -> {
                     Text(
                         text = state.message,
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    Button(onClick = { viewModel.loadAspsps() }) {
-                        Text("Retry")
-                    }
+                    ActionButton(onClick = { viewModel.loadAspsps() }, label = "Retry")
                 }
                 is AspspsState.Loaded -> {
                     val query = searchQuery.trim().lowercase()
@@ -1214,13 +1186,12 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 6, totalSteps = 8) },
         onBack = { viewModel.cancelLinking() },
         backLabel = "Back to bank list",
+        backServerAction = true, // POST cancel-linking — disable while in flight
         forward = {
-            Button(
+            ActionButton(
                 onClick = { viewModel.checkLinkStatus() },
-                enabled = !viewModel.linkStatusChecking && !viewModel.isLoading,
-            ) {
-                Text("I've completed linking")
-            }
+                label = "I've completed linking",
+            )
         },
     ) {
         if (!isResumeMode) {
@@ -1237,9 +1208,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Button(onClick = { viewModel.checkLinkStatus() }) {
-                Text("Retry")
-            }
+            ActionButton(onClick = { viewModel.checkLinkStatus() }, label = "Retry")
         }
 
         viewModel.linkError?.let { err ->
@@ -1251,7 +1220,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
         }
 
         if (viewModel.linkStatusChecking) {
-            CircularProgressIndicator(color = LocalBankTellerColors.current.brass)
+            WaitingIndicator.Inline()
         }
 
         if (linkUrl != null) {
@@ -1273,13 +1242,12 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                 text = "If you closed the tab by accident, you can re-open the linking page.",
                 style = MaterialTheme.typography.bodySmall,
             )
-            QuietButton(
+            QuietActionButton(
                 onClick = {
                     pendingAutoOpen = true
                     viewModel.relinkAccount()
                 },
                 label = "Re-open linking page",
-                enabled = !viewModel.isLoading,
             )
         }
     }
@@ -1301,21 +1269,22 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 7, totalSteps = 8) },
         onBack = null,
         forward = {
-            if (authRedirectUrl != null) {
-                Button(
-                    onClick = {
-                        redirectTo(authRedirectUrl)
+            // D6 footprint rule: the button stays mounted at all times.
+            // While POST /api/auth is in flight, LocalActionBusy disables it
+            // automatically; once the redirect URL arrives, the domain
+            // condition (authRedirectUrl != null) enables it. On failure the
+            // URL stays null so the button remains disabled — the error is
+            // shown in the content zone below.
+            ActionButton(
+                onClick = {
+                    authRedirectUrl?.let {
+                        redirectTo(it)
                         viewModel.consumeAuthRedirectUrl()
-                    },
-                ) {
-                    Text("Continue to your bank")
-                }
-            } else {
-                CircularProgressIndicator(
-                    color = LocalBankTellerColors.current.brass,
-                    modifier = Modifier.size(Dimens.xxl),
-                )
-            }
+                    }
+                },
+                label = "Continue to your bank",
+                enabled = authRedirectUrl != null,
+            )
         },
     ) {
         OutlinedCard(

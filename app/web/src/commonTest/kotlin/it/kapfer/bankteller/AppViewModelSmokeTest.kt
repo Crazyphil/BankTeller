@@ -12,11 +12,12 @@ import kotlin.test.assertEquals
 class AppViewModelSmokeTest {
 
     @Test
-    fun screen_enum_has_three_values() {
-        assertEquals(3, Screen.entries.size)
-        assertEquals(Screen.Login, Screen.entries[0])
-        assertEquals(Screen.Onboarding, Screen.entries[1])
-        assertEquals(Screen.Dashboard, Screen.entries[2])
+    fun screen_enum_has_four_values() {
+        assertEquals(4, Screen.entries.size)
+        assertEquals(Screen.Loading, Screen.entries[0])
+        assertEquals(Screen.Login, Screen.entries[1])
+        assertEquals(Screen.Onboarding, Screen.entries[2])
+        assertEquals(Screen.Dashboard, Screen.entries[3])
     }
 
     @Test

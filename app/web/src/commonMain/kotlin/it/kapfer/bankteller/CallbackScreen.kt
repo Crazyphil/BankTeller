@@ -15,7 +15,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
@@ -34,6 +34,7 @@ import it.kapfer.bankteller.ui.components.BrandLogo
 import it.kapfer.bankteller.ui.components.BrassDoubleRule
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggleOverlay
+import it.kapfer.bankteller.ui.components.WaitingIndicator
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import kotlinx.coroutines.delay
@@ -207,17 +208,14 @@ private fun SuccessContent(isAuthFlow: Boolean, params: Map<String, String>) {
         }
     }
 
-    // Brass CircularProgressIndicator at the card bottom during the 2s redirect (auth flow only)
+    // Brass inline spinner at the card bottom during the 2s redirect (auth flow only)
     if (isAuthFlow) {
         Spacer(modifier = Modifier.height(Dimens.sm))
         Column(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            CircularProgressIndicator(
-                color = LocalBankTellerColors.current.brass,
-                modifier = Modifier.size(Dimens.md),
-            )
+            WaitingIndicator.Inline()
         }
     }
 }

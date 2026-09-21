@@ -27,12 +27,17 @@ import it.kapfer.bankteller.ui.theme.Dimens
  * [Dimens.screenPadding], and optionally makes the content column scrollable.
  * When [topBar] is provided it renders above the content at the top of the
  * column (design D15); absent on login / legal / callback screens.
+ *
+ * [alignment] positions the (content-height) column inside the full-size Box:
+ * the default `TopCenter` suits scrollable screens; full-viewport screens like
+ * the cold-start splash pass `Alignment.Center` to center vertically too.
  */
 @Composable
 fun ScreenShell(
     modifier: Modifier = Modifier,
     maxWidth: Dp = Dimens.contentMaxWidth,
     verticalArrangement: Arrangement.Vertical = Arrangement.Top,
+    alignment: Alignment = Alignment.TopCenter,
     scrollable: Boolean = false,
     topBar: (@Composable () -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
@@ -50,7 +55,7 @@ fun ScreenShell(
             val columnModifier = Modifier
                 .widthIn(max = maxWidth)
                 .fillMaxWidth()
-                .align(Alignment.TopCenter)
+                .align(alignment)
                 .padding(Dimens.screenPadding)
             Column(
                 modifier = if (scrollable) {

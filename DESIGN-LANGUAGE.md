@@ -378,6 +378,46 @@ Subtle hover lift on interactive cards.
 
 Financial figures (amounts, balances) and confirmation buttons remain static. They do not fade, slide, pulse, or shift. Stability of numbers conveys trust.
 
+### 8.5 Processing Feedback & Wait States
+
+Every wait in the app falls into exactly one of four tiers, escalating visual weight with intent. Never mix tiers or escalate a lighter wait into a heavier one.
+
+| Tier | Situation | Presentation |
+|---|---|---|
+| 1. Cold-start splash | Session and route destination unknown (app boot) | Branded splash (`Screen.Loading`): 48dp logo, Fraunces wordmark, 24dp brass spinner. No interactive elements, no entrance animation. Used exclusively when the destination is unknown — never between two known screens. |
+| 2. Action in-flight | A user-triggered server request is running | Button-level busy state: the triggering button (and all other server-action buttons) disables in place via `ActionButton` + `LocalActionBusy`. Global "one action at a time" — navigation controls (Back, Cancel, logout) stay enabled. |
+| 3. Screen transition | A response routes the user to another screen | In-situ hold on the source screen until the response arrives, then direct staggered reveal (`fadeInSlide`, §8.1) of the destination. Never an intermediate splash or overlay. |
+| 4. Ambient polling | Background status checks (e.g. link-status poll) | Quiet inline brass spinner next to the status text. Non-blocking; escape hatches (Back/Cancel) remain interactive. |
+
+**In-flight rules:**
+
+- **Fixed button footprint**: a busy button keeps its full height, width, and shape. It is never unmounted, collapsed, or replaced by a standalone spinner — forms must not jump during submission. The busy state lives inside the disabled button itself.
+- **Brass-only progress indicators**: all spinners and progress indicators use brass (`LocalBankTellerColors.brass`), never primary blue or emerald. Emerald is reserved for completed success / money-in.
+- **No skeleton shimmer on financial amounts**: amounts, balances, and figures never show skeleton placeholders or shimmer while loading. They appear at once, or not at all — stability of numbers conveys trust (§8.4).
+- **No viewport dimming, no modal progress**: the app never dims the viewport or shows indeterminate progress in a modal/popup overlay. Determinate progress (percentage bars, step counters) shown inline as part of a workflow is a separate mechanism and not constrained here.
+
+**Button conventions:**
+
+- **`ActionButton` and `QuietActionButton` are the standard components for server-action buttons.** Every button that triggers a server-side request uses one of the two — never a raw Material `Button` or `QuietButton` with a hand-rolled `enabled = !isLoading` expression. The busy disabling applies automatically via `LocalActionBusy`.
+- **The `enabled` parameter carries domain-specific conditions, ANDed with the busy state.** Effective enabled = `enabled && !LocalActionBusy.current`. A button with an additional enable condition (e.g. "Continue with \<bank\>" requires a selected account type) expresses both through this single parameter — there is no way to override the busy state.
+- **Quiet-styled server-action buttons use `QuietActionButton`**, not raw `QuietButton` — same quiet visual treatment (1dp outline, onSurface label), busy state automatic, visual hierarchy unchanged.
+- **Server-action buttons vs. navigation-only controls**: buttons that fire a server request (including navigate-and-fire controls like "Restart onboarding" → POST reset, or wizard Back on a step that calls the server) disable while any request is in flight. Controls that navigate without a server call (pure client-side step Back/Cancel, logout) stay enabled at all times.
+
+### §8.5.1 Progress Indicator Surfaces & Specifications
+
+Every standalone progress indicator in the app renders through the shared `WaitingIndicator` component (or the bespoke cold-start splash), never through a raw `CircularProgressIndicator` with per-site size, stroke, or alignment choices.
+
+| Surface | Component | Size | Stroke | Color | Alignment | When to use |
+|---|---|---|---|---|---|---|
+| Button | — (no spinner) | — | — | — | — | The busy state lives inside the disabled `ActionButton`/`QuietActionButton` itself; no standalone spinner is shown. |
+| Content-zone | `WaitingIndicator.Zone` | 32dp (`Dimens.xl`) | 2.5dp | brass | horizontally centered, 48dp (`Dimens.xxl`) vertical padding | A wizard step whose entire content zone is the wait — no visible trigger button, no inline status context. |
+| Inline | `WaitingIndicator.Inline` | 16dp (`Dimens.md`) | 2.0dp | brass | as placed by caller | A wait adjacent to status text or in a card footer where surrounding content remains visible. |
+| Cold-start splash | `LoadingSplash` (bespoke) | 24dp | 2.5dp | brass | centered in brand lockup | Restricted to the cold-start routing splash; not migrated to `WaitingIndicator` because of its unique brand lockup layout. |
+
+**Thin-stroke rationale:** the 2.0–2.5dp stroke widths follow the Private Ledger hairline aesthetic — a ~1:13 ring-to-stroke ratio (32dp ring / 2.5dp stroke) vs. Material's 4dp default (~1:8 ratio). The thinner stroke reads as quieter and more precise, matching the design language's "calm, considered" tone. Size, stroke, and color are locked in the component and not overridable per call site.
+
+**Content-zone wait case:** when a wait has no visible trigger button and no inline status context (the entire content zone is the wait), it renders as a content-zone wait via `WaitingIndicator.Zone`. This covers the "Check your email" polling step, the "Verifying" registration step, the bank-list loading state, and the resume-card loading state — all four render identically.
+
 ---
 
 ## 9. Responsive Design

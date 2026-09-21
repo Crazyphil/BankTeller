@@ -21,6 +21,12 @@ import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 /**
  * Multi-step flow scaffold implementing the wizard shell structure:
  * eyebrow, title, one-liner, content zone, and a quiet-back / extra-actions / loud-forward footer.
+ *
+ * [backServerAction] marks the back control as navigate-and-fire (it triggers a
+ * server request, e.g. "Back to email" → POST reset): the back button then
+ * renders as [QuietActionButton] and disables while any request is in flight.
+ * Pure client-side back navigation (the default) keeps the always-enabled
+ * [QuietButton].
  */
 @Composable
 fun WizardScaffold(
@@ -30,6 +36,7 @@ fun WizardScaffold(
     progress: (@Composable () -> Unit)? = null,
     onBack: (() -> Unit)? = null,
     backLabel: String = "Back",
+    backServerAction: Boolean = false,
     extraActions: (@Composable RowScope.() -> Unit)? = null,
     forward: (@Composable () -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
@@ -87,10 +94,17 @@ fun WizardScaffold(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (onBack != null) {
-                    QuietButton(
-                        onClick = onBack,
-                        label = backLabel,
-                    )
+                    if (backServerAction) {
+                        QuietActionButton(
+                            onClick = onBack,
+                            label = backLabel,
+                        )
+                    } else {
+                        QuietButton(
+                            onClick = onBack,
+                            label = backLabel,
+                        )
+                    }
                 }
                 extraActions?.invoke(this)
             }

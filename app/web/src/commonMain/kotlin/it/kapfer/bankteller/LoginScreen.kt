@@ -6,8 +6,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -22,6 +20,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import it.kapfer.bankteller.ui.components.ActionButton
 import it.kapfer.bankteller.ui.components.BrandLogo
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggleOverlay
@@ -93,16 +92,15 @@ fun LoginScreen(viewModel: AppViewModel) {
 
             Spacer(modifier = Modifier.height(Dimens.md))
 
-            if (viewModel.isLoading) {
-                CircularProgressIndicator()
-            } else {
-                Button(
-                    onClick = { viewModel.login(username, password) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Login")
-                }
-            }
+            // Stable submit button (design D6): stays mounted at full footprint
+            // while the request is in flight — disabled via LocalActionBusy
+            // instead of being replaced by a standalone spinner, so the form
+            // does not jump during submission.
+            ActionButton(
+                onClick = { viewModel.login(username, password) },
+                label = "Login",
+                modifier = Modifier.fillMaxWidth(),
+            )
 
             // Non-rate-limited error
             viewModel.loginError?.let { error ->
