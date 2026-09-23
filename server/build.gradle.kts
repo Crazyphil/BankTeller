@@ -34,9 +34,12 @@ dependencies {
 
 val generatedResourcesDir = layout.buildDirectory.dir("generated/resources")
 
-tasks.register<Copy>("copyWebDist") {
-    dependsOn(":app:web:composeCompatibilityBrowserDistribution")
-    from("${rootProject.projectDir}/app/web/build/dist/composeWebCompatibility/productionExecutable")
+// Sync (not Copy): content-hashed wasm artifacts accumulate under Copy —
+// stale .wasm files from previous builds would ship in every jar. Sync
+// mirrors the source dir and deletes outdated files (build-performance D4).
+tasks.register<Sync>("copyWebDist") {
+    dependsOn(":app:web:wasmJsBrowserDistribution")
+    from("${rootProject.projectDir}/app/web/build/dist/wasmJs/productionExecutable")
     from("${rootProject.projectDir}/app/web/index.html")
     into(generatedResourcesDir.map { it.dir("static") })
 }

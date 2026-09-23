@@ -4,26 +4,26 @@ Kotlin Multiplatform project: Ktor server + Compose web app, deployed as a singl
 
 ## Modules (see settings.gradle.kts)
 
-- `:app:web` — Compose Multiplatform web frontend, targets **js and wasmJs**. Only web target exists under `app/`.
-- `:core` — KMP shared code (jvm + js + wasmJs). Hosts the SQLDelight schema: `core/src/commonMain/sqldelight/.../BankTellerDatabase` (sqlite-3-38 dialect). Generated DB code lives in `.gitignore`d `core/build/` — don't edit or expect it in source.
+- `:app:web` — Compose Multiplatform web frontend, targets **wasmJs only**. Only web target exists under `app/`.
+- `:core` — KMP shared code (jvm + wasmJs). Hosts the SQLDelight schema: `core/src/commonMain/sqldelight/.../BankTellerDatabase` (sqlite-3-38 dialect). Generated DB code lives in `.gitignore`d `core/build/` — don't edit or expect it in source.
 - `:server` — Ktor JVM backend (`mainClass it.kapfer.bankteller.ApplicationKt`). `processResources` depends on `copyWebDist`, which builds the web frontend and bundles `app/web/build/dist/...` into server resources — server builds transitively build the frontend.
 
 ## Commands
 
 - Server dev: `./gradlew :server:run` (serves on port from `.env`, default 8080).
-- Web dev: `./gradlew :app:web:jsBrowserDevelopmentRun` / `wasmJsBrowserDevelopmentRun`.
+- Web dev: `./gradlew :app:web:wasmJsBrowserDevelopmentRun`.
 - Tests: `./gradlew :server:test`, single test via `--tests "fqcn.ClassName"`. JVM tests are hermetic.
 - Container image: `scripts/build-image.sh` (host `shadowJar` → `bankteller:latest`, Podman preferred, Docker fallback, auto-prunes dangling images).
 - Deploy: `docker-compose.yml` consumes the prebuilt image; env vars `AUTH_USERNAME` / `AUTH_PASSWORD` / `SERVER_PORT` come from `.env` (copy from `.env.example`).
 
 ## Browser tests (quirky, read before touching the test setup)
 
-Native host browser tests are **disabled by default** to avoid killing a running Chrome. Instead they run inside a dedicated container image with pinned headless Chromium:
+Browser tests execute **exclusively** inside a dedicated container image with pinned headless Chromium — there is no native host execution and no opt-in flag:
 
 - One-time setup: `./scripts/build-browser-tests-image.sh`.
-- Run: `./gradlew :app:web:containerJsBrowserTest` / `containerWasmJsBrowserTest`.
-- Opt back into native host execution: `-PnativeBrowserTests=true`.
-- The env var `BANKTELLER_BROWSER_TESTS_CONTAINER=1` marks the inner container build: it re-enables the native browser test tasks inside the container AND relaxes yarn.lock mismatch from FAIL to WARNING (see root `build.gradle.kts`). Don't change this wiring casually; the rationale is documented inline in both build files.
+- Run: `./gradlew :app:web:containerWasmJsBrowserTest`.
+- The container reuses host-built artifacts and only runs the Karma phase — no Gradle, no compilation inside the container. The repo-controlled Karma config lives at `app/web/karma/container.conf.js`.
+- Without a container engine (podman/docker) on the host, the browser tests are skipped with a warning instead of failing the build.
 
 ## Integration tests excluded by default
 

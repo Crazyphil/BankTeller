@@ -17,13 +17,16 @@ sqldelight {
 kotlin {
     jvm()
 
-    js {
-        browser()
-    }
-
     @OptIn(ExperimentalWasmDsl::class)
     wasmJs {
-        browser()
+        browser {
+            // :core has no test sources — the browser test task would launch
+            // an empty Karma run (Chrome starts, matches zero files). Disabled
+            // unconditionally (build-performance D6).
+            testTask {
+                enabled = false
+            }
+        }
     }
 
 

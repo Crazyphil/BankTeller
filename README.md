@@ -1,13 +1,9 @@
 This is a Kotlin Multiplatform project targeting Web, Server.
 
-* [/app/shared](./app/shared/src) is for code that will be shared across your Compose Multiplatform applications.
+* [/app/web](./app/web/src) is the Compose Multiplatform web frontend (wasmJs only).
   It contains several subfolders:
-    - [commonMain](./app/shared/src/commonMain/kotlin) is for code that’s common for all targets.
-    - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-      For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-      the [iosMain](./app/shared/src/iosMain/kotlin) folder would be the right place for such calls.
-      Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./app/shared/src/jvmMain/kotlin)
-      folder is the appropriate location.
+    - [commonMain](./app/web/src/commonMain/kotlin) is for code that’s common to all targets.
+    - [wasmJsMain](./app/web/src/wasmJsMain/kotlin) is for wasmJs platform specifics.
 
 * [/core](./core/src) is for the code that will be shared between all targets in the project.
   The most important subfolder is [commonMain](./core/src/commonMain/kotlin). If preferred, you
@@ -21,18 +17,14 @@ Use the run configurations provided by the run widget in your IDE's toolbar. You
 options:
 
 - Server: `./gradlew :server:run`
-- Web app:
-    - Wasm target (faster, modern browsers): `./gradlew :app:webApp:wasmJsBrowserDevelopmentRun`
-    - JS target (slower, supports older browsers): `./gradlew :app:webApp:jsBrowserDevelopmentRun`
+- Web app: `./gradlew :app:web:wasmJsBrowserDevelopmentRun`
 
 ### Running tests
 
 Use the run button in your IDE's editor gutter, or run tests using Gradle tasks:
 
 - Server tests: `./gradlew :server:test`
-- Web tests:
-    - Wasm target: `./gradlew :app:shared:wasmJsTest`
-    - JS target: `./gradlew :app:shared:jsTest`
+- Web tests (containerized): `./gradlew :app:web:containerWasmJsBrowserTest`
 
 ### Building the container image
 
@@ -64,8 +56,17 @@ The image sets `JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"` so the JVM heap
 sizes relative to the container's memory limit. Override it via the environment
 (e.g. in `docker-compose.yml` or `docker run -e JAVA_TOOL_OPTIONS=...`).
 
-Browser tests are unaffected: they still run in their dedicated container image
-(`scripts/build-browser-tests-image.sh`, `./gradlew :app:web:containerJsBrowserTest`).
+### Production source maps
+
+Default production builds are fast and lean — the wasmJs production webpack task
+emits no source maps. Pass `-PprodDebug=true` to build a debuggable,
+source-mapped production bundle. Local development tasks are unaffected.
+
+The served frontend is wasmJs-only and requires a WasmGC-capable browser:
+Chrome/Edge 119+, Firefox 120+, Safari 18.2+.
+
+Browser tests run in their dedicated container image
+(`scripts/build-browser-tests-image.sh`, `./gradlew :app:web:containerWasmJsBrowserTest`).
 
 ---
 

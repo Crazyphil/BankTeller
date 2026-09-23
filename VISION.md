@@ -95,7 +95,6 @@ BankTeller/
 ├── app/web/                ← Compose Multiplatform web frontend
 │   ├── commonMain/         ← Shared UI code (login, dashboard, etc.)
 │   ├── wasmJsMain/         ← wasmJs platform specifics
-│   ├── jsMain/             ← JS fallback platform specifics
 │
 ├── Dockerfile              ← Single container: Ktor + static assets
 ├── docker-compose.yml      ← Optional Apprise sidecar
@@ -103,18 +102,18 @@ BankTeller/
 └── openspec/               ← Spec-driven development artifacts
 ```
 
-The `:app:shared` and `:app:webApp` modules are merged into a single `:app:web` module. The web frontend is a PWA only — no cross-platform (Android/iOS) sharing is planned, so separate shared modules are unnecessary.
+The web frontend lives in a single `:app:web` module. It is a PWA only — no cross-platform (Android/iOS) sharing is planned, so separate shared modules are unnecessary.
 
 ## 4. Technical Decisions
 
-### 4.1 Frontend: wasmJs with JS Fallback
+### 4.1 Frontend: wasmJs Only
 
 | Decision | Rationale |
 |----------|-----------|
 | **Primary target**: wasmJs (WasmGC) | ~3x faster UI than JS, JetBrains' strategic direction, ~95% browser coverage |
-| **Fallback**: Kotlin/JS | `composeCompatibilityBrowserDistribution` auto-serves JS to browsers without WasmGC |
+| **No JS fallback** | Kotlin/JS target dropped; the served distribution is the wasmJs output (`wasmJsBrowserDistribution`) only |
 | **Compose Multiplatform** | Canvas-based rendering. No SEO/accessibility concerns — this is an authenticated app shell, not a public website |
-| **Excluded browsers** | ~5-10% mobile (mainly iOS <18.2). Fallback covers these |
+| **Excluded browsers** | Pre-WasmGC browsers: Chrome <119, Firefox <120, Safari <18.2 |
 
 Browser support: Chrome 119+, Firefox 120+, Safari 18.2+, Edge 119+, Samsung Internet 25+.
 
@@ -386,7 +385,7 @@ The first change establishes the infrastructure skeleton. It does NOT implement 
 - Docker packaging (Dockerfile, docker-compose.yml with optional Apprise sidecar)
 - `.env` file with AUTH_USERNAME, AUTH_PASSWORD, SERVER_PORT
 - Auth system: login UI (username + password) → httpOnly SameSite=Strict cookie session → session validation middleware → login rate limiting (5 attempts/15min)
-- Module restructuring: merge `:app:shared` + `:app:webApp` into `:app:web`
+- Module restructuring: single `:app:web` module (merging the former shared and webApp modules)
 - SQLDelight integration: DB driver hookup (JdbcSqliteDriver), WAL mode + busy_timeout enabled, migration framework wired up (even with zero initial migrations)
 - Ktor server: serve static SPA assets, login route, session validation, health check
 - Infrastructure hooks (structural placeholders, not implementations):

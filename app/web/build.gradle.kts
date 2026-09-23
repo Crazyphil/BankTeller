@@ -1,5 +1,6 @@
 import org.gradle.api.tasks.Exec
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
+import org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpack
 
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
@@ -8,55 +9,23 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Browser test execution strategy
+// Production source maps (build-performance D2)
 // ---------------------------------------------------------------------------
-// Browser tests run INSIDE a container (localhost/bankteller-browser-tests)
-// that bundles a pinned headless Chromium plus all its system dependencies.
-// The container is prepared once via ./scripts/build-browser-tests-image.sh.
-//
-// Native browser tests (which would launch Chrome on the host) are DISABLED
-// by default on the OUTER build to avoid killing or conflicting with any
-// interactive browser the developer is using. To opt back into native
-// execution on the host, pass `-PnativeBrowserTests=true`.
-//
-// When the container task runs, it sets BANKTELLER_BROWSER_TESTS_CONTAINER=1
-// inside the container. That same env var signals to THIS script: "I am the
-// inner build, so the native :jsBrowserTest/:wasmJsBrowserTest tasks MUST be
-// enabled" — the container's whole job is to run them.
-val inInnerContainerBuild = providers.environmentVariable("BANKTELLER_BROWSER_TESTS_CONTAINER")
-    .map { it == "1" }
+// KGP enables full production source maps by default (devtool 'source-map'
+// plus source-map-loader over every module) — expensive on a Compose-sized
+// module graph, and the maps ship dead in the server jar. Default: source
+// maps OFF (fast, lean production bundle). `-PprodDebug=true` keeps KGP's
+// debuggable defaults (full source maps) for troubleshooting deployments.
+// Development tasks are unaffected — they keep their cheap eval source maps.
+val prodDebug = providers.gradleProperty("prodDebug")
+    .map { it.toBoolean() }
     .orElse(false)
     .get()
-val runBrowserTestsInContainer = !inInnerContainerBuild &&
-    !providers.gradleProperty("nativeBrowserTests")
-        .map { it.toBoolean() }
-        .orElse(false)
-        .get()
 
 // ---------------------------------------------------------------------------
-// Kotlin/JS + wasmJs targets
+// wasmJs target (js target removed — build-performance D1)
 // ---------------------------------------------------------------------------
 kotlin {
-    js {
-        browser {
-            testTask {
-                useKarma {
-                    // useChromeHeadlessNoSandbox() passes --no-sandbox to Chrome,
-                    // which is required when running as root inside the test
-                    // container. On the host (non-root) the flag is harmless.
-                    // The extra --disable-gpu / --disable-dev-shm-usage flags
-                    // for container robustness are added via the Karma drop-in
-                    // at karma.config.d/ci.conf.kjs.
-                    useChromeHeadlessNoSandbox()
-                }
-                // Disable the native Karma invocation unless explicitly requested.
-                // The container task below takes over for `check`/`test` wiring.
-                enabled = !runBrowserTestsInContainer
-            }
-        }
-        binaries.executable()
-    }
-
     @OptIn(ExperimentalWasmDsl::class)
     wasmJs {
         browser {
@@ -64,7 +33,11 @@ kotlin {
                 useKarma {
                     useChromeHeadlessNoSandbox()
                 }
-                enabled = !runBrowserTestsInContainer
+                // Browser tests execute EXCLUSIVELY inside the
+                // bankteller-browser-tests container (see containerWasmJsBrowserTest
+                // below). The native task would launch Chrome on the developer's
+                // host — disabled unconditionally, there is no opt-in (D6).
+                enabled = false
             }
         }
         binaries.executable()
@@ -88,10 +61,6 @@ kotlin {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
         }
-        jsMain.dependencies {
-            implementation(libs.wrappers.browser)
-            implementation(libs.ktor.client.js)
-        }
         wasmJsMain.dependencies {
             implementation(libs.wrappers.browser)
             implementation(libs.ktor.client.js)
@@ -99,17 +68,39 @@ kotlin {
     }
 }
 
+// KGP's KotlinWebpack exposes sourceMaps/devtool as plain fields WITHOUT
+// @Input annotations, so toggling prodDebug would otherwise not invalidate
+// the build cache. Capture the flag as an explicit task input (task 2.2) and
+// configure the production webpack task accordingly (task 2.1).
+tasks.named("wasmJsBrowserProductionWebpack", KotlinWebpack::class) {
+    inputs.property("prodDebug", prodDebug)
+    if (!prodDebug) {
+        sourceMaps = false
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Containerized browser-test tasks
+// Containerized browser test (build-performance D5)
 // ---------------------------------------------------------------------------
-// Each runs the corresponding native Gradle task *inside* the
-// bankteller-browser-tests container (Playwright image + JDK 21 + Chromium).
-// The repo is mounted at /work and the host Gradle cache at /root/.gradle
-// so dependency resolution is warm on subsequent runs.
+// Browser tests run INSIDE a container (localhost/bankteller-browser-tests)
+// that bundles a pinned headless Chromium, its system dependencies, and a
+// Node runtime. The container is prepared once via
+// ./scripts/build-browser-tests-image.sh.
 //
-// To use: build the image once with ./scripts/build-browser-tests-image.sh,
-// then run `./gradlew :app:web:containerJsBrowserTest` (or containerWasmJsBrowserTest).
-// These tasks are wired into `check` when container mode is active.
+// Execution model: the HOST builds the test bundle (compilation + npm sync —
+// the normal Gradle task graph, build-cache friendly, no --rerun-tasks); the
+// container runs ONLY the Karma phase against the mounted outputs. No Gradle
+// and no compilation inside the container — in-container compiles used to
+// poison the shared build/ tree with /work-absolute incremental-compilation
+// state (design D3).
+//
+// Karma is invoked directly via `node <tooling>/karma/bin/karma start` — NOT
+// through the Kotlin plugin's *BrowserTest task, whose worker-daemon path
+// fails to trigger karma-webpack bundling inside containers (Chrome connects
+// but never receives the test bundle → ping timeout). The Karma config itself
+// is repo-controlled (app/web/karma/container.conf.js) because the plugin only
+// generates karma.conf.js when its native *BrowserTest task runs — which this
+// project never does.
 val browserTestsImage = "localhost/bankteller-browser-tests:latest"
 val browserTestsRepoRoot = rootDir.absolutePath
 
@@ -125,44 +116,81 @@ val containerEngine: String = run {
                 "(command -v docker >/dev/null 2>&1 && echo docker || echo '')"
         )
     }.standardOutput.asText.get().trim()
-    probe.ifEmpty { "docker" }
+    probe
+}
+if (containerEngine.isEmpty()) {
+    // Design D5 risk note: developers without a container engine SKIP the
+    // browser tests (with a warning) rather than fail the build — and rather
+    // than risk their host browser. The task below is registered but disabled.
+    logger.warn(
+        "bankteller: neither podman nor docker found on PATH — " +
+            ":app:web:containerWasmJsBrowserTest will be SKIPPED. " +
+            "Install a container engine and run ./scripts/build-browser-tests-image.sh to enable browser tests."
+    )
 }
 val containerMountFlag = if (containerEngine == "podman") ":Z" else ""
 
-fun containerBrowserTestTask(
-    name: String,
-    // Gradle tasks that build the test bundle (compilation + resource processing).
-    // We deliberately do NOT include the `*BrowserTest` task here — that task
-    // invokes Karma via the Kotlin plugin's worker-daemon code path, which
-    // fails to trigger karma-webpack bundling inside the container. Instead,
-    // after building the bundle, we invoke Karma directly via `node`.
-    buildTaskPath: String,
-    // The karma test bundle package dir name (e.g. "BankTeller-app-web-test").
-    testPackageDir: String,
-    description: String
-) = tasks.register(name, Exec::class) {
-    group = "verification"
-    this.description = description
+// Host-side Kotlin npm tooling dir (~/.kotlin) — holds the yarn-installed
+// Karma/webpack/kotlin-web-helpers tooling that the wasm test runner needs.
+// Mounted into the container instead of re-installing it there.
+val kotlinToolingHostDir = System.getProperty("user.home") + "/.kotlin"
 
-    dependsOn(tasks.named("compileTestKotlinJs"), tasks.named("compileTestKotlinWasmJs"))
+// The wasm entry loader (static/load.mjs) is normally generated by the Kotlin
+// plugin's *BrowserTest task, which this project never runs. The container
+// task writes it before launching Karma so the run is self-contained on a
+// fresh checkout. Content mirrors KGP's createLoadWasm (KotlinKarma.kt);
+// "BankTeller-app-web-test.mjs" is the test compilation's main output file
+// (the npm package name is stable for this module layout).
+val wasmTestStaticDir = rootProject.layout.buildDirectory
+    .dir("wasm/packages/BankTeller-app-web-test/static").get().asFile
+
+val containerWasmJsBrowserTest = tasks.register("containerWasmJsBrowserTest", Exec::class) {
+    group = "verification"
+    description = "Runs the wasmJs browser tests inside the bankteller-browser-tests container (isolated Chrome, host-built bundle)"
+    // No container engine on the host → skip (with a configuration-time
+    // warning above) instead of failing `check`/`build`. The dependsOn
+    // wiring is guarded too, so the skip is instant — without it, Gradle
+    // would still compile the whole wasm test bundle just to skip the exec.
+    enabled = containerEngine.isNotEmpty()
+    if (containerEngine.isNotEmpty()) {
+        // Host-side bundle build (NO --rerun-tasks, NO in-container compile):
+        // compile the test compilation and sync the development-executable test
+        // bundle into build/wasm/packages/BankTeller-app-web-test/.
+        dependsOn(
+            tasks.named("wasmJsTestClasses"),
+            tasks.named("compileTestDevelopmentExecutableKotlinWasmJs"),
+            tasks.named("wasmJsTestTestDevelopmentExecutableCompileSync"),
+        )
+        // Ensures the Kotlin npm tooling (karma, webpack, kotlin-web-helpers) is
+        // installed on the host — the container mounts and reuses it.
+        dependsOn(rootProject.tasks.named("kotlinWasmToolingSetup"))
+    }
 
     val engine = containerEngine
     val mountFlag = containerMountFlag
     val repoRoot = browserTestsRepoRoot
     val image = browserTestsImage
-    val pkgDir = testPackageDir
+    val toolingHostDir = kotlinToolingHostDir
+    // Local copy: referencing a top-level script val from doFirst would capture
+    // the script object itself, which the configuration cache cannot serialize.
+    val staticDir = wasmTestStaticDir
 
-    // Two-phase script run inside the container:
-    //   Phase 1: use Gradle to build the webpack test bundle (compile + sync).
-    //            We do NOT run the `*BrowserTest` task — that would invoke
-    //            Karma through the Kotlin plugin's worker-daemon path, which
-    //            fails to trigger karma-webpack bundling inside the container
-    //            (Chrome connects but never receives the test bundle, causing
-    //            a "ping timeout" after 30s).
-    //   Phase 2: invoke Karma directly via `node karma/bin/karma start`. This
-    //            is the proven-working path: webpack bundles, Chrome loads the
-    //            test page, tests execute and report results.
-    //
+    doFirst {
+        staticDir.mkdirs()
+        staticDir.resolve("load.mjs").writeText(
+            """
+            import * as exports from "../kotlin/BankTeller-app-web-test.mjs"
+            try {
+                const startUnitTests = "startUnitTests"
+                exports[startUnitTests]?.()
+                window.__karma__.loaded();
+            } catch (e) {
+                window.__karma__.error("Problem with loading", void 0, void 0, void 0, e)
+            }
+            """.trimIndent()
+        )
+    }
+
     // Karma's exit code is unreliable in containers: Chrome may disconnect
     // repeatedly during webpack re-bundling (especially for the large wasmJs
     // bundle with skiko.wasm ~8MB), causing Karma to exit 1 even when ALL
@@ -172,37 +200,29 @@ fun containerBrowserTestTask(
     commandLine(
         engine, "run", "--rm",
         "-v", "$repoRoot:/work$mountFlag",
-        "--tmpfs", "/work/.gradle",
-        "-v", "bankteller-gradle-cache:/root/.gradle",
+        "-v", "$toolingHostDir:/root/.kotlin$mountFlag",
         "--shm-size=2g",
         "--network=host",
-        "-e", "BANKTELLER_BROWSER_TESTS_CONTAINER=1",
-        // Host repo root — used inside the container to rewrite the host-absolute
-        // paths baked into the generated karma.conf.js (see sed below).
-        "-e", "HOST_REPO_ROOT=$repoRoot",
         "-w", "/work",
         image,
         "sh", "-c",
-        // Phase 1: build the test bundle (no test execution).
-        "CHROME_BIN=/usr/bin/chromium ./gradlew $buildTaskPath --no-daemon --rerun-tasks && " +
-            "cd build/js/packages/$pkgDir && " +
-            // karma.conf.js is generated by the Kotlin plugin's *BrowserTest task,
-            // which runs on the HOST and bakes host-absolute paths (basePath,
-            // files[], preprocessors) into it. Phase 1 deliberately does NOT run
-            // that task (see comment above), so the file may be stale from the
-            // last host-side generation. Inside the container the repo lives at
-            // /work — rewrite the host root to /work (idempotent no-op when the
-            // paths already match). Without this, Karma matches ZERO files and
-            // silently runs no tests.
-            "sed -i \"s|\$HOST_REPO_ROOT|/work|g\" karma.conf.js && " +
-            // Phase 2: run Karma directly (the proven-working invocation path).
-            // Capture output to a temp file so we can check for test failures.
+        // Locate the Kotlin npm tooling node_modules (karma et al.) inside
+        // the mounted ~/.kotlin — the hash dir changes with dependency
+        // versions, so resolve it fresh on every run.
+        "tooling_nm=\$(dirname \"\$(find /root/.kotlin/kotlin-npm-tooling -type d -name karma -path '*/node_modules/karma' -print -quit)\"); " +
+            "if [ -z \"\$tooling_nm\" ]; then " +
+            "  echo 'ERROR: karma not found under /root/.kotlin/kotlin-npm-tooling — is the Kotlin wasm tooling set up on the host?' >&2; " +
+            "  exit 1; " +
+            "fi; " +
+            // Run ONLY the Karma phase against the host-built bundle.
+            // KOTLIN_TOOLING_DIR / NODE_PATH mirror the environment KGP
+            // itself sets for wasm Karma runs (KotlinKarma.kt).
             "CHROME_BIN=/usr/bin/chromium " +
-            "/root/.gradle/nodejs/node-v24.10.0-linux-x64/bin/node " +
-            "/work/build/js/node_modules/karma/bin/karma " +
-            "start karma.conf.js --single-run --no-auto-watch " +
+            "KOTLIN_TOOLING_DIR=\$tooling_nm " +
+            "NODE_PATH=/work/build/wasm/node_modules:\$tooling_nm " +
+            "/usr/bin/node \$tooling_nm/karma/bin/karma " +
+            "start /work/app/web/karma/container.conf.js --single-run --no-auto-watch " +
             "> /tmp/karma-output.log 2>&1; " +
-            "karma_exit=\$?; " +
             // teamcity testFailed messages indicate real test failures.
             // Use tr to split teamcity messages (which are ##-delimited on one
             // line) so grep can count individual testFailed entries.
@@ -221,33 +241,8 @@ fun containerBrowserTestTask(
     )
 }
 
-val containerJsBrowserTest = containerBrowserTestTask(
-    name = "containerJsBrowserTest",
-    buildTaskPath = ":app:web:jsTestClasses :app:web:compileTestDevelopmentExecutableKotlinJs :app:web:jsTestTestDevelopmentExecutableCompileSync",
-    testPackageDir = "BankTeller-app-web-test",
-    description = "Runs jsBrowserTest inside the bankteller-browser-tests container (isolated Chrome)"
-)
-val containerWasmJsBrowserTest = containerBrowserTestTask(
-    name = "containerWasmJsBrowserTest",
-    buildTaskPath = ":app:web:wasmJsTestClasses :app:web:compileTestDevelopmentExecutableKotlinWasmJs :app:web:wasmJsTestTestDevelopmentExecutableCompileSync",
-    testPackageDir = "BankTeller-app-web-test",
-    description = "Runs wasmJsBrowserTest inside the bankteller-browser-tests container (isolated Chrome)"
-)
-
-// The two container test tasks share build outputs on the repo mount
-// (app/web/build/compose/skiko-for-web-runtime, build/js/...). Running them
-// concurrently (possible with org.gradle.parallel=true) races on the shared
-// build dir — on fuse-backed filesystems this surfaces as "could not set file
-// mode" / ".fuse_hidden" failures inside the containers. Force them to run
-// sequentially.
-containerWasmJsBrowserTest.configure {
-    mustRunAfter(containerJsBrowserTest)
-}
-
-// When running in container mode (the default), wire the container tasks into
-// `check` so a normal `./gradlew test` / `check` exercises them.
-if (runBrowserTestsInContainer) {
-    tasks.named("check") {
-        dependsOn(containerJsBrowserTest, containerWasmJsBrowserTest)
-    }
+// Browser tests execute exclusively in the container — wire the task into
+// `check` so a normal `./gradlew test` / `check` exercises it.
+tasks.named("check") {
+    dependsOn(containerWasmJsBrowserTest)
 }

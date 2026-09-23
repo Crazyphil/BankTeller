@@ -1,31 +1,22 @@
-# Test-runner container for Kotlin/JS browser tests (ChromeHeadless via Karma).
+# Test-runner container for wasmJs browser tests (ChromeHeadless via Karma).
 #
-# Purpose: run :app:web:jsBrowserTest / :wasmJsBrowserTest in an isolated Chrome
-# environment so the host's personal browser (Firefox, Chrome, etc.) is never
-# touched and never killed by a stray cleanup attempt.
+# Purpose: run ONLY the Karma phase of :app:web:containerWasmJsBrowserTest in
+# an isolated Chrome environment — the host builds the test bundle, this
+# container executes it. The host's personal browser is never touched, and no
+# Gradle/compilation ever happens inside (that path poisoned incremental-
+# compilation state; see openspec/changes/build-performance design D3/D5).
 #
 # Base image: Microsoft's Playwright image bundles Chromium + all browser system
-# dependencies (nss, freetype, fonts, mesa, etc.) pre-installed and pinned. We
-# layer JDK 21 + libatomic1 on top so the Kotlin/JS plugin's downloaded Node
-# binary and Gradle itself both run.
+# dependencies (nss, freetype, fonts, mesa, etc.) pre-installed and pinned, plus
+# a Node.js runtime — everything the Karma/webpack phase needs. No JDK: the
+# container never runs Gradle or javac.
 #
 # Build:   ./scripts/build-browser-tests-image.sh
-# Run:     ./gradlew :app:web:containerJsBrowserTest
-#          ./gradlew :app:web:containerWasmJsBrowserTest
+# Run:     ./gradlew :app:web:containerWasmJsBrowserTest
 FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 
 LABEL org.opencontainers.image.title="BankTeller browser-tests runner"
-LABEL org.opencontainers.image.description="Isolated Chrome environment for running :app:web:jsBrowserTest / :wasmJsBrowserTest"
-
-# JDK 21 (matches the main build) + libatomic1 (required by the Kotlin/JS
-# plugin's downloaded Node binary, which runs webpack/Karma tooling).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-21-jdk-headless \
-        libatomic1 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-ENV PATH="$JAVA_HOME/bin:$PATH"
+LABEL org.opencontainers.image.description="Isolated Chrome environment for the Karma phase of :app:web:containerWasmJsBrowserTest"
 
 # Expose Playwright's bundled Chromium at stable paths so Karma's
 # chrome-launcher finds it via CHROME_BIN or standard binary lookup.
