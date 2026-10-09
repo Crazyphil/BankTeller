@@ -959,9 +959,11 @@ class AppViewModelTest {
         // Gate revision (banner item g): linked but never authorized → resume at
         // the resume card for the stored bank (NOT Dashboard) —
         // onboarding counts as complete only after the first authorization.
+        // AMENDED 2.1: selected_bank.psu_type is JSON null from the server —
+        // the resume card must still be constructed from name/country alone.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
         fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
-        val bank = SelectedBank("TestBank", "FI", "personal")
+        val bank = SelectedBank("TestBank", "FI", null)
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -978,7 +980,8 @@ class AppViewModelTest {
         advanceUntilIdle()
         assertEquals(Screen.Onboarding, vm.currentScreen)
         assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
-        // The gate populates selectedBankFromState and resume mode is active.
+        // The gate populates selectedBankFromState (name/country only) and
+        // resume mode is active — the resume card IS offered despite null psu_type.
         assertEquals(bank, vm.selectedBankFromState)
         assertEquals("TestBank", vm.selectedAspsp?.name)
         assertEquals("BIC1", vm.selectedAspsp?.bic)
@@ -1226,6 +1229,35 @@ class AppViewModelTest {
     }
 
     @Test
+    fun relinkAccount_withNullPsuTypeFromState_requiresAccountTypeConfirmation() = runTest(testDispatcher) {
+        // AMENDED 2.1: selected_bank.psu_type is null from the server. Relinking
+        // must NOT fire POST /api/link-accounts without an explicit account type.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = SelectedBank("TestBank", "FI", null)
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.isResumeMode)
+        assertEquals("TestBank", vm.selectedAspsp?.name)
+        assertEquals("", vm.selectedPsuType)
+
+        // Re-open linking with the null-psu_type stored bank → confirmation required
+        vm.relinkAccount()
+        advanceUntilIdle()
+        assertEquals("Confirm your account type to continue", vm.linkError)
+        assertNull(vm.linkAuthorizationUrl)
+    }
+
+    @Test
     fun checkLinkStatus_linkedTrue_triggersStartAuth() = runTest(testDispatcher) {
         val bank = Aspssp("BankA", "FI", "BIC1", null, listOf("personal"), 86400L)
         vm.selectAspsp(bank)
@@ -1292,6 +1324,183 @@ class AppViewModelTest {
         assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
         assertEquals("https://bank.com/sca", vm.authRedirectUrl)
     }
+
+    // ---------------------------------------------------------------
+    // Authorization failure (handle-authorization-failure: 4.2, 4.3, 5.5)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun checkAuth_stateAuthFailed_routesToAuthProgressWithFailureContext() = runTest(testDispatcher) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        // AMENDED 2.1: server reports psu_type null — bank enrichment must
+        // still reach the AuthProgress failure panel.
+        val bank = SelectedBank("TestBank", "FI", null)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "server_error",
+            selectedBank = bank,
+            authFailed = true,
+            authErrorKind = "technical",
+            authorizationId = "auth-123",
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        // auth_failed routes to AuthProgress (NOT the BankSelection resume card)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        // Failure context carried into viewmodel state for display
+        assertTrue(vm.authFailed)
+        assertEquals("technical", vm.authErrorKind)
+        assertEquals("auth-123", vm.authorizationId)
+        assertEquals(bank, vm.selectedBankFromState)
+        // AMENDED 4.2: cold entry must NOT adopt the (soon-null) psu_type from
+        // state — the attempted account type stays unknown/empty. The retry
+        // button is not offered; the user re-confirms the type at the bank list.
+        assertEquals("", vm.selectedPsuType)
+        // Enrichment populates the selected ASPSP (status data for the failure panel)
+        assertEquals("TestBank", vm.selectedAspsp?.name)
+    }
+
+    @Test
+    fun checkAuth_stateAuthFailed_doesNotAutoStartAuth() = runTest(testDispatcher) {
+        // 4.3: cold entry displays the failure WITHOUT auto-running POST /api/auth
+        // (display-before-clear ordering — the retry is user-initiated).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "access_denied",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+            authFailed = true,
+            authErrorKind = "cancelled",
+            authorizationId = "auth-456",
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        // No POST /api/auth fired on cold entry
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+        // No redirect URL prepared either
+        assertNull(vm.authRedirectUrl)
+    }
+
+    @Test
+    fun checkAuth_stateAuthFailedNullKind_routesToAuthProgress() = runTest(testDispatcher) {
+        // Pre-deployment cookie: auth_error non-null but auth_error_kind null →
+        // still routes to AuthProgress; the SPA renders the unexpected variant.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "some_old_error",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+            authFailed = true,
+            authErrorKind = null,
+            authorizationId = null,
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertTrue(vm.authFailed)
+        assertNull(vm.authErrorKind)
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun failureState_noRetryPath_noStartAuthCallPossible() = runTest(testDispatcher) {
+        // AMENDED 5.3 (transitional): the direct retry is NOT offered in the
+        // failure state — the attempted psu_type is unknown on cold entry and
+        // BankTeller never guesses. retryAuth() is removed; nothing in the
+        // failure state can fire POST /api/auth. The path forward is
+        // "Choose a different bank" → cancelLinking → bank list (resume card
+        // re-confirms the account type).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "server_error",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+            authFailed = true,
+            authErrorKind = "technical",
+            authorizationId = "auth-789",
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertTrue(vm.authFailed)
+        // No POST /api/auth fired on cold entry, and no retry affordance exists
+        // to fire one afterwards — the only forward path is back to the bank list.
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+
+        // The failure state's ONLY action is "Choose a different bank" →
+        // cancelLinking: aborts the dead auth context and returns to BankSelection.
+        vm.cancelLinking()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertFalse(vm.authFailed)
+        assertNull(vm.authErrorKind)
+        assertNull(vm.authError)
+        assertNull(vm.authorizationId)
+        // cancelLinking must not fire POST /api/auth either
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun cancelLinking_fromFailureState_resetsResumeSelection() = runTest(testDispatcher) {
+        // 5.4: the resume/bank-list path after a failure starts with a clean
+        // slate (no stale bank selection, no adopted psu_type from state).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = "server_error",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+            authFailed = true,
+            authErrorKind = "technical",
+            authorizationId = "auth-789",
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("", vm.selectedPsuType)
+
+        vm.cancelLinking()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        // Failure + resume context cleared; psu_type back to default (empty selection
+        // for the bank list; the default value remains the "personal" prefill used by
+        // selectAspsp when the user actively picks a bank in-session).
+        assertNull(vm.selectedBankFromState)
+        assertNull(vm.selectedAspsp)
+        assertFalse(vm.isResumeMode)
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
 }
 
 /**
@@ -1342,7 +1551,10 @@ private class FakeApiClient : ApiClient() {
         return true
     }
     override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult = nextLinkAccountsResult
-    override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult = nextStartAuthResult
+    override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult {
+        startAuthCalls.add(StartAuthCall(aspspName, aspspCountry, psuType))
+        return nextStartAuthResult
+    }
     override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {
         linkStatusCalls.add(aspspName to aspspCountry)
         return nextLinkStatus
@@ -1365,12 +1577,19 @@ private class FakeApiClient : ApiClient() {
     var pollCalls: MutableList<String> = mutableListOf()
     var completeCalls: MutableList<CompleteCall>? = mutableListOf()
     var linkStatusCalls: MutableList<Pair<String?, String?>> = mutableListOf()
+    var startAuthCalls: MutableList<StartAuthCall> = mutableListOf()
 
     data class CompleteCall(
         val state: String,
         val environment: String,
         val redirectUrl: String,
         val overrides: ProductionFieldOverrides?,
+    )
+
+    data class StartAuthCall(
+        val aspspName: String,
+        val aspspCountry: String,
+        val psuType: String,
     )
 
     override suspend fun login(username: String, password: String): LoginResult {

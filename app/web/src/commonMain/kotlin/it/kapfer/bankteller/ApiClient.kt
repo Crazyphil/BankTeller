@@ -279,17 +279,33 @@ open class ApiClient {
                 val linkingCompleted = extractJsonBool(body, "linking_completed") ?: false
                 val authCompleted = extractJsonBool(body, "auth_completed") ?: false
                 val authError = extractJsonStringOrNull(body, "auth_error")
+                val authFailed = extractJsonBool(body, "auth_failed") ?: false
+                val authErrorKind = extractJsonStringOrNull(body, "auth_error_kind")
+                val authorizationId = extractJsonStringOrNull(body, "authorization_id")
                 
                 val bankObjJson = extractJsonObject(body, "selected_bank")
                 val selectedBank = bankObjJson?.let {
                     val name = extractJsonString(it, "aspsp_name")
                     val country = extractJsonString(it, "aspsp_country")
-                    val psuType = extractJsonString(it, "psu_type")
-                    if (name.isNotEmpty() && country.isNotEmpty() && psuType.isNotEmpty()) {
+                    // psu_type is JSON null per amended 2.1: yield null so the
+                    // caller keeps the attempted account type unknown (never guess).
+                    val psuType = extractJsonStringOrNull(it, "psu_type")
+                    // Construct whenever the bank identity is usable — the
+                    // resume card needs name/country regardless of psu_type.
+                    if (name.isNotEmpty() && country.isNotEmpty()) {
                         SelectedBank(aspspName = name, aspspCountry = country, psuType = psuType)
                     } else null
                 }
-                return OnboardingState(requiresRelogin, linkingCompleted, authCompleted, authError, selectedBank)
+                return OnboardingState(
+                    requiresRelogin = requiresRelogin,
+                    linkingCompleted = linkingCompleted,
+                    authCompleted = authCompleted,
+                    authError = authError,
+                    selectedBank = selectedBank,
+                    authFailed = authFailed,
+                    authErrorKind = authErrorKind,
+                    authorizationId = authorizationId,
+                )
             }
             return null
         } catch (_: Exception) {
@@ -478,7 +494,37 @@ open class ApiClient {
         val logo = extractJsonString(json, "logo").ifEmpty { null }
         val psuTypes = extractStringList(json, "psu_types")
         val maxValidity = extractJsonLong(json, "maximum_consent_validity")
-        return Aspssp(name, country, bic, logo, psuTypes, maxValidity)
+        val status = extractJsonStringOrNull(json, "status")
+        val statusByPsuType = extractJsonStringMapOrNull(json, "status_by_psu_type")
+        return Aspssp(name, country, bic, logo, psuTypes, maxValidity, status, statusByPsuType)
+    }
+
+    private fun extractJsonStringMapOrNull(json: String, field: String): Map<String, String>? {
+        val objJson = extractJsonObject(json, field) ?: return null
+        val result = mutableMapOf<String, String>()
+        val trimmed = objJson.trim()
+        if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null
+        val inner = trimmed.substring(1, trimmed.length - 1).trim()
+        if (inner.isEmpty()) return emptyMap()
+
+        var i = 0
+        while (i < inner.length) {
+            val keyStartQuote = inner.indexOf('"', i)
+            if (keyStartQuote < 0) break
+            val keyEndQuote = inner.indexOf('"', keyStartQuote + 1)
+            if (keyEndQuote < 0) break
+            val key = inner.substring(keyStartQuote + 1, keyEndQuote)
+            val colonIdx = inner.indexOf(':', keyEndQuote + 1)
+            if (colonIdx < 0) break
+            val valStartQuote = inner.indexOf('"', colonIdx + 1)
+            if (valStartQuote < 0) break
+            val valEndQuote = inner.indexOf('"', valStartQuote + 1)
+            if (valEndQuote < 0) break
+            val value = inner.substring(valStartQuote + 1, valEndQuote)
+            result[key] = value
+            i = valEndQuote + 1
+        }
+        return if (result.isNotEmpty()) result else emptyMap()
     }
 
     private fun extractStringList(json: String, field: String): List<String> {
@@ -607,14 +653,22 @@ data class OnboardingState(
     val linkingCompleted: Boolean,
     val authCompleted: Boolean,
     val authError: String?,
-    val selectedBank: SelectedBank?
+    val selectedBank: SelectedBank?,
+    val authFailed: Boolean = false,
+    val authErrorKind: String? = null,
+    val authorizationId: String? = null,
 )
 
-/** Selected bank details inside the onboarding state. */
+/**
+ * Selected bank details inside the onboarding state.
+ * [psuType] is nullable: the server reports `selected_bank.psu_type` as JSON
+ * null — BankTeller never guesses between personal/business. The SPA keeps the
+ * attempted account type unknown until the user re-confirms it.
+ */
 data class SelectedBank(
     val aspspName: String,
     val aspspCountry: String,
-    val psuType: String
+    val psuType: String?
 )
 
 /** ASPSP bank information. */
@@ -624,7 +678,9 @@ data class Aspssp(
     val bic: String?,
     val logo: String?,
     val psuTypes: List<String>,
-    val maximumConsentValidity: Long?
+    val maximumConsentValidity: Long?,
+    val status: String? = null,
+    val statusByPsuType: Map<String, String>? = null,
 )
 
 /** Result of fetching the ASPSPs list. */

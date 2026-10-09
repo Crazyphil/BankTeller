@@ -18,15 +18,15 @@ import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 /**
  * Tinted surface for consequential choices (Decision Box, Tier 3).
  *
- * A 12% wash of [tint] over the surface with a 3dp brass left border.
+ * A 12% wash of [tint] over the surface with a 3dp semantic left border.
  */
 @Composable
 fun DecisionBox(
     tint: Color = MaterialTheme.colorScheme.primary,
+    borderColor: Color = tint,
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val brass = LocalBankTellerColors.current.brass
     Surface(
         modifier = modifier,
         color = tint.copy(alpha = 0.12f),
@@ -36,7 +36,7 @@ fun DecisionBox(
             modifier = Modifier
                 .drawBehind {
                     drawRect(
-                        color = brass,
+                        color = borderColor,
                         topLeft = Offset.Zero,
                         size = Size(3.dp.toPx(), size.height),
                     )

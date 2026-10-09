@@ -20,31 +20,21 @@ import kotlinx.serialization.Serializable
  * @property authError Error reason from the last failed auth callback
  *   (display-only; cleared at the start of every `POST /api/auth` and on
  *   callback success).
+ * @property authErrorKind Classified RFC 6749 error kind from the last failed
+ *   auth callback: `cancelled`, `technical`, `configuration`, or `unexpected`.
+ *   Null when there is no error. Cleared alongside [authError].
+ * @property authorizationId The Enable Banking `authorization_id` from the
+ *   most recent `POST /api/auth` (the only key into EB's control-panel request
+ *   logs for diagnosing a failed authorization). Overwritten on every new
+ *   attempt; null when no attempt has been made.
  */
 @Serializable
 data class UserSession(
     val username: String,
     val authError: String? = null,
+    val authErrorKind: String? = null,
+    val authorizationId: String? = null,
 )
 
 @Serializable
 data class LoginRequest(val username: String, val password: String)
-
-/**
- * One-shot legacy cookie payload describing the OLD (pre slim-cookie) session
- * format. Used ONLY during the first login with an old-format cookie: when the
- * `eb_sessions` table is still empty, the legacy fields are imported into the
- * server-side `eb_sessions`/`accounts` tables and the fresh cookie replaces
- * them with the slim format.
- */
-@Serializable
-data class LegacySessionPayload(
-    val username: String? = null,
-    val psuIdHash: String? = null,
-    val aspspName: String? = null,
-    val aspspCountry: String? = null,
-    val psuType: String? = null,
-    val ebSessionId: String? = null,
-    val accountsJson: String? = null,
-    val authError: String? = null,
-)

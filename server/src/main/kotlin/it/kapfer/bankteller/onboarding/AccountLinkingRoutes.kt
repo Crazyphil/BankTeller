@@ -8,6 +8,7 @@ import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import it.kapfer.bankteller.database.BankTellerDatabase
 import it.kapfer.bankteller.enablebanking.AspsspListResult
+import it.kapfer.bankteller.enablebanking.AspspStatusResult
 import it.kapfer.bankteller.enablebanking.Access
 import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
@@ -20,6 +21,8 @@ import it.kapfer.bankteller.enablebanking.WhitelistedAccountEntry
 import it.kapfer.bankteller.server.UserSession
 import it.kapfer.bankteller.util.TtlCache
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.time.Instant
@@ -40,11 +43,20 @@ private data class WhitelistSnapshot(
 private val whitelistCache = TtlCache<String, WhitelistSnapshot>(60_000L)
 private val whitelistFailureCache = TtlCache<String, Unit>(10_000L)
 
-/** Test hook: clears the shared whitelist caches so tests start cold. */
-internal fun clearWhitelistCacheForTests() {
+/**
+ * Clears the shared whitelist caches (positive + failure snapshots). Called by
+ * the stale-session purge on application (re-)registration (design D8) so a
+ * fresh application's whitelist is not masked by the defunct app's cached
+ * snapshot for the remainder of the 60 s TTL. Also usable by tests to start
+ * cold.
+ */
+internal fun clearWhitelistCache() {
     whitelistCache.clear()
     whitelistFailureCache.clear()
 }
+
+/** Test hook: clears the shared whitelist caches so tests start cold. */
+internal fun clearWhitelistCacheForTests() = clearWhitelistCache()
 
 /**
  * Fetches the application state (active flag + whitelisted accounts) from the
@@ -164,7 +176,36 @@ fun Route.accountLinkingRoutes(
         }
 
         when (val result = controlPlaneClient.getAspsps(idToken)) {
-            is AspsspListResult.Ok -> call.respond(result.aspsps)
+            is AspsspListResult.Ok -> {
+                // Enrich each bank with advisory availability status from the
+                // cached control-plane get_today_stats. A status-fetch failure
+                // NEVER fails the bank list — the fields are simply omitted.
+                val statusByBank = when (val status = controlPlaneClient.getAspspStatus()) {
+                    is AspspStatusResult.Ok -> status.statuses
+                        .entries
+                        .groupBy({ it.key.brand to it.key.country }, { it.key.psuType to it.value })
+                        .mapValues { (_, pairs) -> pairs.toMap() }
+                    is AspspStatusResult.Error -> emptyMap()
+                }
+                val banks = result.aspsps.map { aspsp ->
+                    val perType = statusByBank[aspsp.name to aspsp.country]
+                    buildJsonObject {
+                        put("name", aspsp.name)
+                        put("country", aspsp.country)
+                        put("bic", aspsp.bic)
+                        put("logo", aspsp.logo)
+                        put("psu_types", JsonArray(aspsp.psuTypes.map { JsonPrimitive(it) }))
+                        put("maximum_consent_validity", aspsp.maximumConsentValidity)
+                        if (perType != null && perType.isNotEmpty()) {
+                            put("status", worstStatus(perType.values))
+                            put("status_by_psu_type", buildJsonObject {
+                                perType.forEach { (k, v) -> put(k, v) }
+                            })
+                        }
+                    }
+                }
+                call.respond(banks)
+            }
             is AspsspListResult.Error -> call.respond(
                 HttpStatusCode.BadGateway,
                 mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
@@ -241,9 +282,11 @@ fun Route.accountLinkingRoutes(
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
 
-        // Clear any stored auth_error at the start of the request — the user is
-        // starting a fresh attempt; the old error must not follow them (D9).
-        val cleanSession = session.copy(authError = null)
+        // Clear any stored auth_error + auth_error_kind at the start of the
+        // request — the user is starting a fresh attempt; the old error must not
+        // follow them (D9). The authorization_id is left intact until a new
+        // startAuth succeeds (it is overwritten below).
+        val cleanSession = session.copy(authError = null, authErrorKind = null)
         call.sessions.set(cleanSession)
 
         val request = call.receive<AuthRequest>()
@@ -294,11 +337,18 @@ fun Route.accountLinkingRoutes(
                 state = state,
                 redirectUrl = redirectUrl,
             )) {
-                is StartAuthResult.Ok -> call.respond(buildJsonObject {
-                    put("url", result.url)
-                    put("authorization_id", result.authorizationId)
-                    put("psu_id_hash", result.psuIdHash)
-                })
+                is StartAuthResult.Ok -> {
+                    // Store the authorization_id in the session — the only key
+                    // into EB's control-panel request logs for diagnosing a
+                    // failed authorization (design D2). Overwritten on every new
+                    // attempt; it always refers to the current attempt only.
+                    call.sessions.set(cleanSession.copy(authorizationId = result.authorizationId))
+                    call.respond(buildJsonObject {
+                        put("url", result.url)
+                        put("authorization_id", result.authorizationId)
+                        put("psu_id_hash", result.psuIdHash)
+                    })
+                }
                 is StartAuthResult.Error -> call.respond(
                     HttpStatusCode.BadGateway,
                     mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
@@ -396,18 +446,31 @@ fun Route.accountLinkingRoutes(
                     buildJsonObject {
                         put("aspsp_name", aspsp.name)
                         put("aspsp_country", aspsp.country)
-                        put("psu_type", "personal")
+                        // The whitelist carries no psu_type — BankTeller never
+                        // guesses between personal/business. Report null; the
+                        // SPA asks the user to confirm the type explicitly.
+                        put("psu_type", kotlinx.serialization.json.JsonNull)
                     }
                 } else {
                     kotlinx.serialization.json.JsonNull
                 }
             } ?: kotlinx.serialization.json.JsonNull
 
+        val authCompleted = ebSessionStore.hasAnySession()
+        val authError = session.authError
+        // auth_failed: an auth error is only meaningful once linking completed
+        // and auth has NOT yet completed (design D3). Before linking, or after
+        // a successful auth, the error is stale/irrelevant.
+        val authFailed = authError != null && linkingCompleted && !authCompleted
+
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
             put("linking_completed", linkingCompleted)
-            put("auth_completed", ebSessionStore.hasAnySession())
-            put("auth_error", session.authError)
+            put("auth_completed", authCompleted)
+            put("auth_error", authError)
+            put("auth_error_kind", session.authErrorKind)
+            put("authorization_id", session.authorizationId)
+            put("auth_failed", authFailed)
             put("selected_bank", selectedBank)
         })
     }
@@ -419,7 +482,22 @@ fun Route.accountLinkingRoutes(
     post("/api/onboarding/cancel-linking") {
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
-        call.sessions.set(session.copy(authError = null))
+        call.sessions.set(session.copy(authError = null, authErrorKind = null))
         call.respond(mapOf("success" to true))
     }
+}
+
+/**
+ * Returns the worst status across a collection of per-psu_type status values
+ * (red > yellow > green) — used for the bank-list badge where no account type
+ * has been chosen yet. Unknown values are filtered out before ranking (symmetry
+ * with the control-plane client's `worstOf`) so an all-unknown collection can
+ * never leak an arbitrary string into the `status` field — it normalizes to
+ * green.
+ */
+private fun worstStatus(statuses: Collection<String>): String {
+    val rank = mapOf("green" to 0, "yellow" to 1, "red" to 2)
+    return statuses.filter { rank.containsKey(it) }
+        .maxByOrNull { rank.getValue(it) }
+        ?: "green"
 }

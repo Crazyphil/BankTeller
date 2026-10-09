@@ -18,11 +18,9 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import io.ktor.server.sessions.serialization.KotlinxSessionSerializer
-import it.kapfer.bankteller.enablebanking.AccountResource
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.buildEnableBankingClient
-import it.kapfer.bankteller.onboarding.EbSessionStore
 import it.kapfer.bankteller.onboarding.OnboardingService
 import it.kapfer.bankteller.onboarding.StateJwt
 import it.kapfer.bankteller.onboarding.accountLinkingRoutes
@@ -206,54 +204,12 @@ fun Application.module(
 
             if (AuthService.validateCredentials(request.username, request.password)) {
                 LoginRateLimiter.clearOnSuccess(ip)
-                // One-time legacy-cookie import (pre slim-cookie format):
-                // detect + import progress fields into eb_sessions/accounts
-                // before issuing the slim cookie. Best-effort — never a
-                // login blocker.
-                //
-                // Invariant: the legacy format always carried `ebSessionId`
-                // and `accountsJson` together — the old auth callback set
-                // both in one `session.copy(...)` (verified against the
-                // pre-change code), and the old `auth_completed` derivation
-                // required both. A cookie with only one of the two never
-                // existed, so requiring both here loses nothing.
-                try {
-                    val rawSessionCookie = call.request.cookies["bankteller-session"]
-                    val unsignedPayload = rawSessionCookie?.let { raw ->
-                        try { sessionValueTransformer.transformRead(raw) } catch (_: Exception) { null }
-                    }
-                    val legacy = unsignedPayload?.let { unsigned ->
-                        try { legacyJson.decodeFromString<LegacySessionPayload>(unsigned) } catch (_: Exception) { null }
-                    }
-                    if (legacy != null && legacy.ebSessionId != null && legacy.accountsJson != null) {
-                        val ebSessionStore = EbSessionStore(database)
-                        if (!ebSessionStore.hasAnySession()) {
-                            val accounts = Json { ignoreUnknownKeys = true }
-                                .decodeFromString<List<AccountResource>>(legacy.accountsJson)
-                                .map { acc ->
-                                    EbSessionStore.MergedAccount(
-                                        iban = acc.iban,
-                                        uid = acc.uid,
-                                        currency = acc.currency,
-                                        name = acc.name,
-                                    )
-                                }
-                            val authErr = legacy.authError
-                            ebSessionStore.mergeSession(
-                                sessionId = legacy.ebSessionId,
-                                aspspName = legacy.aspspName,
-                                aspspCountry = legacy.aspspCountry,
-                                psuType = legacy.psuType,
-                                accounts = accounts,
-                            )
-                            logger.info("Imported legacy onboarding session for user ${request.username}: session=${legacy.ebSessionId}, accounts=${accounts.size}, authError=${authErr != null}")
-                        }
-                    }
-                } catch (e: Exception) {
-                    logger.warn("Failed to import legacy onboarding session from cookie; continuing login anyway.", e)
-                }
                 // Onboarding progress lives server-side (eb_sessions/accounts +
                 // system_config), so login simply issues a fresh slim session.
+                // (The legacy-cookie import was removed — design D8: the
+                // pre-slim-cookie format was never released, and the import,
+                // gated on eb_sessions emptiness, would re-import dead-application
+                // rows after the stale-session purge.)
                 call.sessions.set(UserSession(request.username))
                 call.respond(HttpStatusCode.OK, mapOf("message" to "Login successful"))
             } else {

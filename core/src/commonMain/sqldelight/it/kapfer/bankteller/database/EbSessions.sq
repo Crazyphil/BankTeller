@@ -51,6 +51,9 @@ DELETE FROM eb_sessions WHERE id IN ?;
 countSessions:
 SELECT COUNT(*) FROM eb_sessions;
 
+deleteAllSessions:
+DELETE FROM eb_sessions;
+
 -- ---------------------------------------------------------------------------
 -- accounts queries
 -- ---------------------------------------------------------------------------
@@ -75,6 +78,9 @@ DELETE FROM accounts WHERE id IN ?;
 
 countAccounts:
 SELECT COUNT(*) FROM accounts;
+
+deleteAllAccounts:
+DELETE FROM accounts;
 
 hasAnySession:
 SELECT COUNT(*) > 0 FROM eb_sessions;

@@ -32,15 +32,25 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TooltipAnchorPosition
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -829,17 +839,26 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                     modifier = Modifier.weight(1f, fill = false),
                                 )
                                 Spacer(modifier = Modifier.width(Dimens.sm))
-                                val countryName = countryCodeToNameMap[bankCountry.uppercase()]
-                                val displayCountry = if (countryName != null) {
-                                    "${bankCountry.uppercase()} · $countryName"
-                                } else {
-                                    bankCountry.uppercase()
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+                                ) {
+                                    val status = aspsp?.status
+                                    if (status == "yellow" || status == "red") {
+                                        BankStatusBadge(status = status)
+                                    }
+                                    val countryName = countryCodeToNameMap[bankCountry.uppercase()]
+                                    val displayCountry = if (countryName != null) {
+                                        "${bankCountry.uppercase()} · $countryName"
+                                    } else {
+                                        bankCountry.uppercase()
+                                    }
+                                    Text(
+                                        text = displayCountry,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
-                                Text(
-                                    text = displayCountry,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
                             }
 
                             if (aspsp?.bic != null) {
@@ -911,6 +930,21 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                         style = MaterialTheme.typography.bodySmall,
                         color = if (hasValidationErr) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+
+                    val selectedPsu = viewModel.selectedPsuType
+                    val perTypeStatus = if (selectedPsu.isNotEmpty()) {
+                        aspsp?.statusByPsuType?.get(selectedPsu.lowercase())
+                    } else {
+                        null
+                    }
+                    val psuStatus = perTypeStatus ?: aspsp?.status
+                    if (psuStatus == "yellow" || psuStatus == "red") {
+                        Spacer(modifier = Modifier.height(Dimens.sm))
+                        CommitmentStatusWarning(
+                            status = psuStatus,
+                            psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
+                        )
+                    }
                 }
             }
 
@@ -1064,17 +1098,25 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                         modifier = Modifier.weight(1f, fill = false),
                                                     )
                                                     Spacer(modifier = Modifier.width(Dimens.sm))
-                                                    val countryName = countryCodeToNameMap[bank.country.uppercase()]
-                                                    val displayCountry = if (countryName != null) {
-                                                        "${bank.country.uppercase()} · $countryName"
-                                                    } else {
-                                                        bank.country.uppercase()
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+                                                    ) {
+                                                        if (bank.status == "yellow" || bank.status == "red") {
+                                                            BankStatusBadge(status = bank.status)
+                                                        }
+                                                        val countryName = countryCodeToNameMap[bank.country.uppercase()]
+                                                        val displayCountry = if (countryName != null) {
+                                                            "${bank.country.uppercase()} · $countryName"
+                                                        } else {
+                                                            bank.country.uppercase()
+                                                        }
+                                                        Text(
+                                                            text = displayCountry,
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        )
                                                     }
-                                                    Text(
-                                                        text = displayCountry,
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                    )
                                                 }
 
                                                 if (bank.bic != null) {
@@ -1120,6 +1162,22 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                                     borderWidth = 1.dp,
                                                                     selectedBorderWidth = 1.dp,
                                                                 ),
+                                                            )
+                                                        }
+                                                    }
+                                                    if (isSelected) {
+                                                        val selectedPsu = viewModel.selectedPsuType
+                                                        val perTypeStatus = if (selectedPsu.isNotEmpty()) {
+                                                            bank.statusByPsuType?.get(selectedPsu.lowercase())
+                                                        } else {
+                                                            null
+                                                        }
+                                                        val psuStatus = perTypeStatus ?: bank.status
+                                                        if (psuStatus == "yellow" || psuStatus == "red") {
+                                                            Spacer(modifier = Modifier.height(Dimens.sm))
+                                                            CommitmentStatusWarning(
+                                                                status = psuStatus,
+                                                                psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
                                                             )
                                                         }
                                                     }
@@ -1194,21 +1252,32 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
             )
         },
     ) {
+        // Commitment warning (advisory, D6 touchpoint 2/4): top of the LinkingProgress
+        // frame when the selected psu_type's status is non-green — linking uses the same
+        // per-bank mechanisms as authorization, so the same advisory warning is warranted.
+        // psu_type is already fixed at bank selection, so the type-specific copy applies.
+        val aspsp = viewModel.selectedAspsp
+        val selectedPsu = viewModel.selectedPsuType
+        val perTypeStatus = if (selectedPsu.isNotEmpty()) {
+            aspsp?.statusByPsuType?.get(selectedPsu.lowercase())
+        } else {
+            null
+        }
+        val psuStatus = perTypeStatus ?: aspsp?.status
+        if (psuStatus == "yellow" || psuStatus == "red") {
+            CommitmentStatusWarning(
+                status = psuStatus,
+                psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
+            )
+            Spacer(modifier = Modifier.height(Dimens.md))
+        }
+
         if (!isResumeMode) {
             Text(
                 text = "After completing the linking process, close that tab and return here to continue.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        }
-
-        viewModel.authError?.let { err ->
-            Text(
-                text = err,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            ActionButton(onClick = { viewModel.checkLinkStatus() }, label = "Retry")
         }
 
         viewModel.linkError?.let { err ->
@@ -1260,6 +1329,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
 @Composable
 private fun AuthProgressStep(viewModel: AppViewModel) {
     val authRedirectUrl = viewModel.authRedirectUrl
+    val authFailed = viewModel.authFailed
 
     WizardScaffold(
         eyebrow = "STEP 8 OF 8",
@@ -1267,26 +1337,64 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
         oneLiner = "You'll be redirected to your bank's secure page to grant account access. " +
                 "Here's what to expect:",
         progress = { WizardProgressIndicator(currentStep = 7, totalSteps = 8) },
-        onBack = null,
+        // D7: back affordance once authorization has started — "Choose a
+        // different bank" aborts via the cancel-linking flow (clears the
+        // one-shot authError and returns to the bank list). In the failure
+        // state it is the ONLY path forward (see forward slot below).
+        onBack = { viewModel.cancelLinking() },
+        backLabel = "Choose a different bank",
+        backServerAction = true, // POST cancel-linking — disable while in flight
         forward = {
             // D6 footprint rule: the button stays mounted at all times.
             // While POST /api/auth is in flight, LocalActionBusy disables it
             // automatically; once the redirect URL arrives, the domain
-            // condition (authRedirectUrl != null) enables it. On failure the
-            // URL stays null so the button remains disabled — the error is
-            // shown in the content zone below.
-            ActionButton(
-                onClick = {
-                    authRedirectUrl?.let {
-                        redirectTo(it)
-                        viewModel.consumeAuthRedirectUrl()
-                    }
-                },
-                label = "Continue to your bank",
-                enabled = authRedirectUrl != null,
-            )
+            // condition (authRedirectUrl != null) enables it.
+            //
+            // Failure state (D3, transitional): the direct retry is NOT
+            // offered — the attempted psu_type is unknown on cold entry
+            // (selected_bank.psu_type is null) and BankTeller never guesses.
+            // The forward slot renders nothing; "Choose a different bank"
+            // (back slot) is the path forward, and the resume card re-confirms
+            // the account type explicitly.
+            if (!authFailed) {
+                ActionButton(
+                    onClick = {
+                        authRedirectUrl?.let {
+                            redirectTo(it)
+                            viewModel.consumeAuthRedirectUrl()
+                        }
+                    },
+                    label = "Continue to your bank",
+                    enabled = authRedirectUrl != null,
+                )
+            }
         },
     ) {
+        // Failure state (cold entry): display the failure BEFORE any new
+        // authorization attempt (display-before-clear ordering — POST /api/auth
+        // clears auth_error at attempt start).
+        if (authFailed) {
+            AuthFailurePanel(viewModel)
+        }
+
+        // Commitment warning (advisory, D6 touchpoint 2): above the consent box
+        // when the selected psu_type's status is non-green.
+        val aspsp = viewModel.selectedAspsp
+        val selectedPsu = viewModel.selectedPsuType
+        val perTypeStatus = if (selectedPsu.isNotEmpty()) {
+            aspsp?.statusByPsuType?.get(selectedPsu.lowercase())
+        } else {
+            null
+        }
+        val psuStatus = perTypeStatus ?: aspsp?.status
+        if (psuStatus == "yellow" || psuStatus == "red") {
+            Spacer(modifier = Modifier.height(Dimens.sm))
+            CommitmentStatusWarning(
+                status = psuStatus,
+                psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
+            )
+        }
+
         OutlinedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.medium,
@@ -1336,7 +1444,132 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
+
+        // Flow-level error pattern: a failed retry (POST /api/auth error) is
+        // shown here so the user can see why the redirect did not fire.
+        viewModel.linkError?.let { err ->
+            Text(
+                text = err,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
     }
+}
+
+/**
+ * Failure display for the AuthProgress step (cold entry after an auth-callback
+ * failure). Renders the designer-specified variant copy keyed on auth_error_kind,
+ * the optional status-enrichment line (technical variant, non-green selected type),
+ * and the "Authorization ID: <id>" mono footer. The raw error value is never rendered.
+ */
+@Composable
+private fun AuthFailurePanel(viewModel: AppViewModel) {
+    val kind = viewModel.authErrorKind
+    val error = MaterialTheme.colorScheme.error
+
+    val title: String
+    val body: String
+    val guidance: String
+    when (kind) {
+        "cancelled" -> {
+            title = "Authorization cancelled"
+            body = "The authorization request was cancelled at your bank. No accounts were connected and no data was shared."
+            guidance = "If this was unintended, you can try connecting again. You can also pick a different bank."
+        }
+        "technical" -> {
+            title = "Bank connection unavailable"
+            body = "Your bank could not complete the connection request. You did nothing wrong — this is usually a temporary disruption on the bank's side."
+            guidance = "You can try again in a few moments, or return to the bank list to connect another institution."
+        }
+        "configuration" -> {
+            title = "Bank connection not supported"
+            body = "This bank rejected the connection request due to an integration setup issue. You did nothing wrong — BankTeller cannot complete the connection with this institution at this time."
+            guidance = "Retrying is unlikely to resolve this. We recommend returning to the bank list to connect a different bank."
+        }
+        else -> {
+            // null kind (pre-deployment cookie) and unknown kinds → unexpected
+            title = "Connection incomplete"
+            body = "BankTeller could not verify the connection with your bank. Your credentials and accounts remain secure."
+            guidance = "Please try starting the authorization again. If the issue persists, try connecting a different bank or check back later."
+        }
+    }
+
+    DecisionBox(
+        tint = error,
+        borderColor = error,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Error,
+                contentDescription = null,
+                tint = error,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = error,
+            )
+        }
+        Spacer(modifier = Modifier.height(Dimens.xs))
+        Text(
+            text = body,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        if (kind == "technical") {
+            val enrichment = technicalStatusEnrichment(viewModel)
+            if (enrichment != null) {
+                Spacer(modifier = Modifier.height(Dimens.xs))
+                Text(
+                    text = enrichment,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(Dimens.xs))
+        Text(
+            text = guidance,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        viewModel.authorizationId?.let { id ->
+            Spacer(modifier = Modifier.height(Dimens.sm))
+            Text(
+                text = "Authorization ID: $id",
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = jetBrainsMonoFamily()),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * Status-enrichment line for the technical failure variant (D6 touchpoint 3):
+ * "[Bank] is currently reporting [possible issues|major issues]."
+ * AMENDED (oracle F3): rendered only when the attempted account type is KNOWN
+ * and its current status is non-green. On cold entry the attempted psu_type is
+ * unknown (selected_bank.psu_type is null) → no enrichment line (advisory-only
+ * degradation); BankTeller never guesses the type. Post
+ * persist-onboarding-view-position the stage bank's type will key it.
+ */
+private fun technicalStatusEnrichment(viewModel: AppViewModel): String? {
+    val aspsp = viewModel.selectedAspsp
+    val bankName = aspsp?.name ?: viewModel.selectedBankFromState?.aspspName ?: return null
+    val selectedPsu = viewModel.selectedPsuType
+    if (selectedPsu.isEmpty()) return null
+    val status = aspsp?.statusByPsuType?.get(selectedPsu.lowercase()) ?: return null
+    val wording = when (status) {
+        "yellow" -> "possible issues"
+        "red" -> "major issues"
+        else -> return null
+    }
+    return "$bankName is currently reporting $wording."
 }
 
 @Composable
@@ -1367,6 +1600,125 @@ private fun ConsentItem(title: String, description: String) {
 
 private fun String.capitalizeFirstLetter(): String =
     replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+
+/**
+ * Advisory status badge for bank list and selection cards.
+ * Yellow: "Issues" with a Warning icon (brass).
+ * Red: "Outage" with an Error icon (danger).
+ * Green or absent: renders nothing.
+ * Tooltip copy: yellow "Possible issues", red "Major issues".
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BankStatusBadge(status: String) {
+    val isYellow = status == "yellow"
+    val isRed = status == "red"
+    if (!isYellow && !isRed) return
+
+    val brass = LocalBankTellerColors.current.brass
+    val error = MaterialTheme.colorScheme.error
+    val textColor = if (isYellow) brass else error
+    val bgColor = if (isYellow) brass.copy(alpha = 0.12f) else error.copy(alpha = 0.12f)
+    val label = if (isYellow) "Issues" else "Outage"
+    val tooltip = if (isYellow) "Possible issues" else "Major issues"
+    val icon = if (isYellow) Icons.Filled.Warning else Icons.Filled.Error
+
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
+        tooltip = {
+            PlainTooltip {
+                Text(tooltip)
+            }
+        },
+        state = rememberTooltipState(),
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(MaterialTheme.shapes.small)
+                .background(bgColor)
+                .padding(horizontal = Dimens.xs, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = textColor,
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                color = textColor,
+            )
+        }
+    }
+}
+
+/**
+ * Advisory DecisionBox rendered at commitment points (resume card, bank card, AuthProgress)
+ * when the selected PSU type (or the bank overall) is in a non-green availability status.
+ */
+@Composable
+private fun CommitmentStatusWarning(
+    status: String,
+    psuType: String?,
+    modifier: Modifier = Modifier,
+) {
+    val isYellow = status == "yellow"
+    val isRed = status == "red"
+    if (!isYellow && !isRed) return
+
+    val tint = if (isYellow) LocalBankTellerColors.current.brass else MaterialTheme.colorScheme.error
+    val headline = if (isYellow) {
+        "Bank reporting possible issues"
+    } else {
+        "Bank reporting major issues"
+    }
+    val icon = if (isYellow) Icons.Filled.Warning else Icons.Filled.Error
+    val body = if (isYellow) {
+        if (!psuType.isNullOrEmpty()) {
+            "Connecting may take longer than usual or fail temporarily for $psuType accounts. You can still proceed or choose another bank."
+        } else {
+            "Connecting may take longer than usual or fail temporarily. You can still proceed or choose another bank."
+        }
+    } else {
+        if (!psuType.isNullOrEmpty()) {
+            "Authorizations for $psuType accounts at this bank are currently failing. We recommend choosing a different bank or trying again later."
+        } else {
+            "Authorizations for this bank are currently failing. We recommend choosing a different bank or trying again later."
+        }
+    }
+
+    DecisionBox(
+        tint = tint,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = tint,
+            )
+            Text(
+                text = headline,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = tint,
+            )
+        }
+        Spacer(modifier = Modifier.height(Dimens.xs))
+        Text(
+            text = body,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
 
 // ---------------------------------------------------------------
 // Shared composables & helpers

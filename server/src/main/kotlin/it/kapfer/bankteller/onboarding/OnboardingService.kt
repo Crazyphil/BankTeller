@@ -281,6 +281,17 @@ class OnboardingService(
     }
 
     /**
+     * Invalidates the status cache AND clears the shared whitelist cache (design
+     * D8). Called at persist time after a successful application registration so
+     * the state endpoint immediately reflects the new application's whitelist
+     * instead of the defunct app's cached snapshot (≤ 60 s stale window).
+     */
+    private fun invalidateStatusCacheAndWhitelistCache() {
+        invalidateStatusCache()
+        clearWhitelistCache()
+    }
+
+    /**
      * Clears the persisted Enable Banking credentials (application ID + private key)
      * from `system_config` and invalidates the status cache.
      *
@@ -462,10 +473,14 @@ class OnboardingService(
         }
 
         // --- Step 9: Persist application ID + redirect URL + refresh token + email ---
+        // (also purges stale eb_sessions/accounts rows — design D8)
         persistCredentials(applicationId, redirectUrl, refreshToken, context.email)
 
-        // --- Step 10: Invalidate cached status ---
-        invalidateStatusCache()
+        // --- Step 10: Invalidate cached status + clear the whitelist cache ---
+        // The whitelist cache holds the defunct application's snapshot; without
+        // clearing it, the state endpoint would keep reporting the old whitelist
+        // for up to 60 s (design D8).
+        invalidateStatusCacheAndWhitelistCache()
 
         // --- Step 11: Verify freshly-persisted credentials ---
         val freshActive = verifyFreshCredentials { context.status = OnboardingStatus.COMPLETED }
@@ -526,7 +541,7 @@ class OnboardingService(
         }
 
         persistCredentials(applicationId, redirectUrl, rotatedRefreshToken, storedEmail)
-        invalidateStatusCache()
+        invalidateStatusCacheAndWhitelistCache()
 
         val freshActive = verifyFreshCredentials()
         return CompleteResult.Success(active = freshActive)
@@ -628,16 +643,25 @@ class OnboardingService(
         refreshToken: String,
         email: String?,
     ) {
-        database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
-        database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
-        database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
-        // Blank the "was ever active" history: these credentials belong to a NEWLY
-        // registered app. Without this, a re-registration after deleting a previously
-        // active app inherits the stale flag and the gate misclassifies the fresh
-        // (inactive) app as a deleted previously-active one → RegistrationReview loop.
-        database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
-        if (email != null) {
-            database.systemConfigQueries.insertOrReplace("enable_banking_email", email)
+        // ONE transaction (design D8): purge all stale application-scoped rows
+        // (deleteAllAccounts before deleteAllSessions keeps the FK contract
+        // honest) AND overwrite the system_config credentials. The purge runs at
+        // persist time — after registration success, before verifyFreshCredentials
+        // (a best-effort activation check whose failure must not skip the purge).
+        database.transaction {
+            database.ebSessionsQueries.deleteAllAccounts()
+            database.ebSessionsQueries.deleteAllSessions()
+            database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
+            database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
+            database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
+            // Blank the "was ever active" history: these credentials belong to a NEWLY
+            // registered app. Without this, a re-registration after deleting a previously
+            // active app inherits the stale flag and the gate misclassifies the fresh
+            // (inactive) app as a deleted previously-active one → RegistrationReview loop.
+            database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
+            if (email != null) {
+                database.systemConfigQueries.insertOrReplace("enable_banking_email", email)
+            }
         }
     }
 

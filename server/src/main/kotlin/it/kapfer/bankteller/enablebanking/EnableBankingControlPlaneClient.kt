@@ -7,6 +7,7 @@ import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import it.kapfer.bankteller.database.BankTellerDatabase
+import it.kapfer.bankteller.util.TtlCache
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.json.*
@@ -87,6 +88,28 @@ sealed class GetApplicationResult {
     data class Error(val statusCode: Int?, val message: String) : GetApplicationResult()
 }
 
+/**
+ * Key identifying one ASPSP availability-status record: the `{brand, country,
+ * psu_type}` triple. A bank (ASPSP) is identified by `{brand, country}`; the
+ * psu_type further splits status per account type.
+ */
+data class AspspStatusKey(
+    val brand: String,
+    val country: String,
+    val psuType: String,
+)
+
+/**
+ * Result of [EnableBankingControlPlaneClient.getAspspStatus]. The function
+ * NEVER throws — failures are surfaced as [AspspStatusResult.Error] (and
+ * cached for the same 60 s window as successes).
+ */
+sealed class AspspStatusResult {
+    /** @property statuses Per-`{brand, country, psu_type}` status (green/yellow/red), AIS entries only, duplicates aggregated worst-of. */
+    data class Ok(val statuses: Map<AspspStatusKey, String>) : AspspStatusResult()
+    data class Error(val message: String) : AspspStatusResult()
+}
+
 // --- Response DTOs ---
 
 @Serializable
@@ -154,6 +177,24 @@ private data class GitErrorResponse(
     val error: GitErrorDetail? = null,
 )
 
+/**
+ * One entry of the control-plane `GET /api/get_today_stats` response.
+ * The endpoint is undocumented; the shape is `{connector_name, brand, country,
+ * psu_type, service, status}` with status green/yellow/red. Unknown fields are
+ * ignored by the tolerant [json] decoder.
+ */
+@Serializable
+private data class TodayStatsEntry(
+    @SerialName("connector_name")
+    val connectorName: String? = null,
+    val brand: String? = null,
+    val country: String? = null,
+    @SerialName("psu_type")
+    val psuType: String? = null,
+    val service: String? = null,
+    val status: String? = null,
+)
+
 @Serializable
 private data class GitErrorDetail(
     val message: String? = null,
@@ -167,6 +208,15 @@ class EnableBankingControlPlaneClient(
     private val client: HttpClient = HttpClient(CIO),
     private val database: BankTellerDatabase? = null,
 ) : Closeable {
+
+    /**
+     * 60 s TTL cache for [getAspspStatus]. Status can change intra-day, so a
+     * short TTL is used (not daily). Both successes AND failures are cached for
+     * the same window so a fetch failure does not hammer the control plane
+     * (advisory data tolerates a slower retry cadence than the whitelist
+     * cache's 10 s failure TTL).
+     */
+    private val aspspStatusCache = TtlCache<String, AspspStatusResult>(60_000L)
 
     override fun close() {
         client.close()
@@ -460,6 +510,90 @@ class EnableBankingControlPlaneClient(
             logger.warn("getApplication failed", e)
             GetApplicationResult.Error(statusCode = null, message = e.message ?: "Unknown error")
         }
+    }
+
+    /**
+     * Fetches per-ASPSP availability status from the control-plane
+     * `GET /api/get_today_stats` (Firebase idToken auth, same pattern as
+     * [getApplication]).
+     *
+     * The result is cached for 60 seconds (both successes and failures) so the
+     * control plane is called at most once per 60-second window. The function
+     * NEVER throws — any fetch/parse/refresh failure returns
+     * [AspspStatusResult.Error] (and is cached for the same window).
+     *
+     * The idToken is obtained internally by refreshing the persisted refresh
+     * token from `system_config` (the same auth the route-level callers use).
+     *
+     * @return [AspspStatusResult.Ok] with the per-`{brand, country, psu_type}`
+     *   status map (AIS entries only, duplicates aggregated worst-of), or
+     *   [AspspStatusResult.Error] on any failure.
+     */
+    suspend fun getAspspStatus(): AspspStatusResult {
+        aspspStatusCache.get("status")?.let { return it }
+
+        val result = try {
+            val refreshToken = database?.systemConfigQueries
+                ?.selectValue("enable_banking_refresh_token")
+                ?.executeAsOneOrNull()
+            if (refreshToken.isNullOrBlank()) {
+                AspspStatusResult.Error("Enable Banking refresh token not configured")
+            } else {
+                when (val refresh = refreshIdToken(refreshToken)) {
+                    is IdTokenRefreshResult.Ok -> {
+                        val response = client.get("https://enablebanking.com/api/get_today_stats") {
+                            header(HttpHeaders.Authorization, "Bearer ${refresh.idToken}")
+                        }
+                        val body = response.bodyAsText()
+                        if (response.status.isSuccess()) {
+                            val entries = json.decodeFromString<List<TodayStatsEntry>>(body)
+                            AspspStatusResult.Ok(aggregateAspspStatuses(entries))
+                        } else {
+                            AspspStatusResult.Error(
+                                tryParseEbErrorMessage(body) ?: "Enable Banking status fetch failed (HTTP ${response.status.value})",
+                            )
+                        }
+                    }
+                    is IdTokenRefreshResult.Error ->
+                        AspspStatusResult.Error("Failed to refresh Enable Banking session: ${refresh.message}")
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("getAspspStatus failed", e)
+            AspspStatusResult.Error(e.message ?: "Unknown error")
+        }
+
+        // Cache both successes and failures for the same 60 s window.
+        aspspStatusCache.put("status", result)
+        return result
+    }
+
+    /**
+     * Filters to `service == "AIS"` entries and aggregates per-`{brand, country,
+     * psu_type}` status, taking the worst-of (red > yellow > green) when
+     * duplicate records exist for the same key (e.g. multiple connectors).
+     */
+    private fun aggregateAspspStatuses(entries: List<TodayStatsEntry>): Map<AspspStatusKey, String> {
+        val result = mutableMapOf<AspspStatusKey, String>()
+        for (entry in entries) {
+            if (entry.service != "AIS") continue
+            val brand = entry.brand ?: continue
+            val country = entry.country ?: continue
+            val psuType = entry.psuType ?: continue
+            val status = entry.status ?: continue
+            val key = AspspStatusKey(brand, country, psuType)
+            val existing = result[key]
+            result[key] = if (existing == null) status else worstOf(existing, status)
+        }
+        return result
+    }
+
+    /** Returns the worse of two status values (red > yellow > green). */
+    private fun worstOf(a: String, b: String): String {
+        val rank = mapOf("green" to 0, "yellow" to 1, "red" to 2)
+        val ra = rank[a] ?: 0
+        val rb = rank[b] ?: 0
+        return if (ra >= rb) a else b
     }
 
     /**

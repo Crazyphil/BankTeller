@@ -1670,6 +1670,210 @@ class OnboardingServiceTest {
     }
 
     // =====================================================================
+    // Task 9.4 — stale-session purge on application (re-)registration (D8)
+    // =====================================================================
+
+    @Test
+    fun `reregister purges stale eb_sessions and accounts rows`() = runBlocking {
+        val db = createDatabase()
+        // Preserved credentials from the old (deleted) app.
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "old-app")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "old-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-refresh")
+        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
+        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://old.example.com/cb")
+        // Stale rows from the old app — must be purged by the re-registration.
+        EbSessionStore(db).mergeSession(
+            sessionId = "stale-session",
+            aspspName = "Old Bank",
+            aspspCountry = "DE",
+            psuType = "personal",
+            accounts = listOf(
+                EbSessionStore.MergedAccount(
+                    iban = "DE89370400440532013000",
+                    uid = "stale-1",
+                    currency = "EUR",
+                    name = "Stale",
+                ),
+            ),
+        )
+        assertTrue(db.ebSessionsQueries.hasAnySession().executeAsOne())
+
+        val engine = MockEngine { request ->
+            when {
+                request.url.toString().contains("securetoken.googleapis.com") ->
+                    respond(
+                        content = """{"id_token":"fresh-id","refresh_token":"rotated-refresh","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"app_id": "new-app"}""",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val mockClient = object : EnableBankingClient(
+            DatabaseEnableBankingCredentialProvider(db)
+        ) {
+            override suspend fun verifyApplication() = ApplicationVerificationResult.Success(active = true)
+            override fun close() = Unit
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+
+        val result = service.completeOnboarding(
+            state = "reregister",
+            ownerUsername = "admin",
+            environment = Environment.SANDBOX,
+            redirectUrl = "https://app.example.com/cb",
+        )
+        assertTrue(result is CompleteResult.Success)
+        // Stale rows purged — tables empty after completion; hasAnySession()
+        // false so the login gate routes to onboarding, not Dashboard.
+        assertFalse(db.ebSessionsQueries.hasAnySession().executeAsOne())
+        assertEquals(0, db.ebSessionsQueries.countAccounts().executeAsOne())
+    }
+
+    @Test
+    fun `fresh onboarding purge is a no-op`() = testWithCall { call ->
+        val db = createDatabase()
+        val engine = MockEngine { request ->
+            when {
+                request.url.toString().contains("getOobConfirmationCode") ->
+                    respond(
+                        content = """{"success": true}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("emailLinkSignin") ->
+                    respond(
+                        content = """{"idToken": "test-id-token", "refreshToken": "test-refresh-token"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"app_id": "app-001"}""",
+                        status = HttpStatusCode.Created,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val mockClient = object : EnableBankingClient(
+            DatabaseEnableBankingCredentialProvider(db)
+        ) {
+            override suspend fun verifyApplication() = ApplicationVerificationResult.Success(active = true)
+            override fun close() = Unit
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+        // Empty tables before completion.
+        assertFalse(db.ebSessionsQueries.hasAnySession().executeAsOne())
+
+        val startResult = service.startOnboarding(
+            email = "user@example.com",
+            ownerUsername = "admin",
+            call = call,
+        )
+        val state = (startResult as StartResult.Ok).state
+        service.handleCallback(state, "oob-123")
+        val result = service.completeOnboarding(
+            state = state,
+            ownerUsername = "admin",
+            environment = Environment.SANDBOX,
+            redirectUrl = "https://app.example.com/cb",
+        )
+        assertTrue(result is CompleteResult.Success)
+        // Purge is a no-op — tables stay empty.
+        assertFalse(db.ebSessionsQueries.hasAnySession().executeAsOne())
+        assertEquals(0, db.ebSessionsQueries.countAccounts().executeAsOne())
+    }
+
+    @Test
+    fun `registration failure leaves sessions untouched`() = testWithCall { call ->
+        val db = createDatabase()
+        // Stale rows from a previous app.
+        EbSessionStore(db).mergeSession(
+            sessionId = "stale-session",
+            aspspName = "Old Bank",
+            aspspCountry = "DE",
+            psuType = "personal",
+            accounts = listOf(
+                EbSessionStore.MergedAccount(
+                    iban = "DE89370400440532013000",
+                    uid = "stale-1",
+                    currency = "EUR",
+                    name = "Stale",
+                ),
+            ),
+        )
+        val engine = MockEngine { request ->
+            when {
+                request.url.toString().contains("getOobConfirmationCode") ->
+                    respond(
+                        content = """{"success": true}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("emailLinkSignin") ->
+                    respond(
+                        content = """{"idToken": "test-id-token"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                request.url.toString().contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"error":"Unauthorized"}""",
+                        status = HttpStatusCode.Unauthorized,
+                    )
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val mockClient = object : EnableBankingClient(
+            DatabaseEnableBankingCredentialProvider(db)
+        ) {
+            override suspend fun verifyApplication() = ApplicationVerificationResult.Success(active = true)
+            override fun close() = Unit
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+        val startResult = service.startOnboarding(
+            email = "user@example.com",
+            ownerUsername = "admin",
+            call = call,
+        )
+        val state = (startResult as StartResult.Ok).state
+        service.handleCallback(state, "oob-123")
+        val result = service.completeOnboarding(
+            state = state,
+            ownerUsername = "admin",
+            environment = Environment.PRODUCTION,
+            redirectUrl = "https://app.example.com/cb",
+        )
+        assertTrue(result is CompleteResult.IdTokenExpired)
+        // No purge on failure — rows untouched.
+        assertTrue(db.ebSessionsQueries.hasAnySession().executeAsOne())
+        assertEquals(1, db.ebSessionsQueries.countAccounts().executeAsOne())
+    }
+
+    // =====================================================================
     // getRegistrationInfo — RegistrationReview pre-fill
     // =====================================================================
 

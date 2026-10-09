@@ -81,6 +81,8 @@ fun Route.onboardingRoutes(
         val state = call.request.queryParameters["state"]
         val oobCode = call.request.queryParameters["oobCode"]
         val code = call.request.queryParameters["code"]
+        val error = call.request.queryParameters["error"]
+        val errorDescription = call.request.queryParameters["error_description"]
 
         when {
             // Email-link flow — no session cookie required (regression path, 6.11)
@@ -104,14 +106,20 @@ fun Route.onboardingRoutes(
                 // Decode the state JWT and bind it to this session.
                 val sessionId = state?.let { stateJwt?.verify(it) }
                 if (sessionId == null || sessionId != session.username) {
-                    call.sessions.set(session.copy(authError = "State mismatch — please retry the authorization"))
+                    call.sessions.set(session.copy(
+                        authError = "State mismatch — please retry the authorization",
+                        authErrorKind = "unexpected",
+                    ))
                     serveSpaBundle(call)
                     return@get
                 }
 
                 val client = enableBankingClientFactory?.invoke()
                 if (client == null) {
-                    call.sessions.set(session.copy(authError = "Technical error"))
+                    call.sessions.set(session.copy(
+                        authError = "Technical error",
+                        authErrorKind = "unexpected",
+                    ))
                     serveSpaBundle(call)
                     return@get
                 }
@@ -132,20 +140,57 @@ fun Route.onboardingRoutes(
                                         EbSessionStore.MergedAccount(it.iban, it.uid, it.currency, it.name)
                                     },
                                 )
-                                call.sessions.set(session.copy(authError = null))
+                                call.sessions.set(session.copy(authError = null, authErrorKind = null))
                             } catch (e: Exception) {
                                 logger.warn("Failed to persist EB session ${result.sessionId}", e)
-                                call.sessions.set(session.copy(authError = "Failed to persist session — please retry"))
+                                call.sessions.set(session.copy(
+                                    authError = "Failed to persist session — please retry",
+                                    authErrorKind = "unexpected",
+                                ))
                             }
                         }
                         is AuthorizeSessionResult.Error -> {
-                            call.sessions.set(session.copy(authError = result.message))
+                            call.sessions.set(session.copy(
+                                authError = result.message,
+                                authErrorKind = "unexpected",
+                            ))
                         }
                     }
                 } finally {
                     client.close()
                 }
                 serveSpaBundle(call)
+            }
+
+            // Error branch — OAuth error redirect (RFC 6749): `error` (+ optional
+            // `error_description`, + `state`), NO oobCode/code. Requires a valid
+            // session + state JWT; classify the error, store the raw value + kind
+            // + authorization_id in the session, log the raw error server-side
+            // (the only durable record of the raw value), then 302 to "/".
+            error != null -> {
+                val session = call.sessions.get<UserSession>()
+                if (session == null) {
+                    call.respondRedirect("/")
+                    return@get
+                }
+                val sessionId = state?.let { stateJwt?.verify(it) }
+                if (sessionId == null || sessionId != session.username) {
+                    call.respondRedirect("/")
+                    return@get
+                }
+                val kind = classifyAuthError(error)
+                logger.warn(
+                    "Enable Banking auth callback error: error={}, error_description={}, authorization_id={}",
+                    error, errorDescription, session.authorizationId,
+                )
+                call.sessions.set(session.copy(
+                    // Raw error value + description when present (e.g. "server_error: Denied data sharing consent");
+                    // plain code when no description accompanies it.
+                    authError = listOfNotNull(error, errorDescription).joinToString(": "),
+                    authErrorKind = kind,
+                    authorizationId = session.authorizationId,
+                ))
+                call.respondRedirect("/")
             }
 
             // Neither param — preserve the previous missing-oobCode behavior
@@ -254,12 +299,18 @@ fun Route.onboardingRoutes(
             redirectUrl = request.redirectUrl,
             productionOverrides = overrides,
         )) {
-            is CompleteResult.Success -> call.respond(
-                buildJsonObject {
-                    put("success", true)
-                    put("active", result.active)
-                },
-            )
+            is CompleteResult.Success -> {
+                // Design D8: a recorded authorization failure / authorization ID
+                // refers to the defunct application — clear the one-shot
+                // diagnostics fields so they cannot surface against the new app.
+                call.sessions.set(session.copy(authError = null, authErrorKind = null, authorizationId = null))
+                call.respond(
+                    buildJsonObject {
+                        put("success", true)
+                        put("active", result.active)
+                    },
+                )
+            }
             is CompleteResult.StateNotFound -> call.respond(
                 HttpStatusCode.NotFound,
                 buildJsonObject {
@@ -350,6 +401,22 @@ fun Route.onboardingRoutes(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Classifies an RFC 6749 OAuth `error` code from the Enable Banking auth
+ * callback into a coarse-grained kind the SPA can act on (design D4):
+ *  - `access_denied` → `cancelled` (user declined the consent)
+ *  - `server_error` / `temporarily_unavailable` → `technical`
+ *  - `invalid_request` / `unauthorized_client` / `unsupported_response_type` /
+ *    `invalid_scope` → `configuration`
+ *  - anything else → `unexpected`
+ */
+private fun classifyAuthError(error: String): String = when (error) {
+    "access_denied" -> "cancelled"
+    "server_error", "temporarily_unavailable" -> "technical"
+    "invalid_request", "unauthorized_client", "unsupported_response_type", "invalid_scope" -> "configuration"
+    else -> "unexpected"
+}
 
 /**
  * Serves the SPA bundle (`static/index.html` from the classpath) with 200 OK.

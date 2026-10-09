@@ -541,4 +541,162 @@ class ControlPlaneClientTest {
         assertEquals("hash-1", ok.psuIdHash)
         client.close()
     }
+
+    // =====================================================================
+    // Task 3.2 — getAspspStatus (get_today_stats parsing/aggregation/TTL/never-throws)
+    // =====================================================================
+
+    /** Seeds the refresh token and serves get_today_stats + token refresh. */
+    private fun statsEngine(todayStatsJson: String): MockEngine = MockEngine { request ->
+        val url = request.url.toString()
+        when {
+            url.contains("securetoken.googleapis.com/v1/token") ->
+                respond(
+                    content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+            url.contains("enablebanking.com/api/get_today_stats") ->
+                respond(
+                    content = todayStatsJson,
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+            else -> error("Unexpected request: $url")
+        }
+    }
+
+    @Test
+    fun `getAspspStatus parses AIS entries into per brand country psu_type map`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = statsEngine("""[
+            {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
+            {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"business","service":"AIS","status":"yellow"},
+            {"connector_name":"c3","brand":"Other Bank","country":"FR","psu_type":"personal","service":"AIS","status":"red"}
+        ]""")
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val result = client.getAspspStatus()
+        assertTrue(result is AspspStatusResult.Ok, "Expected Ok but got: $result")
+        val statuses = (result as AspspStatusResult.Ok).statuses
+        assertEquals(3, statuses.size)
+        assertEquals("green", statuses[AspspStatusKey("Test Bank", "DE", "personal")])
+        assertEquals("yellow", statuses[AspspStatusKey("Test Bank", "DE", "business")])
+        assertEquals("red", statuses[AspspStatusKey("Other Bank", "FR", "personal")])
+        client.close()
+    }
+
+    @Test
+    fun `getAspspStatus filters out non-AIS entries`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = statsEngine("""[
+            {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
+            {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"personal","service":"PIS","status":"red"},
+            {"connector_name":"c3","brand":"Test Bank","country":"DE","psu_type":"personal","service":null,"status":"red"}
+        ]""")
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val result = client.getAspspStatus()
+        assertTrue(result is AspspStatusResult.Ok)
+        val statuses = (result as AspspStatusResult.Ok).statuses
+        assertEquals(1, statuses.size)
+        assertEquals("green", statuses[AspspStatusKey("Test Bank", "DE", "personal")])
+        client.close()
+    }
+
+    @Test
+    fun `getAspspStatus aggregates duplicate keys worst-of`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = statsEngine("""[
+            {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
+            {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"red"},
+            {"connector_name":"c3","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"yellow"}
+        ]""")
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val result = client.getAspspStatus()
+        assertTrue(result is AspspStatusResult.Ok)
+        val statuses = (result as AspspStatusResult.Ok).statuses
+        assertEquals(1, statuses.size)
+        // Worst-of: red > yellow > green.
+        assertEquals("red", statuses[AspspStatusKey("Test Bank", "DE", "personal")])
+        client.close()
+    }
+
+    @Test
+    fun `getAspspStatus caches result for 60 seconds`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        var statsRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/get_today_stats") -> {
+                    statsRequests++
+                    respond(
+                        content = """[{"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected request: $url")
+            }
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val first = client.getAspspStatus()
+        assertTrue(first is AspspStatusResult.Ok)
+        val second = client.getAspspStatus()
+        assertTrue(second is AspspStatusResult.Ok)
+        assertEquals(1, statsRequests, "Second call within TTL must be served from cache")
+        client.close()
+    }
+
+    @Test
+    fun `getAspspStatus never throws on network failure and caches the failure`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        var statsRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/get_today_stats") -> {
+                    statsRequests++
+                    throw java.io.IOException("Broken pipe")
+                }
+                else -> error("Unexpected request: $url")
+            }
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val first = client.getAspspStatus()
+        assertTrue(first is AspspStatusResult.Error, "Expected Error but got: $first")
+        assertTrue((first as AspspStatusResult.Error).message.contains("Broken pipe"))
+        // Failure is cached for the same 60 s window — no second fetch.
+        val second = client.getAspspStatus()
+        assertTrue(second is AspspStatusResult.Error)
+        assertEquals(1, statsRequests, "Failure must be cached for the TTL window")
+        client.close()
+    }
+
+    @Test
+    fun `getAspspStatus returns Error when refresh token missing`() = runBlocking {
+        val db = DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
+        val engine = MockEngine { request -> error("No request expected: ${request.url}") }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+        val result = client.getAspspStatus()
+        assertTrue(result is AspspStatusResult.Error)
+        client.close()
+    }
 }

@@ -153,6 +153,15 @@ class AppViewModel(
     var authError: String? by mutableStateOf(null)
         private set
 
+    var authFailed: Boolean by mutableStateOf(false)
+        private set
+
+    var authErrorKind: String? by mutableStateOf(null)
+        private set
+
+    var authorizationId: String? by mutableStateOf(null)
+        private set
+
     var selectedBankFromState: SelectedBank? by mutableStateOf(null)
         private set
 
@@ -302,6 +311,9 @@ class AppViewModel(
         val state = apiClient.getOnboardingState()
         if (state != null) {
             authError = state.authError
+            authFailed = state.authFailed
+            authErrorKind = state.authErrorKind
+            authorizationId = state.authorizationId
             if (state.requiresRelogin) {
                 currentScreen = Screen.Onboarding
                 onboardingStep = OnboardingStep.EmailEntry
@@ -326,6 +338,20 @@ class AppViewModel(
                 // fetch fails (linking_completed=false). Expired/revoked
                 // consent does not regress — rows persist across expiry.
                 currentScreen = Screen.Dashboard
+            } else if (state.authFailed) {
+                currentScreen = Screen.Onboarding
+                onboardingStep = OnboardingStep.AuthProgress
+                val bank = state.selectedBank
+                if (bank != null) {
+                    selectedBankFromState = bank
+                    // AMENDED (D3, oracle F3): cold entry never adopts the
+                    // attempted psu_type — selected_bank.psu_type is null and
+                    // BankTeller never guesses between personal/business. The
+                    // type stays unknown/empty until the user re-confirms it
+                    // (resume card / bank list).
+                    selectedPsuType = ""
+                    enrichResumeSelection(bank)
+                }
             } else if (state.linkingCompleted) {
                 // Linked but never authorized → resume at the resume card for
                 // the stored bank (8.2 mechanics, now also the login-gate route).
@@ -370,9 +396,12 @@ class AppViewModel(
     }
 
     /**
-     * Resume enrichment: when routing into [OnboardingStep.BankSelection] with a
-     * previously-linked bank, load the ASPSP list and enrich the matching bank
-     * (logo, BIC, psuTypes) for the resume card. PSU type starts unselected.
+     * Resume enrichment: when routing into [OnboardingStep.BankSelection] or [OnboardingStep.AuthProgress]
+     * with a previously-linked bank, load the ASPSP list and enrich the matching bank
+     * (logo, BIC, psuTypes) for display. The PSU type is never adopted from
+     * persisted state — callers set [selectedPsuType] (empty on gate routes) before
+     * calling, since the server no longer reports a psu_type (BankTeller never
+     * guesses between personal/business).
      */
     private fun enrichResumeSelection(bank: SelectedBank) {
         viewModelScope.launch {
@@ -388,11 +417,12 @@ class AppViewModel(
                 country = bank.aspspCountry,
                 bic = null,
                 logo = null,
-                psuTypes = listOf(bank.psuType),
+                // psu_type is null from state; an empty list lets the UI fall
+                // back to the personal/business chips (OnboardingScreen.kt).
+                psuTypes = listOfNotNull(bank.psuType),
                 maximumConsentValidity = null,
             )
             selectedAspsp = aspsp
-            selectedPsuType = ""
         }
     }
 
@@ -653,6 +683,13 @@ class AppViewModel(
                 linkError = "Bank information missing."
                 return
             }
+        // The stored bank may carry a null/blank psu_type (server reports
+        // selected_bank.psu_type as null — BankTeller never guesses). Relinking
+        // cannot proceed without an explicit account type.
+        if (bank.psuType.isNullOrBlank()) {
+            linkError = "Confirm your account type to continue"
+            return
+        }
         isLoading = true
         linkError = null
         viewModelScope.launch {
@@ -683,6 +720,9 @@ class AppViewModel(
             selectedAspsp = null
             selectedPsuType = "personal"
             authError = null
+            authFailed = false
+            authErrorKind = null
+            authorizationId = null
             onboardingStep = OnboardingStep.BankSelection
             isLoading = false
         }
@@ -778,6 +818,16 @@ class AppViewModel(
         }
     }
 
+    /**
+     * Retry authorization is NOT offered in the failure state (transitional,
+     * D3/oracle F3): on cold entry the attempted psu_type is unknown
+     * (selected_bank.psu_type is null), so a fresh POST /api/auth cannot target
+     * the right account type. The path forward is "Choose a different bank"
+     * (cancelLinking → bank list), where the resume card/bank chips re-confirm
+     * the account type. The parallel persist-onboarding-view-position change
+     * will reintroduce a retry via stage_bank.
+     */
+
     // ---------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------
@@ -801,6 +851,9 @@ class AppViewModel(
         linkError = null
         linkStatusChecking = false
         authError = null
+        authFailed = false
+        authErrorKind = null
+        authorizationId = null
         selectedBankFromState = null
         authRedirectUrl = null
     }
