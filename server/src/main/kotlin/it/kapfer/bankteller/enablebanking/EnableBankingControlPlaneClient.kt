@@ -82,9 +82,16 @@ sealed class LinkAccountsResult {
 }
 
 sealed class GetApplicationResult {
-    /** @property active Whether the application is active. */
-    /** @property whitelistedAccounts Entries from whitelisted_accounts; empty if app is inactive. */
-    data class Ok(val active: Boolean, val whitelistedAccounts: List<WhitelistedAccountEntry>) : GetApplicationResult()
+    /**
+     * @property active Whether the application is active.
+     * @property whitelistedAccounts Entries from `whitelisted_accounts`; empty when the field is absent or null.
+     * @property pendingActionType Informational EB control-plane action (e.g. "activation"); null when absent or null.
+     */
+    data class Ok(val active: Boolean, val whitelistedAccounts: List<WhitelistedAccountEntry>, val pendingActionType: String?) : GetApplicationResult()
+
+    /** The application id is absent from the control-plane list — positive deletion signal. */
+    data object Deleted : GetApplicationResult()
+
     data class Error(val statusCode: Int?, val message: String) : GetApplicationResult()
 }
 
@@ -157,7 +164,8 @@ private data class ApplicationEntry(
     val kid: String? = null,
     val active: Boolean = false,
     @SerialName("whitelisted_accounts")
-    val whitelistedAccounts: List<WhitelistedAccountEntry> = emptyList(),
+    val whitelistedAccounts: List<WhitelistedAccountEntry>? = null,
+    val pendingActionType: String? = null,
 )
 
 @Serializable
@@ -485,6 +493,12 @@ class EnableBankingControlPlaneClient(
      * (Firebase idToken auth). Used by the link-status check to detect whether
      * account linking completed: the application's `active` field becomes true
      * after the PSU finishes SCA in the control panel.
+     *
+     * The control-plane list contains only actually existing applications, so an
+     * application id absent from the list is a positive deletion signal and is
+     * reported as [GetApplicationResult.Deleted] (never collapsed into
+     * `Ok(active = false)`). Failures (non-200, network, unparseable body) are
+     * reported as [GetApplicationResult.Error] — never as Deleted or Ok.
      */
     suspend fun getApplication(idToken: String, applicationId: String): GetApplicationResult {
         return try {
@@ -496,10 +510,15 @@ class EnableBankingControlPlaneClient(
             if (response.status.isSuccess()) {
                 val parsed = json.decodeFromString<List<ApplicationEntry>>(body)
                 val matching = parsed.firstOrNull { it.kid == applicationId }
-                GetApplicationResult.Ok(
-                    active = matching?.active ?: false,
-                    whitelistedAccounts = matching?.whitelistedAccounts ?: emptyList(),
-                )
+                if (matching != null) {
+                    GetApplicationResult.Ok(
+                        active = matching.active,
+                        whitelistedAccounts = matching.whitelistedAccounts ?: emptyList(),
+                        pendingActionType = matching.pendingActionType,
+                    )
+                } else {
+                    GetApplicationResult.Deleted
+                }
             } else {
                 GetApplicationResult.Error(
                     statusCode = response.status.value,

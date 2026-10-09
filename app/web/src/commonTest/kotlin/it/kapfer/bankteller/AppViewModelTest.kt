@@ -71,7 +71,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_whenAuthenticatedAndNotConfigured_showsOnboardingEmailEntry() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false, verified = null, active = null)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false)
         vm.checkAuth()
         advanceUntilIdle()
         assertTrue(vm.isAuthenticated)
@@ -80,20 +80,9 @@ class AppViewModelTest {
     }
 
     @Test
-    fun checkAuth_whenAuthenticatedAndConfiguredButNotVerified_showsOnboardingEmailEntry() = runTest(testDispatcher) {
-        fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        // verified=false signals invalid credentials → re-onboard
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = false, active = null)
-        vm.checkAuth()
-        advanceUntilIdle()
-        assertEquals(Screen.Onboarding, vm.currentScreen)
-        assertEquals(OnboardingStep.EmailEntry, vm.onboardingStep)
-    }
-
-    @Test
     fun checkAuth_whenAuthenticatedAndConfiguredAndActive_showsDashboard() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(Screen.Dashboard, vm.currentScreen)
@@ -103,7 +92,7 @@ class AppViewModelTest {
     fun checkAuth_whenAuthenticatedAndConfiguredButInactive_routesToRegistrationReview() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
         // active=false + previouslyActive=true (deleted app), state=null → RegistrationReview
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(Screen.Onboarding, vm.currentScreen)
@@ -113,8 +102,8 @@ class AppViewModelTest {
     @Test
     fun checkAuth_whenAuthenticatedAndConfiguredButActiveAbsent_routesToBankSelection() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        // active=null (absent), state=null → bank selection as safe default
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = null)
+        // appState=null (unknown — CP failure), state=null → bank selection as safe default
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true)
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(Screen.Onboarding, vm.currentScreen)
@@ -134,7 +123,7 @@ class AppViewModelTest {
     @Test
     fun login_success_checksOnboardingStatus() = runTest(testDispatcher) {
         fakeApi.nextLoginResult = LoginResult.Success
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false, verified = null, active = null)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false)
         vm.login("admin", "changeme")
         advanceUntilIdle()
         assertTrue(vm.isAuthenticated)
@@ -189,7 +178,7 @@ class AppViewModelTest {
         // was still routing (visible as a disabled → enabled → redirect flash).
         fakeApi.nextLoginResult = LoginResult.Success
         fakeApi.nextOnboardingStatus =
-            OnboardingStatus(enableBankingConfigured = false, verified = null, active = null)
+            OnboardingStatus(enableBankingConfigured = false)
         fakeApi.onboardingStatusCallDelayMs = 1_000L
 
         vm.login("admin", "changeme")
@@ -731,7 +720,7 @@ class AppViewModelTest {
     fun submitRegistration_reregister_noToken_successActive_transitionsToDashboard() = runTest(testDispatcher) {
         // Gate-routed: deleted app (active=false, previouslyActive=true) → RegistrationReview with null onboardingStateToken.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
@@ -754,7 +743,7 @@ class AppViewModelTest {
     @Test
     fun submitRegistration_reregister_noToken_successInactive_transitionsToActivationGuide() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
@@ -775,7 +764,7 @@ class AppViewModelTest {
     @Test
     fun submitRegistration_reregister_noToken_retryableError_staysOnRegistrationReview() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         vm.checkAuth()
         advanceUntilIdle()
         assertEquals(OnboardingStep.RegistrationReview, vm.onboardingStep)
@@ -828,7 +817,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateRequiresRelogin_routesToEmailEntry() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = true,
             linkingCompleted = false,
@@ -845,7 +834,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateAuthCompleted_routesToDashboard() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -863,7 +852,7 @@ class AppViewModelTest {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
         // Deleted app: active=false + previouslyActive=true → RegistrationReview,
         // takes precedence over linkingCompleted → Dashboard.
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         val bank = SelectedBank("TestBank", "FI", "personal")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -887,7 +876,7 @@ class AppViewModelTest {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
         // Fresh PRODUCTION registration pending activation: active=false but the app
         // was never seen active → ActivationGuide, NOT RegistrationReview.
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = false)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "inactiveNeverLinked")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = false,
@@ -906,7 +895,7 @@ class AppViewModelTest {
     fun checkAuth_fallbackActiveFalseNeverActive_routesToActivationGuide() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
         // state == null fallback: fresh PRODUCTION app pending activation → ActivationGuide.
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = false)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "inactiveNeverLinked")
         fakeApi.nextOnboardingState = null
         vm.checkAuth()
         advanceUntilIdle()
@@ -918,7 +907,7 @@ class AppViewModelTest {
     fun checkAuth_inactiveGate_stateBranch_loadsRegistrationInfo() = runTest(testDispatcher) {
         // state != null, active == false + previouslyActive=true → RegistrationReview + load registration info
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -941,7 +930,7 @@ class AppViewModelTest {
     fun checkAuth_inactiveGate_fallbackBranch_loadsRegistrationInfo() = runTest(testDispatcher) {
         // state == null fallback, active == false + previouslyActive=true → RegistrationReview + load info
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = false, previouslyActive = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "deleted")
         fakeApi.nextOnboardingState = null
         fakeApi.nextRegistrationInfo = RegistrationInfo(
             email = "saved@example.com",
@@ -962,7 +951,7 @@ class AppViewModelTest {
         // AMENDED 2.1: selected_bank.psu_type is JSON null from the server —
         // the resume card must still be constructed from name/country alone.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         val bank = SelectedBank("TestBank", "FI", null)
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -992,7 +981,7 @@ class AppViewModelTest {
     @Test
     fun dismissResumeCard_abandonsCardAndRestoresDefaults() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         val bank = SelectedBank("TestBank", "FI", "personal")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -1020,7 +1009,7 @@ class AppViewModelTest {
     @Test
     fun resumeCard_psuValidationAndAuthFlow() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         val bank = SelectedBank("TestBank", "FI", "personal")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -1058,7 +1047,7 @@ class AppViewModelTest {
     @Test
     fun dismissResumeCard_selectDifferentBank_linksViaLinkingProgress() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         val bank = SelectedBank("OldBank", "FI", "personal")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
@@ -1093,7 +1082,7 @@ class AppViewModelTest {
         // Linked but never authorized, and the whitelist entry carries no usable
         // selected_bank (null) → plain BankSelection without pre-selection.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1117,7 +1106,7 @@ class AppViewModelTest {
         // but auth_completed=true. A previously-authorized user still lands on
         // Dashboard during an EB outage.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = false,
@@ -1133,7 +1122,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateLinkingCompletedAndAuthorized_routesToDashboard() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1150,7 +1139,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateWhitelistEmptyActiveTrue_routesToBankSelection() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = false,
@@ -1233,7 +1222,7 @@ class AppViewModelTest {
         // AMENDED 2.1: selected_bank.psu_type is null from the server. Relinking
         // must NOT fire POST /api/link-accounts without an explicit account type.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1332,7 +1321,7 @@ class AppViewModelTest {
     @Test
     fun checkAuth_stateAuthFailed_routesToAuthProgressWithFailureContext() = runTest(testDispatcher) {
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         // AMENDED 2.1: server reports psu_type null — bank enrichment must
         // still reach the AuthProgress failure panel.
         val bank = SelectedBank("TestBank", "FI", null)
@@ -1372,7 +1361,7 @@ class AppViewModelTest {
         // 4.3: cold entry displays the failure WITHOUT auto-running POST /api/auth
         // (display-before-clear ordering — the retry is user-initiated).
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1400,7 +1389,7 @@ class AppViewModelTest {
         // Pre-deployment cookie: auth_error non-null but auth_error_kind null →
         // still routes to AuthProgress; the SPA renders the unexpected variant.
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1431,7 +1420,7 @@ class AppViewModelTest {
         // "Choose a different bank" → cancelLinking → bank list (resume card
         // re-confirms the account type).
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,
@@ -1471,7 +1460,7 @@ class AppViewModelTest {
         // 5.4: the resume/bank-list path after a failure starts with a clean
         // slate (no stale bank selection, no adopted psu_type from state).
         fakeApi.nextAuthState = AuthState.Authenticated("admin")
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, verified = true, active = true)
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
         fakeApi.nextOnboardingState = OnboardingState(
             requiresRelogin = false,
             linkingCompleted = true,

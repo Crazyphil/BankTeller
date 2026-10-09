@@ -63,12 +63,49 @@ class OnboardingServiceTest {
     // getStatus
     // =====================================================================
 
+    /**
+     * Control-plane client backed by a MockEngine that serves the token-refresh
+     * exchange and the GET /api/applications lookup. [applicationJson] is read on
+     * every application request so a test can flip the served state between
+     * calls; [appRequestCount] counts GET /api/applications calls (for cache
+     * assertions).
+     */
+    private fun statusControlClient(
+        db: BankTellerDatabase,
+        applicationJson: () -> String,
+        appRequestCount: () -> Unit = {},
+    ): EnableBankingControlPlaneClient {
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") && request.method == HttpMethod.Get -> {
+                    appRequestCount()
+                    respond(
+                        content = applicationJson(),
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected status request: $url")
+            }
+        }
+        return EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
+    }
+
     @Test
-    fun `getStatus with empty database returns false null null`() = runBlocking {
+    fun `getStatus with empty database returns false with null state`() = runBlocking {
         val db = createDatabase()
         val service = createService(database = db)
         val status = service.getStatus()
-        assertEquals(OnboardingStatusResponse(false, null, null), status)
+        assertEquals(OnboardingStatusResponse(false), status)
+        assertEquals(null, status.appState)
+        assertEquals(null, status.pendingAction)
     }
 
     @Test
@@ -76,27 +113,25 @@ class OnboardingServiceTest {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        val mockClient = object : EnableBankingClient(
-            DatabaseEnableBankingCredentialProvider(db)
-        ) {
-            var callCount = 0
-            override suspend fun verifyApplication(): ApplicationVerificationResult {
-                callCount++
-                return ApplicationVerificationResult.Success(active = true)
-            }
-            override fun close() = Unit
-        }
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        var applicationRequests = 0
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]""" },
+        ) { applicationRequests++ }
         val service = OnboardingService(
             database = db,
-            controlPlaneClient = EnableBankingControlPlaneClient(),
-            enableBankingClientFactory = { mockClient },
+            controlPlaneClient = controlClient,
+            // getStatus derives state from the control plane — the data-plane
+            // client must not be touched anymore.
+            enableBankingClientFactory = { error("data-plane client must not be used by getStatus") },
         )
         val first = service.getStatus()
-        assertEquals(OnboardingStatusResponse(true, true, true, previouslyActive = true), first)
-        assertEquals(1, mockClient.callCount)
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.ACTIVE, null), first)
+        assertEquals(1, applicationRequests)
         val second = service.getStatus()
         assertEquals(first, second)
-        assertEquals(1, mockClient.callCount, "Second call must be served from cache")
+        assertEquals(1, applicationRequests, "Second call must be served from cache")
     }
 
     @Test
@@ -104,129 +139,172 @@ class OnboardingServiceTest {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        val mockClient = object : EnableBankingClient(
-            DatabaseEnableBankingCredentialProvider(db)
-        ) {
-            var callCount = 0
-            override suspend fun verifyApplication(): ApplicationVerificationResult {
-                callCount++
-                return ApplicationVerificationResult.Success(active = true)
-            }
-            override fun close() = Unit
-        }
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        var applicationRequests = 0
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]""" },
+        ) { applicationRequests++ }
         val service = OnboardingService(
             database = db,
-            controlPlaneClient = EnableBankingControlPlaneClient(),
-            enableBankingClientFactory = { mockClient },
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("data-plane client must not be used by getStatus") },
         )
-        assertEquals(1, service.getStatus().let { mockClient.callCount })
+        assertEquals(EbApplicationState.ACTIVE, service.getStatus().appState)
+        assertEquals(1, applicationRequests)
         service.invalidateStatusCache()
-        assertEquals(2, service.getStatus().let { mockClient.callCount })
+        assertEquals(EbApplicationState.ACTIVE, service.getStatus().appState)
+        assertEquals(2, applicationRequests)
     }
 
     @Test
-    fun `getStatus does NOT auto-reset when app was previously active but now inactive`() = runBlocking {
+    fun `getStatus reports deleted after the app was active and then disappears from the control plane`() = runBlocking {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        var callIndex = 0
-        val mockClient = object : EnableBankingClient(
-            DatabaseEnableBankingCredentialProvider(db)
-        ) {
-            override suspend fun verifyApplication(): ApplicationVerificationResult {
-                callIndex++
-                return if (callIndex == 1) {
-                    ApplicationVerificationResult.Success(active = true)
-                } else {
-                    ApplicationVerificationResult.Success(active = false)
-                }
-            }
-            override fun close() = Unit
-        }
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        var appJson = """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]"""
+        val controlClient = statusControlClient(db, applicationJson = { appJson })
         val service = OnboardingService(
             database = db,
-            controlPlaneClient = EnableBankingControlPlaneClient(),
-            enableBankingClientFactory = { mockClient },
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("data-plane client must not be used by getStatus") },
         )
 
-        // First call: app is active — should persist previously_active and return active=true
-        val first = service.getStatus()
-        assertEquals(OnboardingStatusResponse(true, true, true, previouslyActive = true), first)
-        val previouslyActive = db.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
-            .executeAsOneOrNull()
-        assertEquals("true", previouslyActive)
+        // First call: app registered and active.
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.ACTIVE, null), service.getStatus())
 
-        // Second call: invalidate cache first so the new mock response is read
+        // The app is deleted on the EB control panel — its kid disappears from
+        // the application list (a positive deletion signal).
         service.invalidateStatusCache()
-        // App is now inactive — NO auto-reset: the previously-active app is surfaced
-        // to the UI as a normal ActivationGuide state (the explicit
-        // /api/onboarding/enable-banking/reset endpoint remains for user-initiated reset).
-        val second = service.getStatus()
-        assertEquals(OnboardingStatusResponse(true, true, false, previouslyActive = true), second)
+        appJson = """[]"""
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.DELETED, null), service.getStatus())
 
-        // Credentials must NOT be blanked
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
-        assertEquals("app-001", appId)
-        assertEquals("fake-pem", privateKey)
-        // previously_active history is kept
-        val previouslyActiveAfter = db.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
-            .executeAsOneOrNull()
-        assertEquals("true", previouslyActiveAfter)
+        // Deletion must NOT auto-reset the credentials.
+        assertEquals("app-001", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
+        assertEquals("fake-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
     }
 
     @Test
-    fun `getStatus does NOT auto-reset for fresh app that was never active`() = runBlocking {
+    fun `getStatus reports inactiveNeverLinked for a fresh app that was never activated`() = runBlocking {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        // Ensure previously_active is NOT set
-        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
-        val mockClient = object : EnableBankingClient(
-            DatabaseEnableBankingCredentialProvider(db)
-        ) {
-            override suspend fun verifyApplication(): ApplicationVerificationResult {
-                return ApplicationVerificationResult.Success(active = false)
-            }
-            override fun close() = Unit
-        }
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":false,"whitelisted_accounts":[]}]""" },
+        )
         val service = OnboardingService(
             database = db,
-            controlPlaneClient = EnableBankingControlPlaneClient(),
-            enableBankingClientFactory = { mockClient },
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
         )
 
         val result = service.getStatus()
-        // Should be normal ActivationGuide state — NOT auto-reset
-        assertEquals(OnboardingStatusResponse(true, true, false, previouslyActive = false), result)
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.INACTIVE_NEVER_LINKED, null), result)
 
-        // Credentials should still be present (not blanked)
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
-        assertEquals("app-001", appId)
-        assertEquals("fake-pem", privateKey)
+        // Credentials must still be present (not blanked).
+        assertEquals("app-001", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
+        assertEquals("fake-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
     }
 
     @Test
-    fun `resetCredentials clears previously_active flag`() = runBlocking {
+    fun `getStatus reports inactiveButLinked for an inactive app with a non-empty whitelist`() = runBlocking {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":false,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""" },
+        )
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.INACTIVE_BUT_LINKED, null), service.getStatus())
+    }
+
+    @Test
+    fun `getStatus returns unknown when refresh fails and never reports deleted`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"error":"token refresh down"}""",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    error("getApplication must not be called after a failed refresh")
+                else -> error("Unexpected status request: $url")
+            }
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = EnableBankingControlPlaneClient(HttpClient(engine), db),
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        val status = service.getStatus()
+        assertEquals(true, status.enableBankingConfigured)
+        assertEquals(null, status.appState, "CP failure must yield unknown, never deleted")
+    }
+
+    @Test
+    fun `getStatus returns unknown when getApplication fails and never reports deleted`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"error":"boom"}""",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected status request: $url")
+            }
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = EnableBankingControlPlaneClient(HttpClient(engine), db),
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        val status = service.getStatus()
+        assertEquals(true, status.enableBankingConfigured)
+        assertEquals(null, status.appState, "CP failure must yield unknown, never deleted")
+    }
+
+    @Test
+    fun `getStatus returns unknown when refresh token missing but credentials configured`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
         val service = createService(database = db)
 
-        service.resetCredentials()
-
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
-        val previouslyActive = db.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
-            .executeAsOneOrNull()
-        assertEquals("", appId)
-        assertEquals("", privateKey)
-        assertEquals("", previouslyActive)
+        val status = service.getStatus()
+        assertEquals(true, status.enableBankingConfigured)
+        assertEquals(null, status.appState)
+        assertEquals(null, status.pendingAction)
     }
 
     // =====================================================================
@@ -624,11 +702,12 @@ class OnboardingServiceTest {
         val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
         assertNotNull(privateKey)
         assertTrue(privateKey!!.isNotBlank())
-        // Verification returned active=true → previously_active flag should be persisted
+        // Verification returned active=true — the previously_active marker is
+        // deliberately NOT written anymore (task 2.2): stale values are never read.
         val previouslyActive = db.systemConfigQueries
             .selectValue("enable_banking_previously_active")
             .executeAsOneOrNull()
-        assertEquals("true", previouslyActive)
+        assertNull(previouslyActive)
     }
 
     @Test
@@ -1282,6 +1361,13 @@ class OnboardingServiceTest {
                         status = HttpStatusCode.OK,
                         headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
                     )
+                // POST = registerApplication; GET = getApplication (status lookup)
+                request.url.toString().contains("enablebanking.com/api/applications") && request.method == HttpMethod.Get ->
+                    respond(
+                        content = """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
                 request.url.toString().contains("enablebanking.com/api/applications") ->
                     respond(
                         content = """{"app_id": "app-001"}""",
@@ -1319,7 +1405,7 @@ class OnboardingServiceTest {
             redirectUrl = "https://app.example.com/cb",
         )
         assertTrue(completeResult is CompleteResult.Success)
-        assertEquals(OnboardingStatusResponse(true, true, true, previouslyActive = true), service.getStatus())
+        assertEquals(OnboardingStatusResponse(true, EbApplicationState.ACTIVE, null), service.getStatus())
 
         // Simulate maintainer clearing system_config rows (re-onboarding scenario)
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "")
@@ -1327,7 +1413,7 @@ class OnboardingServiceTest {
         service.invalidateStatusCache()
 
         // After clearing, the system appears unconfigured
-        assertEquals(OnboardingStatusResponse(false, null, null), service.getStatus())
+        assertEquals(OnboardingStatusResponse(false), service.getStatus())
 
         // A new onboarding can be started
         val secondStart = service.startOnboarding(
@@ -1409,11 +1495,13 @@ class OnboardingServiceTest {
     // =====================================================================
 
     @Test
-    fun `resetCredentials blanks all four keys including refresh token`() = runBlocking {
+    fun `resetCredentials blanks the three credential keys and leaves previously_active untouched`() = runBlocking {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
         db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
         db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "refresh-xyz")
+        // Stale marker from an earlier app — reset must not touch it; it is
+        // simply never read (task 2.2/2.4).
         db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
         val service = createService(database = db)
 
@@ -1428,7 +1516,8 @@ class OnboardingServiceTest {
         assertEquals("", appId)
         assertEquals("", privateKey)
         assertEquals("", refreshToken)
-        assertEquals("", previouslyActive)
+        // The stale marker value simply remains — no migration, no write.
+        assertEquals("true", previouslyActive)
     }
 
     // =====================================================================
@@ -1504,7 +1593,8 @@ class OnboardingServiceTest {
         assertNotNull(privateKey)
         assertTrue(privateKey!!.isNotBlank())
         assertNotEquals("old-pem", privateKey)
-        // The new app verified active → the flag is (re)set to true.
+        // The previously_active marker is no longer written by the flow (task
+        // 2.2) — the stale value simply remains, never read.
         assertEquals(
             "true",
             db.systemConfigQueries.selectValue("enable_banking_previously_active").executeAsOneOrNull(),
@@ -1564,12 +1654,10 @@ class OnboardingServiceTest {
         assertEquals("stored@example.com", json["gdpr_email"]?.jsonPrimitive?.content)
         assertEquals("https://app.example.com/privacy", json["privacy_url"]?.jsonPrimitive?.content)
         assertEquals("https://app.example.com/terms", json["terms_url"]?.jsonPrimitive?.content)
-        // Regression: the stale previously_active flag from the deleted app must be
-        // blanked by the re-registration — the new app is fresh (inactive), and with
-        // the stale flag the gate would misclassify it as a deleted previously-active
-        // app and loop back to RegistrationReview.
+        // The previously_active marker is no longer blanked by the
+        // re-registration (task 2.2) — the stale value simply remains, never read.
         assertEquals(
-            "",
+            "true",
             db.systemConfigQueries.selectValue("enable_banking_previously_active").executeAsOneOrNull(),
         )
     }

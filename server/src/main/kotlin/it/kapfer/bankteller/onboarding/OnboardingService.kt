@@ -9,6 +9,7 @@ import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.Environment
 import it.kapfer.bankteller.enablebanking.EmailLinkSigninResult
+import it.kapfer.bankteller.enablebanking.GetApplicationResult
 import it.kapfer.bankteller.enablebanking.GetOobResult
 import it.kapfer.bankteller.enablebanking.IdTokenRefreshResult
 import it.kapfer.bankteller.enablebanking.ProductionFields
@@ -76,17 +77,24 @@ data class ProductionFieldOverrides(
     val termsUrl: String? = null,
 )
 
+/**
+ * Derived application state, sourced from the Enable Banking control plane
+ * (creation/activation/deletion live there; the data plane cannot distinguish
+ * a deleted app from an inactive one).
+ */
+enum class EbApplicationState { DELETED, INACTIVE_NEVER_LINKED, INACTIVE_BUT_LINKED, ACTIVE }
+
 data class OnboardingStatusResponse(
     val enableBankingConfigured: Boolean,
-    val verified: Boolean?,
-    val active: Boolean?,
     /**
-     * Whether the app was ever seen `active == true` (from `enable_banking_previously_active`
-     * in `system_config`). Lets the SPA gate distinguish a fresh PRODUCTION registration
-     * pending activation (`active == false`, `previouslyActive == false/null` → ActivationGuide)
-     * from a previously-active app that was deleted (`previouslyActive == true` → RegistrationReview).
+     * `null` = unknown — either credentials are absent (see
+     * [enableBankingConfigured]) or the control-plane lookup failed.
+     * `DELETED` is ONLY reported when the control plane positively reports the
+     * application as gone — never on a failure.
      */
-    val previouslyActive: Boolean? = null,
+    val appState: EbApplicationState? = null,
+    /** Informational only (from the control-plane `pendingActionType`); never gates routing. */
+    val pendingAction: String? = null,
 )
 
 /**
@@ -189,8 +197,10 @@ class OnboardingService(
     }
 
     /**
-     * Cached verification result from [EnableBankingClient.verifyApplication]
-     * (30 s TTL). Invalidated after successful onboarding completion.
+     * Cached status response (30 s TTL) derived from the Enable Banking control
+     * plane. Invalidated after successful onboarding completion. ALL outcomes —
+     * including the unknown/`enableBankingConfigured=true` results — are cached
+     * for the same window, so a control-plane outage does not hammer the CP.
      */
     private val statusCache = TtlCache<String, OnboardingStatusResponse>(30_000L)
 
@@ -210,69 +220,58 @@ class OnboardingService(
             .executeAsOneOrNull()
 
         if (appId.isNullOrBlank() || privateKey.isNullOrBlank()) {
-            val response = OnboardingStatusResponse(
-                enableBankingConfigured = false,
-                verified = null,
-                active = null,
-            )
+            val response = OnboardingStatusResponse(enableBankingConfigured = false)
             statusCache.put("status", response)
             return response
         }
 
-        // Credentials exist — verify via EB
-        val previouslyActive = database.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
+        // Credentials exist — derive state from the control plane (the only
+        // source that can distinguish a deleted app from an inactive one; the
+        // data-plane verifyApplication() answers active:false forever for a
+        // deleted app, so it is not usable here).
+        val refreshToken = database.systemConfigQueries
+            .selectValue("enable_banking_refresh_token")
             .executeAsOneOrNull()
-            ?.equals("true", ignoreCase = true) ?: false
-        val client = enableBankingClientFactory()
-        try {
-            val verification = client.verifyApplication()
-            val response = when (verification) {
-                is ApplicationVerificationResult.Success -> {
-                    if (verification.active == true) {
-                        // Persist that the app was seen as active — used later to detect
-                        // deletion (EB returns active:false with no deleted/status field).
-                        database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
-                        OnboardingStatusResponse(
-                            enableBankingConfigured = true,
-                            verified = true,
-                            active = true,
-                            previouslyActive = true,
-                        )
-                    } else {
-                        // active == false — could be a fresh PRODUCTION app (never activated)
-                        // or a previously-active app that was deleted from the EB control
-                        // panel. `previouslyActive` disambiguates: fresh app → ActivationGuide,
-                        // previously-active → RegistrationReview (re-register).
-                        OnboardingStatusResponse(
-                            enableBankingConfigured = true,
-                            verified = true,
-                            active = false,
-                            previouslyActive = previouslyActive,
-                        )
-                    }
-                }
-                is ApplicationVerificationResult.InvalidCredentials -> OnboardingStatusResponse(
-                    enableBankingConfigured = true,
-                    verified = false,
-                    active = null,
-                    previouslyActive = previouslyActive,
-                )
-                is ApplicationVerificationResult.Error -> {
-                    logger.warn("verifyApplication failed: status=${verification.statusCode}, msg=${verification.message}")
-                    OnboardingStatusResponse(
-                        enableBankingConfigured = true,
-                        verified = false,
-                        active = null,
-                        previouslyActive = previouslyActive,
-                    )
-                }
-            }
+        if (refreshToken.isNullOrBlank()) {
+            // Unknown state — the SPA's requires_relogin handles routing.
+            val response = OnboardingStatusResponse(enableBankingConfigured = true)
             statusCache.put("status", response)
             return response
-        } finally {
-            client.close()
         }
+
+        val response: OnboardingStatusResponse = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
+            is IdTokenRefreshResult.Error -> {
+                logger.warn("getStatus: idToken refresh failed: status=${refresh.statusCode}, msg=${refresh.message}")
+                OnboardingStatusResponse(enableBankingConfigured = true)
+            }
+            is IdTokenRefreshResult.Ok -> when (val result = controlPlaneClient.getApplication(refresh.idToken, appId)) {
+                is GetApplicationResult.Ok -> {
+                    val appState = when {
+                        result.active -> EbApplicationState.ACTIVE
+                        result.whitelistedAccounts.isEmpty() -> EbApplicationState.INACTIVE_NEVER_LINKED
+                        else -> EbApplicationState.INACTIVE_BUT_LINKED
+                    }
+                    OnboardingStatusResponse(
+                        enableBankingConfigured = true,
+                        appState = appState,
+                        pendingAction = result.pendingActionType,
+                    )
+                }
+                is GetApplicationResult.Deleted -> OnboardingStatusResponse(
+                    enableBankingConfigured = true,
+                    appState = EbApplicationState.DELETED,
+                )
+                is GetApplicationResult.Error -> {
+                    // NEVER report deleted on a failed lookup — an outage must
+                    // not masquerade as a deletion (which would push the user
+                    // into re-registration).
+                    logger.warn("getStatus: getApplication failed: status=${result.statusCode}, msg=${result.message}")
+                    OnboardingStatusResponse(enableBankingConfigured = true)
+                }
+            }
+        }
+        statusCache.put("status", response)
+        return response
     }
 
     /** Called after successful onboarding to force re-verification on next [getStatus]. */
@@ -292,15 +291,12 @@ class OnboardingService(
     }
 
     /**
-     * Clears the persisted Enable Banking credentials (application ID + private key)
-     * from `system_config` and invalidates the status cache.
+     * Clears the persisted Enable Banking credentials (application ID + private
+     * key + refresh token) from `system_config` and invalidates the status
+     * cache.
      *
      * After this call, [getStatus] reports `enableBankingConfigured = false`, which
      * routes the onboarding gate to [EmailEntry] so the user can re-register.
-     *
-     * Also blanks `enable_banking_previously_active` so a freshly re-registered app
-     * that is still pending activation (`active: false`) is NOT reported as
-     * previously-active history by [getStatus].
      *
      * Uses blank-string overwrites (same trade-off as [cleanupPrivateKey]) rather
      * than a SQL DELETE, because [SystemConfig.sq] has no delete query and adding
@@ -311,7 +307,6 @@ class OnboardingService(
         database.systemConfigQueries.insertOrReplace("enable_banking_application_id", "")
         database.systemConfigQueries.insertOrReplace("enable_banking_private_key", "")
         database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
-        database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
         invalidateStatusCache()
     }
 
@@ -654,11 +649,6 @@ class OnboardingService(
             database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
             database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
             database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
-            // Blank the "was ever active" history: these credentials belong to a NEWLY
-            // registered app. Without this, a re-registration after deleting a previously
-            // active app inherits the stale flag and the gate misclassifies the fresh
-            // (inactive) app as a deleted previously-active one → RegistrationReview loop.
-            database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "")
             if (email != null) {
                 database.systemConfigQueries.insertOrReplace("enable_banking_email", email)
             }
@@ -677,12 +667,6 @@ class OnboardingService(
         try {
             return when (val verification = freshClient.verifyApplication()) {
                 is ApplicationVerificationResult.Success -> {
-                    if (verification.active == true) {
-                        // Persist that the app was seen as active immediately — otherwise a
-                        // SANDBOX app (auto-active) could be deleted before the user's next
-                        // getStatus() call and the auto-reset detection would not fire.
-                        database.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
-                    }
                     onActive?.invoke(verification.active)
                     verification.active
                 }

@@ -103,6 +103,16 @@ private suspend fun fetchWhitelist(
             whitelistCache.put("whitelist", snapshot)
             snapshot
         }
+        // A deleted application has no linked accounts by definition — the CP
+        // call succeeded, so cache a definitive empty snapshot (60 s, NOT the
+        // 10 s failure cache) instead of answering 502 for a successful call.
+        // /api/onboarding/state then conservatively reports linking_completed
+        // false, selected_bank null.
+        is GetApplicationResult.Deleted -> {
+            val snapshot = WhitelistSnapshot(active = false, entries = emptyList())
+            whitelistCache.put("whitelist", snapshot)
+            snapshot
+        }
         is GetApplicationResult.Error -> {
             whitelistFailureCache.put("whitelist", Unit)
             null

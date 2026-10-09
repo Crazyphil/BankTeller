@@ -9,6 +9,7 @@ import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
@@ -20,6 +21,7 @@ import it.kapfer.bankteller.enablebanking.EnableBankingCredentialProvider
 import it.kapfer.bankteller.module
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -58,10 +60,20 @@ class OnboardingFlowE2ETest {
                     respond("{}", HttpStatusCode.OK)
 
                 request.url.encodedPath.contains("emailLinkSignin") ->
-                    respond("""{"idToken":"fake-firebase-token"}""", HttpStatusCode.OK)
+                    respond("""{"idToken":"fake-firebase-token","refreshToken":"fake-refresh-token"}""", HttpStatusCode.OK)
+
+                request.url.encodedPath == "/api/applications" && request.method == HttpMethod.Get ->
+                    respond(
+                        """[{"kid":"test-app-123","active":true,"whitelisted_accounts":[]}]""",
+                        HttpStatusCode.OK,
+                    )
 
                 request.url.encodedPath == "/api/applications" ->
                     respond("""{"app_id":"test-app-123"}""", HttpStatusCode.OK)
+
+                // Token refresh for the getStatus control-plane lookup.
+                request.url.encodedPath.contains("/v1/token") ->
+                    respond("""{"id_token":"fresh-id","refresh_token":"rt2","expires_in":"3600"}""", HttpStatusCode.OK)
 
                 else -> respond("Unexpected request: ${request.url}", HttpStatusCode.NotFound)
             }
@@ -157,13 +169,74 @@ class OnboardingFlowE2ETest {
         assertTrue(completeBody.contains(""""success":true"""), "Expected success=true, got: $completeBody")
         assertTrue(completeBody.contains(""""active":true"""), "Expected active=true, got: $completeBody")
 
-        // --- Step 8: Verify final onboarding status (configured + verified + active) ---
+        // --- Step 8: Verify final onboarding status (configured + active) ---
         client.get("/api/onboarding/status").also { resp ->
             assertEquals(HttpStatusCode.OK, resp.status)
             val body = resp.bodyAsText()
             assertTrue(body.contains(""""enableBankingConfigured":true"""), "Expected configured=true, got: $body")
-            assertTrue(body.contains(""""verified":true"""), "Expected verified=true, got: $body")
-            assertTrue(body.contains(""""active":true"""), "Expected active=true, got: $body")
+            assertTrue(body.contains(""""appState":"active""""), "Expected appState=active, got: $body")
+            assertFalse(body.contains(""""verified"""), "verified must be removed from the status response")
+        }
+    }
+
+    @Test
+    fun `status endpoint emits camelCase appState wire values for inactive states`() {
+        // Shared temp-file DB so seeded credentials are visible to the module's
+        // DatabaseFactory.init() (same pattern as OnboardingRoutesTest).
+        val dbFile = java.io.File.createTempFile("bt-wire-appstate", ".db")
+        dbFile.deleteOnExit()
+        System.setProperty("database.path", dbFile.absolutePath)
+        val db = it.kapfer.bankteller.server.DatabaseFactory.init()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "test-app-123")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "dummy-key")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt")
+
+        // CP list: app present, inactive, never linked (no whitelisted_accounts).
+        val mockEngine = MockEngine { request ->
+            when {
+                request.url.encodedPath.contains("/v1/token") ->
+                    respond("""{"id_token":"fresh-id","refresh_token":"rt2","expires_in":"3600"}""", HttpStatusCode.OK)
+                request.url.encodedPath == "/api/applications" && request.method == HttpMethod.Get ->
+                    respond("""[{"kid":"test-app-123","active":false}]""", HttpStatusCode.OK)
+                else -> respond("Unexpected request: ${request.url}", HttpStatusCode.NotFound)
+            }
+        }
+        val controlPlaneClient = EnableBankingControlPlaneClient(HttpClient(mockEngine))
+
+        try {
+            testApplication {
+                application {
+                    module(
+                        controlPlaneClient = controlPlaneClient,
+                        enableBankingClientFactory = {
+                            object : EnableBankingClient(object : EnableBankingCredentialProvider {
+                                override fun credentials() = CredentialResult.NotConfigured
+                            }) {}
+                        },
+                    )
+                }
+                val client = createClient { install(HttpCookies) }
+                client.post("/api/login") {
+                    contentType(ContentType.Application.Json)
+                    setBody("""{"username":"admin","password":"changeme"}""")
+                }
+                client.get("/api/onboarding/status").also { resp ->
+                    assertEquals(HttpStatusCode.OK, resp.status)
+                    val body = resp.bodyAsText()
+                    // Wire values are pinned camelCase by the delta spec (design D6) —
+                    // the SPA matches these exact strings. Regression guard for the
+                    // enum.name.lowercase() bug (snake_case never matched).
+                    assertTrue(
+                        body.contains(""""appState":"inactiveNeverLinked""""),
+                        "Expected camelCase appState=inactiveNeverLinked, got: $body",
+                    )
+                    assertFalse(body.contains("inactive_never_linked"), "Snake_case appState leaked: $body")
+                }
+            }
+        } finally {
+            // Restore the companion's default so later tests (which expect an
+            // unconfigured :memory: DB) are not affected by this test's temp file.
+            System.setProperty("database.path", ":memory:")
         }
     }
 

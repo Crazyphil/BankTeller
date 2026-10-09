@@ -380,12 +380,20 @@ fun Route.onboardingRoutes(
     // 5.11 — Get onboarding status
     get("/api/onboarding/status") {
         val response = service.getStatus()
-        call.respond(mapOf(
-            "enableBankingConfigured" to response.enableBankingConfigured,
-            "verified" to response.verified,
-            "active" to response.active,
-            "previouslyActive" to response.previouslyActive,
-        ))
+        call.respond(buildJsonObject {
+            put("enableBankingConfigured", response.enableBankingConfigured)
+            // Wire values are pinned by the delta spec (camelCase, design D6) —
+            // do NOT serialize the enum name (snake_case) here; the SPA matches
+            // these exact strings.
+            put("appState", when (response.appState) {
+                EbApplicationState.DELETED -> "deleted"
+                EbApplicationState.INACTIVE_NEVER_LINKED -> "inactiveNeverLinked"
+                EbApplicationState.INACTIVE_BUT_LINKED -> "inactiveButLinked"
+                EbApplicationState.ACTIVE -> "active"
+                null -> null
+            })
+            put("pendingAction", response.pendingAction)
+        })
     }
 
     // Reset Enable Banking credentials — clears the persisted application ID +

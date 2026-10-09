@@ -427,12 +427,12 @@ class ControlPlaneClientTest {
     // =====================================================================
 
     @Test
-    fun `getApplication returns active true when matching application is active`() = runBlocking {
+    fun `getApplication returns Ok with active true whitelist and pendingActionType when matching application is active`() = runBlocking {
         val engine = MockEngine { request ->
             assertEquals("https://enablebanking.com/api/applications", request.url.toString())
             assertEquals("Bearer my-id-token", request.headers["Authorization"])
             respond(
-                content = """[{"kid":"app-123","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""",
+                content = """[{"kid":"app-123","active":true,"pendingActionType":"unrestriction","whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""",
                 status = HttpStatusCode.OK,
                 headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
             )
@@ -440,15 +440,17 @@ class ControlPlaneClientTest {
         val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
         val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
         assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
-        assertEquals(true, (result as GetApplicationResult.Ok).active)
-        assertEquals(1, result.whitelistedAccounts.size)
-        assertEquals("Test Bank", result.whitelistedAccounts.first().aspsp?.name)
-        assertEquals("DE", result.whitelistedAccounts.first().aspsp?.country)
+        val ok = result as GetApplicationResult.Ok
+        assertEquals(true, ok.active)
+        assertEquals("unrestriction", ok.pendingActionType)
+        assertEquals(1, ok.whitelistedAccounts.size)
+        assertEquals("Test Bank", ok.whitelistedAccounts.first().aspsp?.name)
+        assertEquals("DE", ok.whitelistedAccounts.first().aspsp?.country)
         client.close()
     }
 
     @Test
-    fun `getApplication returns active false when application is inactive`() = runBlocking {
+    fun `getApplication returns Ok with active false empty whitelist and null pendingActionType when field is absent`() = runBlocking {
         val engine = MockEngine { request ->
             respond(
                 content = """[{"kid":"app-123","active":false}]""",
@@ -459,13 +461,15 @@ class ControlPlaneClientTest {
         val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
         val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
         assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
-        assertEquals(false, (result as GetApplicationResult.Ok).active)
-        assertTrue(result.whitelistedAccounts.isEmpty())
+        val ok = result as GetApplicationResult.Ok
+        assertEquals(false, ok.active)
+        assertTrue(ok.whitelistedAccounts.isEmpty())
+        assertNull(ok.pendingActionType)
         client.close()
     }
 
     @Test
-    fun `getApplication returns active false when applicationId does not match any entry`() = runBlocking {
+    fun `getApplication returns Deleted when applicationId does not match any entry`() = runBlocking {
         val engine = MockEngine { request ->
             respond(
                 content = """[{"kid":"other-app","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Other Bank","country":"FR"}}]}]""",
@@ -475,9 +479,39 @@ class ControlPlaneClientTest {
         }
         val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
         val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
-        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
-        assertEquals(false, (result as GetApplicationResult.Ok).active)
-        assertTrue(result.whitelistedAccounts.isEmpty())
+        assertTrue(result is GetApplicationResult.Deleted, "Expected Deleted but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getApplication returns Deleted when the list is empty`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Deleted, "Expected Deleted but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getApplication returns Error on non-200 with statusCode`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"error":{"message":"Forbidden"}}""",
+                status = HttpStatusCode.Forbidden,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Error, "Expected Error but got: $result")
+        assertEquals(403, (result as GetApplicationResult.Error).statusCode)
+        assertTrue(result.message.contains("Forbidden"))
         client.close()
     }
 
@@ -491,6 +525,59 @@ class ControlPlaneClientTest {
         assertTrue(result is GetApplicationResult.Error)
         assertNull((result as GetApplicationResult.Error).statusCode)
         assertTrue(result.message.contains("Broken pipe"))
+        client.close()
+    }
+
+    @Test
+    fun `getApplication unparseable 200 body returns Error not Deleted`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"not":"an array"}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Error, "Expected Error but got: $result")
+        assertNull((result as GetApplicationResult.Error).statusCode)
+        client.close()
+    }
+
+    @Test
+    fun `getApplication ignores extra unknown fields in list entries`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[
+                    {
+                        "kid":"app-extra",
+                        "active":true,
+                        "certificate":"cert-pem",
+                        "creator":{"name":"x"},
+                        "created":"2024-01-15T10:00:00Z",
+                        "redirect_urls":["https://app.example.com/cb"],
+                        "services":["AIS","PIS"],
+                        "privacy_url":"https://app.example.com/privacy",
+                        "terms_url":"https://app.example.com/terms",
+                        "gdpr_email":"admin@example.com",
+                        "pendingActionType":"activation",
+                        "whitelisted_accounts":[
+                            {"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"},"identification_hash":"h-1","title":"My IBAN","linker":"fb-user-1"}
+                        ]
+                    }
+                ]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-extra")
+        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
+        val ok = result as GetApplicationResult.Ok
+        assertEquals(true, ok.active)
+        assertEquals("activation", ok.pendingActionType)
+        assertEquals(1, ok.whitelistedAccounts.size)
+        assertEquals("Test Bank", ok.whitelistedAccounts.first().aspsp?.name)
         client.close()
     }
 

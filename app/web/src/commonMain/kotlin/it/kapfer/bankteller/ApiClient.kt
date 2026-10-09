@@ -141,10 +141,9 @@ open class ApiClient {
             if (response.status.value == 200) {
                 val body = response.bodyAsText()
                 val configured = extractJsonBool(body, "enableBankingConfigured") ?: false
-                val verified = extractJsonBool(body, "verified")
-                val active = extractJsonBool(body, "active")
-                val previouslyActive = extractJsonBool(body, "previouslyActive")
-                return OnboardingStatus(configured, verified, active, previouslyActive)
+                val appState = extractJsonStringOrNull(body, "appState")
+                val pendingAction = extractJsonStringOrNull(body, "pendingAction")
+                return OnboardingStatus(configured, appState, pendingAction)
             }
             return null
         } catch (_: Exception) {
@@ -606,9 +605,8 @@ open class ApiClient {
 /** Onboarding status returned by GET /api/onboarding/status. */
 data class OnboardingStatus(
     val enableBankingConfigured: Boolean,
-    val verified: Boolean?,
-    val active: Boolean?,
-    val previouslyActive: Boolean? = null,
+    val appState: String? = null,
+    val pendingAction: String? = null,
 )
 
 /** Result of starting the enable-banking flow. */

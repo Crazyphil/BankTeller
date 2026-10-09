@@ -125,6 +125,15 @@ class AppViewModel(
     var registrationInfoRedirectUrl by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * Non-blocking informational note about the Enable Banking application
+     * status, set by the login gate (change deleted-app-detection) and shown on
+     * the onboarding screen until dismissed. Never gates routing — it is
+     * purely advisory (e.g. app inactive but linked, or a pending action).
+     */
+    var onboardingStatusNote by mutableStateOf<String?>(null)
+        private set
+
     // ---------------------------------------------------------------
     // Account Linking & Auth state
     // ---------------------------------------------------------------
@@ -275,20 +284,27 @@ class AppViewModel(
      * Check the Enable Banking onboarding status and update [currentScreen]
      * and [onboardingStep] accordingly. Called after successful authentication.
      *
-     * Login gate (task 8.1, D4): [Screen.Onboarding] is ONLY set from here.
-     * The gate runs only at app load / fresh login; mid-wizard navigation
-     * stays client-side ([onboardingStep]).
+     * Login gate (task 8.1, D4; deleted-app-detection 3.1–3.4): [Screen.Onboarding]
+     * is ONLY set from here. The gate runs only at app load / fresh login;
+     * mid-wizard navigation stays client-side ([onboardingStep]).
      *
-     * - Not configured / not verified → Onboarding / EmailEntry
-     * - requires_relogin              → Onboarding / EmailEntry
-     * - App inactive + previously active (deleted app) → Onboarding / RegistrationReview
-     *   (credentials preserved, no email re-entry)
-     * - App inactive + never active (fresh PRODUCTION registration pending
-     *   control-panel activation) → Onboarding / ActivationGuide
+     * Gate evaluated in order, first match wins:
+     * - requires_relogin                          → Onboarding / EmailEntry (outranks everything)
+     * - appState == "deleted"                     → Onboarding / RegistrationReview
+     *   (credentials preserved via registration-info, no reset call)
+     * - appState == "inactiveNeverLinked"         → Onboarding / ActivationGuide
+     * - appState == "inactiveButLinked"           → normal whitelist/eb_sessions
+     *   routing (same as active) + a non-blocking status note
+     * - appState == "active" / unknown (null)     → normal whitelist/eb_sessions routing
+     *   (unknown degrades to the safest non-progressing route: previously
+     *   authorized → Dashboard; never authorized → BankSelection)
+     *
+     * Normal whitelist/eb_sessions routing mechanics (unchanged):
      * - auth_completed (≥1 eb_sessions row) → Dashboard. This is authoritative
      *   even when the whitelist fetch fails (D8): eb_sessions is local, so a
      *   previously-authorized user still lands on Dashboard during an EB
      *   outage. Expired/revoked consent does not regress (rows persist).
+     * - auth_failed → Onboarding / AuthProgress
      * - linking_completed but never authorized → Onboarding resuming at the
      *   bank list with the stored bank pre-selected (8.2 mechanics, now also
      *   reachable from the login gate) — onboarding counts as complete only
@@ -302,7 +318,7 @@ class AppViewModel(
             currentScreen = Screen.Dashboard
             return
         }
-        if (!status.enableBankingConfigured || (status.verified != null && !status.verified)) {
+        if (!status.enableBankingConfigured) {
             currentScreen = Screen.Onboarding
             onboardingStep = OnboardingStep.EmailEntry
             return
@@ -315,83 +331,159 @@ class AppViewModel(
             authErrorKind = state.authErrorKind
             authorizationId = state.authorizationId
             if (state.requiresRelogin) {
+                // Refresh token absent — full re-onboarding is required. Outranks
+                // every appState branch (deleted-app-detection 3.2).
                 currentScreen = Screen.Onboarding
                 onboardingStep = OnboardingStep.EmailEntry
-            } else if (status.active == false) {
-                // App inactive. Two distinct cases (D4):
-                // - previously active → the app was deleted on the EB control
-                //   panel; re-register with preserved credentials (RegistrationReview).
-                // - never active → a fresh PRODUCTION registration pending
-                //   activation; keep the user in the activation guide flow.
+            } else if (status.appState == "deleted") {
+                // App deleted on the EB control panel → re-register with the
+                // preserved credentials (RegistrationReview, pre-populated via
+                // the registration-info flow). No reset call — credentials kept.
                 currentScreen = Screen.Onboarding
-                if (status.previouslyActive == true) {
+                onboardingStep = OnboardingStep.RegistrationReview
+                loadRegistrationInfo()
+            } else if (status.appState == "inactiveNeverLinked") {
+                // Fresh PRODUCTION registration pending control-panel activation.
+                currentScreen = Screen.Onboarding
+                onboardingStep = OnboardingStep.ActivationGuide
+            } else if (status.appState == "inactiveButLinked") {
+                // Inactive but previously linked: keep the normal routing mechanics
+                // (same as active) and surface a non-blocking status note.
+                surfaceInactiveButLinkedNote()
+                routeByWhitelistAndSessions(state)
+            } else {
+                // appState == "active" or unknown (null / CP failure). Unknown
+                // degrades to the safest non-progressing route: the normal
+                // whitelist/eb_sessions logic already sends previously-authorized
+                // users to Dashboard and never-authorized users to BankSelection —
+                // no new failure routes. Non-null pendingAction on an active app
+                // carries an informational note (no gating).
+                surfacePendingActionNote(status)
+                routeByWhitelistAndSessions(state)
+            }
+        } else {
+            // State endpoint unreachable — fall back to status-only routing.
+            when (status.appState) {
+                "deleted" -> {
+                    currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.RegistrationReview
                     loadRegistrationInfo()
-                } else {
+                }
+                "inactiveNeverLinked" -> {
+                    currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.ActivationGuide
                 }
-            } else if (state.authCompleted) {
-                // Authorized at least once (≥1 eb_sessions row) → Dashboard.
-                // Authoritative even during an EB outage: the server derives
-                // auth_completed from the local eb_sessions table, so the state
-                // call succeeds with auth_completed=true while the whitelist
-                // fetch fails (linking_completed=false). Expired/revoked
-                // consent does not regress — rows persist across expiry.
-                currentScreen = Screen.Dashboard
-            } else if (state.authFailed) {
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.AuthProgress
-                val bank = state.selectedBank
-                if (bank != null) {
-                    selectedBankFromState = bank
-                    // AMENDED (D3, oracle F3): cold entry never adopts the
-                    // attempted psu_type — selected_bank.psu_type is null and
-                    // BankTeller never guesses between personal/business. The
-                    // type stays unknown/empty until the user re-confirms it
-                    // (resume card / bank list).
-                    selectedPsuType = ""
-                    enrichResumeSelection(bank)
+                "inactiveButLinked" -> {
+                    // Same-as-active fallback (whitelist routing is unavailable
+                    // without the state endpoint): Dashboard + non-blocking note.
+                    surfaceInactiveButLinkedNote()
+                    routeByStatusFallback()
                 }
-            } else if (state.linkingCompleted) {
-                // Linked but never authorized → resume at the resume card for
-                // the stored bank (8.2 mechanics, now also the login-gate route).
-                // Onboarding counts as complete only after the first successful authorization.
-                currentScreen = Screen.Onboarding
-                val bank = state.selectedBank
-                if (bank != null) {
-                    selectedBankFromState = bank
-                    resumeCardDismissed = false
-                    selectedPsuType = ""
-                    onboardingStep = OnboardingStep.BankSelection
-                    enrichResumeSelection(bank)
-                } else {
-                    // No usable selected_bank (e.g. whitelist entry without
-                    // aspsp name/country) → plain bank selection.
+                "active" -> {
+                    currentScreen = Screen.Dashboard
+                }
+                else -> {
+                    // Unknown app state → safest non-progressing route consistent
+                    // with current behavior: never-authorized users start at bank
+                    // selection. No false deleted, no EmailEntry mis-route.
+                    currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.BankSelection
                 }
+            }
+        }
+    }
+
+    /**
+     * Normal whitelist/eb_sessions routing (deleted-app-detection 3.2):
+     * appState is treated as active regardless of the actual value — callers
+     * that reach this route (active, unknown, or inactiveButLinked) all share
+     * the same mechanics:
+     * - auth_completed (≥1 eb_sessions row) → Dashboard
+     * - auth_failed → AuthProgress (failure display)
+     * - linking_completed but never authorized → resume card (BankSelection)
+     * - whitelist empty → plain BankSelection
+     */
+    private fun routeByWhitelistAndSessions(state: OnboardingState) {
+        if (state.authCompleted) {
+            // Authorized at least once (≥1 eb_sessions row) → Dashboard.
+            // Authoritative even during an EB outage: the server derives
+            // auth_completed from the local eb_sessions table, so the state
+            // call succeeds with auth_completed=true while the whitelist
+            // fetch fails (linking_completed=false). Expired/revoked
+            // consent does not regress — rows persist across expiry.
+            currentScreen = Screen.Dashboard
+        } else if (state.authFailed) {
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.AuthProgress
+            val bank = state.selectedBank
+            if (bank != null) {
+                selectedBankFromState = bank
+                // AMENDED (D3, oracle F3): cold entry never adopts the
+                // attempted psu_type — selected_bank.psu_type is null and
+                // BankTeller never guesses between personal/business. The
+                // type stays unknown/empty until the user re-confirms it
+                // (resume card / bank list).
+                selectedPsuType = ""
+                enrichResumeSelection(bank)
+            }
+        } else if (state.linkingCompleted) {
+            // Linked but never authorized → resume at the resume card for
+            // the stored bank (8.2 mechanics, now also the login-gate route).
+            // Onboarding counts as complete only after the first successful authorization.
+            currentScreen = Screen.Onboarding
+            val bank = state.selectedBank
+            if (bank != null) {
+                selectedBankFromState = bank
+                resumeCardDismissed = false
+                selectedPsuType = ""
+                onboardingStep = OnboardingStep.BankSelection
+                enrichResumeSelection(bank)
             } else {
-                // Whitelist empty + app active (or active unknown) → start
-                // onboarding at bank selection.
-                currentScreen = Screen.Onboarding
+                // No usable selected_bank (e.g. whitelist entry without
+                // aspsp name/country) → plain bank selection.
                 onboardingStep = OnboardingStep.BankSelection
             }
         } else {
-            // Fallback to status-only routing if state endpoint call returns null
-            if (status.active == true) {
-                currentScreen = Screen.Dashboard
-            } else if (status.active == false) {
-                currentScreen = Screen.Onboarding
-                if (status.previouslyActive == true) {
-                    onboardingStep = OnboardingStep.RegistrationReview
-                    loadRegistrationInfo()
-                } else {
-                    onboardingStep = OnboardingStep.ActivationGuide
-                }
-            } else {
-                // active unknown → bank selection as safe default
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.BankSelection
-            }
+            // Whitelist empty + app active (or active unknown) → start
+            // onboarding at bank selection.
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.BankSelection
+        }
+    }
+
+    /**
+     * Status-only fallback routing when the onboarding state endpoint is
+     * unreachable (deleted-app-detection 3.2): active (or unknown) →
+     * Dashboard, the safest non-blocking route.
+     */
+    private fun routeByStatusFallback() {
+        currentScreen = Screen.Dashboard
+    }
+
+    /**
+     * Surface the non-blocking "app inactive but linked" note when the gate
+     * routes on an [inactiveButLinked] app state (deleted-app-detection 3.3).
+     * Purely informational — never gates routing, never resets credentials.
+     */
+    private fun surfaceInactiveButLinkedNote() {
+        onboardingStatusNote = "Your Enable Banking application is currently inactive. " +
+            "Some banks may not respond until it is reactivated in the Enable Banking control panel."
+    }
+
+    /**
+     * Surface an informational note for a non-null [pendingAction] on an app
+     * that routes through the normal (active) path (deleted-app-detection 3.3):
+     * - "activation" → activation-pending note
+     * - any other pending action on an active app → restricted/free-tier note
+     * Advisory only — never gates routing.
+     */
+    private fun surfacePendingActionNote(status: OnboardingStatus) {
+        when (val action = status.pendingAction) {
+            null -> Unit
+            "activation" -> onboardingStatusNote =
+                "Your Enable Banking application is awaiting activation. Some banks may not respond until it is activated in the Enable Banking control panel."
+            else -> onboardingStatusNote =
+                "Your Enable Banking application is on a restricted plan. Some banks may not respond until it is upgraded in the Enable Banking control panel."
         }
     }
 
@@ -828,6 +920,14 @@ class AppViewModel(
      * will reintroduce a retry via stage_bank.
      */
 
+    /**
+     * Dismiss the non-blocking onboarding status note (deleted-app-detection 3.3).
+     * Advisory only — dismissing never changes routing or credentials.
+     */
+    fun dismissOnboardingStatusNote() {
+        onboardingStatusNote = null
+    }
+
     // ---------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------
@@ -842,6 +942,7 @@ class AppViewModel(
         onboardingResultActive = null
         registrationInfoEmail = null
         registrationInfoRedirectUrl = null
+        onboardingStatusNote = null
         aspspsState = AspspsState.Loading
         selectedAspsp = null
         selectedPsuType = "personal"

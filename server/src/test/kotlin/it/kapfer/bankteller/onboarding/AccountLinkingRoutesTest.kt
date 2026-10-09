@@ -1187,6 +1187,61 @@ class AccountLinkingRoutesTest {
         assertEquals(false, body["linked"]?.jsonPrimitive?.boolean)
     }
 
+    @Test
+    fun `6_12 link-status returns linked false not 502 when application is deleted and caches empty snapshot`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // A deleted application: its kid is absent from the control-plane
+        // application list (the positive deletion signal). GET /api/applications
+        // serves an empty list; count calls to prove the cached snapshot.
+        var applicationRequests = 0
+        val deletedEngine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") -> {
+                    applicationRequests++
+                    respond(
+                        content = """[]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(deletedEngine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // Deleted app → the CP call SUCCEEDED (200, empty list) so link-status
+        // must NOT 502: a deleted app has no linked accounts, linked=false.
+        val response = sessionClient.get("/api/onboarding/link-status")
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertEquals(false, body["linked"]?.jsonPrimitive?.boolean)
+        assertEquals(1, applicationRequests)
+
+        // The definitive empty snapshot is cached in the POSITIVE whitelist cache
+        // (not the failure cache) — a state read serves it without another CP call.
+        val stateJson = sessionClient.stateJson()
+        assertEquals(false, stateJson.bool("linking_completed"))
+        assertTrue(stateJson.isNull("selected_bank"))
+        assertEquals(1, applicationRequests, "State read must be served from the cached empty snapshot")
+    }
+
     // =====================================================================
     // Task 6.13 — GET /api/onboarding/state for each state
     // =====================================================================

@@ -131,6 +131,18 @@ fun OnboardingScreen(viewModel: AppViewModel) {
             )
         },
     ) {
+        // Non-blocking status note (deleted-app-detection 3.3): informational
+        // banner for inactive-but-linked apps or non-null pending actions.
+        // Advisory only — the wizard itself is unchanged; the note can be
+        // dismissed and never gates routing or resets credentials.
+        viewModel.onboardingStatusNote?.let { note ->
+            StatusNote(
+                text = note,
+                onDismiss = { viewModel.dismissOnboardingStatusNote() },
+            )
+            Spacer(modifier = Modifier.height(Dimens.sm))
+        }
+
         when (viewModel.onboardingStep) {
             OnboardingStep.EmailEntry -> EmailEntryStep(viewModel)
             OnboardingStep.WaitingForAuthentication -> WaitingStep(viewModel)
@@ -140,6 +152,49 @@ fun OnboardingScreen(viewModel: AppViewModel) {
             OnboardingStep.BankSelection -> BankSelectionStep(viewModel)
             OnboardingStep.LinkingProgress -> LinkingProgressStep(viewModel)
             OnboardingStep.AuthProgress -> AuthProgressStep(viewModel)
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// StatusNote (deleted-app-detection 3.3)
+// ---------------------------------------------------------------
+
+/**
+ * Non-blocking informational note about the Enable Banking application status
+ * (inactive-but-linked or a pending action). Dismissible, purely advisory:
+ * it never gates routing, never forces re-onboarding, and never resets
+ * credentials. Styled as a brass attention banner consistent with the
+ * wizard's existing DecisionBox treatment.
+ */
+@Composable
+private fun StatusNote(
+    text: String,
+    onDismiss: () -> Unit,
+) {
+    DecisionBox(
+        tint = LocalBankTellerColors.current.brass,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Warning,
+                contentDescription = null,
+                tint = LocalBankTellerColors.current.brass,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onDismiss) {
+                Text("Dismiss")
+            }
         }
     }
 }
