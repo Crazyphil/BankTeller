@@ -24,11 +24,11 @@ The system SHALL authenticate users against credentials defined in the `.env` fi
 - **THEN** the system compares `AUTH_PASSWORD` from `.env` against the stored bcrypt hash. If they don't match, the system SHALL log a warning and use the stored hash as the source of truth
 
 ### Requirement: Session management via httpOnly cookies
-The system SHALL issue httpOnly, SameSite=Strict cookies containing an HMAC-SHA256-signed session payload upon successful login. The `Secure` flag SHALL be set when the request is not from localhost. The session payload SHALL contain identity only (`username`) plus the one-shot `authError` field used for the auth-callback error handoff. The session cookie SHALL NOT carry onboarding progress (no `psuIdHash`, `aspspName`, `aspspCountry`, `psuType`, `ebSessionId`, `accountsJson`) — onboarding progress is derived server-side from the Enable Banking API and from the `eb_sessions` / `accounts` tables. The session serializer SHALL be pinned to kotlinx.serialization `Json { ignoreUnknownKeys = true }` so cookies issued before this change (still containing the removed fields) decode cleanly to `UserSession` defaults without forcing logout.
+The system SHALL issue httpOnly, SameSite=Strict cookies containing an HMAC-SHA256-signed session payload upon successful login. The `Secure` flag SHALL be set when the request is not from localhost. The session payload SHALL contain identity only (`username`) plus the authorization-failure diagnostics fields: `authError` (raw error detail — server-side diagnostics only, never rendered in the SPA), `authErrorKind` (the classified failure kind: `cancelled` / `technical` / `configuration` / `unexpected`), and `authorizationId` (the Enable Banking authorization ID of the current attempt, stored at `POST /api/auth`). **Clearing semantics differ by field:** `authError` and `authErrorKind` are one-shot — cleared at the start of every `POST /api/auth` call, cleared on auth-callback success (belt-and-suspenders), cleared by the cancel-linking endpoint, and cleared by the onboarding completion endpoint on application (re-)registration (a recorded failure refers to the defunct application and MUST NOT surface against the new one). `authorizationId` is attempt-scoped — it is NOT cleared with the one-shot fields (it must survive the failure display so the SPA can render it); it is overwritten on every successful `POST /api/auth` (it always refers to the current attempt only) and cleared by the onboarding completion endpoint on application (re-)registration together with the one-shot fields. The session cookie SHALL NOT carry onboarding progress (no `psuIdHash`, `aspspName`, `aspspCountry`, `psuType`, `ebSessionId`, `accountsJson`) — onboarding progress is derived server-side from the Enable Banking API and from the `eb_sessions` / `accounts` tables. The session serializer SHALL be pinned to kotlinx.serialization `Json { ignoreUnknownKeys = true }` so cookies issued before this change (still containing the removed fields, or lacking the new diagnostics fields) decode cleanly to `UserSession` defaults without forcing logout. **Legacy cookies are not imported:** the login handler performs no legacy-cookie import — the pre-slim-cookie format was never released, no legacy cookies exist in the wild, and the import (gated on `eb_sessions` emptiness) would re-import dead-application rows after the stale-session purge; it is removed entirely. An incoming legacy cookie is simply overwritten by the fresh slim cookie issued at login.
 
 #### Scenario: Cookie issued on login
 - **WHEN** a user successfully authenticates
-- **THEN** the system sets an httpOnly, SameSite=Strict cookie named `bankteller-session` whose payload contains only the username (and transient `authError`), and no onboarding-progress fields
+- **THEN** the system sets an httpOnly, SameSite=Strict cookie named `bankteller-session` whose payload contains only the username (and the transient authorization-failure diagnostics fields when a failure was recorded), and no onboarding-progress fields
 
 #### Scenario: Session validated on protected routes
 - **WHEN** a request arrives at a protected route with a valid session cookie
@@ -42,17 +42,15 @@ The system SHALL issue httpOnly, SameSite=Strict cookies containing an HMAC-SHA2
 - **WHEN** a cookie issued before this change (payload containing `psuIdHash`, `aspspName`, `ebSessionId`, `accountsJson`, …) is presented
 - **THEN** the session serializer (`Json { ignoreUnknownKeys = true }`) decodes it to `UserSession` defaults and the user is NOT forced to log out
 
-#### Scenario: Legacy cookie imported on first login
-- **WHEN** a user logs in successfully with an incoming cookie that still carries legacy progress fields (`ebSessionId`, `accountsJson`, `psuIdHash`, `aspsp*`, `psuType`) AND the `eb_sessions` table is empty
-- **THEN** the login handler imports the legacy state — one `eb_sessions` row (`session_id` = `ebSessionId`, `aspsp_name`/`aspsp_country`/`psu_type` from the old fields) plus `accounts` rows parsed from `accountsJson` (IBAN-based; `uid`/`currency`/`name` mapped 1:1) — inside the usual transaction semantics, and issues the slim identity-only cookie (legacy fields dropped). Any import error is logged and login still succeeds (best-effort, never a login blocker)
+#### Scenario: Authorization-failure fields are one-shot; authorization ID is attempt-scoped
+- **WHEN** an auth-failure callback records `authError`/`authErrorKind`/`authorizationId` and the user subsequently starts a new authorization attempt (`POST /api/auth`), completes one (auth-callback success), or aborts (cancel-linking)
+- **THEN** `authError` and `authErrorKind` are cleared from the session payload in all three cases; `authorizationId` is attempt-scoped — it is NOT cleared in any of them (it must survive the failure display so the SPA can render it) and is overwritten by the next successful `POST /api/auth` (it always refers to the current attempt)
+- **AND WHEN** the onboarding completion endpoint registers a new application (fresh or re-registration)
+- **THEN** all three fields are cleared — they refer to the defunct application
 
-#### Scenario: Legacy import is idempotent
-- **WHEN** a user logs in and the `eb_sessions` table is already non-empty
-- **THEN** no import runs — the legacy import only ever happens once per deployment
-
-#### Scenario: Legacy cookie without ebSessionId imports nothing
-- **WHEN** a user logs in with an incoming legacy cookie that carries no `ebSessionId` (linked but never authorized before this change)
-- **THEN** nothing is imported and login proceeds with the slim identity-only cookie; the login gate routes via the linked-but-never-authorized branch
+#### Scenario: Legacy cookie is not imported
+- **WHEN** a user logs in with an incoming cookie that still carries legacy progress fields (`ebSessionId`, `accountsJson`, `psuIdHash`, `aspsp*`, `psuType`)
+- **THEN** nothing is imported — no `eb_sessions`/`accounts` rows are created from cookie data; the login issues the slim identity-only cookie (legacy fields dropped), and the login gate routes purely on the server-derived state
 
 ### Requirement: Login rate limiting with proxy-aware IP resolution
 The system SHALL limit login attempts to 5 per client IP address per 15-minute sliding window. Failed attempts beyond this limit SHALL return HTTP 429 with a `Retry-After` header. The system SHALL use Ktor's `XForwardedHeader` plugin to resolve the actual client IP from `X-Forwarded-For` headers when a reverse proxy is present. Without a proxy, the direct request IP SHALL be used.
