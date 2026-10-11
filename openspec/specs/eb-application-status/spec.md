@@ -14,6 +14,8 @@ The system SHALL derive the Enable Banking application's lifecycle state exclusi
 
 The system SHALL additionally parse `pendingActionType` from the matched entry and expose it as informational status (`"activation"` → activation pending; any other non-null value on an active app → restricted/free-tier). `pendingActionType` SHALL NOT gate any routing or flow decision. `whitelisted_accounts` is absent (not an empty array) when no accounts have been linked; the parser SHALL treat absent as empty.
 
+The system SHALL additionally parse the `environment` field from the matched control-plane entry (`SANDBOX` / `PRODUCTION`) and expose it alongside the lifecycle state in the same cached derivation. The environment is server-derived state, never persisted configuration: no `system_config` key is written or read for it. Its only flow-level consumer is the onboarding route resolver's sandbox auto-activation rung (per the `onboarding-view-position` capability); a missing, blank, or unrecognized value resolves to null and the consumer treats null conservatively (never guessed as sandbox). A failed or unparseable control-plane lookup yields no environment at all (unknown state), consistent with the defensive-parsing requirement.
+
 The data-plane `GET /application` call SHALL NOT be used for state determination: a deleted application answers `200` with `active: false` indefinitely (empirically verified — no 401, no 404, no tombstone), making it permanently blind to deletion.
 
 #### Scenario: Active application
@@ -40,6 +42,13 @@ The data-plane `GET /application` call SHALL NOT be used for state determination
 - **WHEN** the matched entry carries `pendingActionType: "activation"` (or any non-null value)
 - **THEN** the state derivation is unaffected and the value is exposed as informational status only
 
+#### Scenario: Environment parsed and exposed alongside the lifecycle state
+- **WHEN** the matched control-plane entry carries `environment: "SANDBOX"` (or `"PRODUCTION"`)
+- **THEN** the derivation exposes the environment alongside the lifecycle state (same cached lookup, no extra control-plane call), available to the route resolver's sandbox rung
+
+#### Scenario: Missing or unrecognized environment resolves to null
+- **WHEN** the matched entry carries no `environment` field, a blank value, or a value other than `SANDBOX`/`PRODUCTION`
+- **THEN** the exposed environment is null and no consumer treats the application as sandbox — the resolver never guesses
 ### Requirement: Defensive parsing of the control-plane list
 The system SHALL parse the control-plane application list defensively: on an unexpected response shape (schema drift in the undocumented CP API), the state derivation SHALL report an unknown/unverified result — it SHALL NOT report `deleted`. A parse failure degrades to "status unknown", never to a false deletion positive.
 
