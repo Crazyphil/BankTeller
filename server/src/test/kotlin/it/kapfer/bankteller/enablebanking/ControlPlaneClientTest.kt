@@ -581,6 +581,85 @@ class ControlPlaneClientTest {
         client.close()
     }
 
+    @Test
+    fun `getApplication parses environment from the matched entry`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[{"kid":"app-123","active":true,"environment":"SANDBOX"}]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
+        assertEquals("SANDBOX", (result as GetApplicationResult.Ok).environment)
+        client.close()
+    }
+
+    @Test
+    fun `getApplication environment is null when the field is missing`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[{"kid":"app-123","active":true}]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
+        assertNull((result as GetApplicationResult.Ok).environment)
+        client.close()
+    }
+
+    @Test
+    fun `getApplication environment is null when the field is blank`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[{"kid":"app-123","active":true,"environment":"  "}]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
+        assertNull((result as GetApplicationResult.Ok).environment)
+        client.close()
+    }
+
+    @Test
+    fun `getApplication environment is null when the value is unrecognized`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[{"kid":"app-123","active":true,"environment":"WONDERLAND"}]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Ok, "Expected Ok but got: $result")
+        assertNull((result as GetApplicationResult.Ok).environment, "An unrecognized environment is never guessed")
+        client.close()
+    }
+
+    @Test
+    fun `getApplication environment stays null on unmatched application (Deleted carries no environment)`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """[{"kid":"other-app","active":true,"environment":"SANDBOX"}]""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getApplication(idToken = "my-id-token", applicationId = "app-123")
+        assertTrue(result is GetApplicationResult.Deleted, "Expected Deleted but got: $result")
+        client.close()
+    }
+
     // =====================================================================
     // Task 5.3 — linkAccounts form-data body + Bearer idToken
     // =====================================================================

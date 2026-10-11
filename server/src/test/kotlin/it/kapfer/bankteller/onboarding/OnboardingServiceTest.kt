@@ -229,6 +229,77 @@ class OnboardingServiceTest {
     }
 
     @Test
+    fun `getStatus carries the parsed environment through on a successful lookup`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":true,"environment":"SANDBOX","whitelisted_accounts":[]}]""" },
+        )
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        assertEquals("SANDBOX", service.getStatus().environment)
+    }
+
+    @Test
+    fun `getStatus reports null environment when the control-plane entry omits it`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val controlClient = statusControlClient(
+            db,
+            applicationJson = { """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]""" },
+        )
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        assertEquals(null, service.getStatus().environment)
+    }
+
+    @Test
+    fun `getStatus reports null environment when the lookup fails`() = runBlocking {
+        val db = createDatabase()
+        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
+        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """{"error":"boom"}""",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected status request: $url")
+            }
+        }
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = EnableBankingControlPlaneClient(HttpClient(engine), db),
+            enableBankingClientFactory = { error("not called") },
+        )
+
+        assertEquals(null, service.getStatus().environment, "A failed lookup carries no environment — never guessed")
+    }
+
+    @Test
     fun `getStatus returns unknown when refresh fails and never reports deleted`() = runBlocking {
         val db = createDatabase()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")

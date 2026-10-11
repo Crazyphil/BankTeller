@@ -87,7 +87,12 @@ sealed class GetApplicationResult {
      * @property whitelistedAccounts Entries from `whitelisted_accounts`; empty when the field is absent or null.
      * @property pendingActionType Informational EB control-plane action (e.g. "activation"); null when absent or null.
      */
-    data class Ok(val active: Boolean, val whitelistedAccounts: List<WhitelistedAccountEntry>, val pendingActionType: String?) : GetApplicationResult()
+    data class Ok(
+        val active: Boolean,
+        val whitelistedAccounts: List<WhitelistedAccountEntry>,
+        val pendingActionType: String?,
+        val environment: String? = null,
+    ) : GetApplicationResult()
 
     /** The application id is absent from the control-plane list — positive deletion signal. */
     data object Deleted : GetApplicationResult()
@@ -166,6 +171,8 @@ private data class ApplicationEntry(
     @SerialName("whitelisted_accounts")
     val whitelistedAccounts: List<WhitelistedAccountEntry>? = null,
     val pendingActionType: String? = null,
+    /** SANDBOX / PRODUCTION; null when the field is absent or blank (never guessed). */
+    val environment: String? = null,
 )
 
 @Serializable
@@ -515,6 +522,12 @@ class EnableBankingControlPlaneClient(
                         active = matching.active,
                         whitelistedAccounts = matching.whitelistedAccounts ?: emptyList(),
                         pendingActionType = matching.pendingActionType,
+                        // Missing/blank/unrecognized → null; the environment is
+                        // never guessed (an unrecognized value falls through
+                        // conservatively on the consumer side).
+                        environment = matching.environment?.takeIf {
+                            it == Environment.SANDBOX.name || it == Environment.PRODUCTION.name
+                        },
                     )
                 } else {
                     GetApplicationResult.Deleted

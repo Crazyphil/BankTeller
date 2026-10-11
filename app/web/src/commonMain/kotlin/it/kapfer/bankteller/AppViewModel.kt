@@ -174,6 +174,26 @@ class AppViewModel(
     var selectedBankFromState: SelectedBank? by mutableStateOf(null)
         private set
 
+    /**
+     * The stored in-flight bank triple (`stage_bank` from the state response —
+     * persist-onboarding-view-position). Unlike the whitelist-derived
+     * [selectedBankFromState] (whose psu_type is null), the stage triple
+     * carries the attempted psu_type. Keys the AuthProgress failure-state
+     * retry and the non-failure restore's fresh POST /api/auth (5.4).
+     */
+    var stageBankFromState: SelectedBank? by mutableStateOf(null)
+        private set
+
+    /**
+     * Server-derived set of already-linked banks (`linked_banks` from the
+     * state endpoint — whitelist-derived, not cookie data). Consumed by the
+     * bank-list selection routing (5.5): a selection whose {name, country}
+     * matches an entry skips LinkingProgress and continues directly to
+     * AuthProgress. Empty when unknown — the SPA never guesses a bank is linked.
+     */
+    var linkedBanks: List<LinkedBank> by mutableStateOf(emptyList())
+        private set
+
     var resumeCardDismissed: Boolean by mutableStateOf(false)
         private set
 
@@ -189,6 +209,27 @@ class AppViewModel(
 
     /** Non-null while the wait-for-authentication poll is active. */
     private var waitPollJob: Job? = null
+
+    /** Non-null while the registration-in-flight re-route poll is active (9.5). */
+    private var registrationProgressPollJob: Job? = null
+
+    /**
+     * The in-flight GET /api/aspsps job, if any (persist-onboarding-view-
+     * position D11). Shared by the user-triggered fetch ([loadAspsps]) and
+     * the resume-card background prefetch ([enrichResumeSelection]) so at
+     * most one catalog request is in flight at a time — a concurrent caller
+     * (e.g. the BankSelectionStep enter effect during a resume prefetch)
+     * joins the active fetch instead of firing a second one.
+     */
+    private var aspspsFetchJob: Job? = null
+
+    /**
+     * Whether ANY caller of the in-flight fetch requested the busy flag.
+     * The completing job clears [isLoading] when set — so a user-triggered
+     * [loadAspsps] joining a background prefetch still gets the flag
+     * lowered when the shared request completes.
+     */
+    private var aspspsFetchBusyRequested = false
 
     // ---------------------------------------------------------------
     // Actions — authentication
@@ -265,6 +306,8 @@ class AppViewModel(
     fun logout() {
         waitPollJob?.cancel()
         waitPollJob = null
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = null
         viewModelScope.launch {
             apiClient.logout()
             isAuthenticated = false
@@ -284,34 +327,84 @@ class AppViewModel(
      * Check the Enable Banking onboarding status and update [currentScreen]
      * and [onboardingStep] accordingly. Called after successful authentication.
      *
-     * Login gate (task 8.1, D4; deleted-app-detection 3.1–3.4): [Screen.Onboarding]
-     * is ONLY set from here. The gate runs only at app load / fresh login;
-     * mid-wizard navigation stays client-side ([onboardingStep]).
+     * persist-onboarding-view-position (5.2): the gate is a DUMB SWITCH over
+     * the server-resolved `route` field from GET /api/onboarding/state —
+     * whether onboarding takes place is exclusively a server concern; the
+     * SPA never re-derives the routing decision from the raw flags.
+     * [Screen.Onboarding] is ONLY set from here; the gate runs only at app
+     * load / fresh login (mid-wizard navigation stays client-side in
+     * [onboardingStep]).
      *
-     * Gate evaluated in order, first match wins:
-     * - requires_relogin                          → Onboarding / EmailEntry (outranks everything)
-     * - appState == "deleted"                     → Onboarding / RegistrationReview
-     *   (credentials preserved via registration-info, no reset call)
-     * - appState == "inactiveNeverLinked"         → Onboarding / ActivationGuide
-     * - appState == "inactiveButLinked"           → normal whitelist/eb_sessions
-     *   routing (same as active) + a non-blocking status note
-     * - appState == "active" / unknown (null)     → normal whitelist/eb_sessions routing
-     *   (unknown degrades to the safest non-progressing route: previously
-     *   authorized → Dashboard; never authorized → BankSelection)
+     * Route switch (first match is the server's job — the client just maps):
+     * - email_entry          → Onboarding / EmailEntry
+     * - registration_progress → Onboarding / Verifying (restored verifying UI
+     *                           with its polling — no submit form; D10)
+     * - registration_review  → Onboarding / RegistrationReview (pre-populated
+     *                           via the registration-info call)
+     * - activation_guide      → Onboarding / ActivationGuide
+     * - linking_progress     → Onboarding / LinkingProgress resume mode with stage_bank
+     * - auth_progress        → Onboarding / AuthProgress with stage_bank
+     *                           (failure display when auth_failed is also true)
+     * - bank_selection       → Onboarding / BankSelection (resume card when
+     *                           selected_bank is present — display concern)
+     * - dashboard            → Dashboard
      *
-     * Normal whitelist/eb_sessions routing mechanics (unchanged):
-     * - auth_completed (≥1 eb_sessions row) → Dashboard. This is authoritative
-     *   even when the whitelist fetch fails (D8): eb_sessions is local, so a
-     *   previously-authorized user still lands on Dashboard during an EB
-     *   outage. Expired/revoked consent does not regress (rows persist).
-     * - auth_failed → Onboarding / AuthProgress
-     * - linking_completed but never authorized → Onboarding resuming at the
-     *   bank list with the stored bank pre-selected (8.2 mechanics, now also
-     *   reachable from the login gate) — onboarding counts as complete only
-     *   after the first successful authorization.
-     * - Whitelist empty                → Onboarding / BankSelection
+     * Transitional fallback: when the response carries no `route` field (a
+     * server predating this change), the previous flag-based gate runs until
+     * the single-container deploy completes. A failed state call falls back
+     * to Dashboard ("cannot reach the server — don't block the user").
      */
     private suspend fun checkOnboardingStatus() {
+        val state = apiClient.getOnboardingState()
+        if (state == null) {
+            // Cannot reach the server — fall back to Dashboard to avoid blocking the user.
+            currentScreen = Screen.Dashboard
+            return
+        }
+        authError = state.authError
+        authFailed = state.authFailed
+        authErrorKind = state.authErrorKind
+        authorizationId = state.authorizationId
+        linkedBanks = state.linkedBanks
+
+        // Presentation-only notes (5.3): surfaced regardless of route.
+        if (state.appState == "inactiveButLinked") surfaceInactiveButLinkedNote()
+        surfacePendingActionNote(state.pendingAction)
+
+        val route = state.route
+        if (route != null) {
+            when (route) {
+                "email_entry" -> {
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.EmailEntry
+                }
+                "registration_progress" -> restoreRegistrationProgress()
+                "registration_review" -> {
+                    // App deleted on the EB control panel → re-register with the
+                    // preserved credentials (RegistrationReview, pre-populated via
+                    // the registration-info flow). No reset call — credentials kept.
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.RegistrationReview
+                    loadRegistrationInfo()
+                }
+                "activation_guide" -> {
+                    // Fresh PRODUCTION registration pending control-panel activation.
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.ActivationGuide
+                }
+                "linking_progress" -> restoreLinkingProgress(state)
+                "auth_progress" -> restoreAuthProgress(state)
+                "bank_selection" -> restoreBankSelection(state)
+                // "dashboard" and any unknown value: server said onboarding is
+                // complete (or an unrecognized future route) → don't block.
+                else -> currentScreen = Screen.Dashboard
+            }
+            return
+        }
+
+        // ----- Transitional fallback (server predating this change): -----
+        // flag-based gate consuming the raw state flags + the separate
+        // GET /api/onboarding/status call (appState + pending-action note).
         val status = apiClient.getOnboardingStatus()
         if (status == null) {
             // Cannot reach the server — fall back to Dashboard to avoid blocking the user.
@@ -323,71 +416,147 @@ class AppViewModel(
             onboardingStep = OnboardingStep.EmailEntry
             return
         }
-
-        val state = apiClient.getOnboardingState()
-        if (state != null) {
-            authError = state.authError
-            authFailed = state.authFailed
-            authErrorKind = state.authErrorKind
-            authorizationId = state.authorizationId
-            if (state.requiresRelogin) {
-                // Refresh token absent — full re-onboarding is required. Outranks
-                // every appState branch (deleted-app-detection 3.2).
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.EmailEntry
-            } else if (status.appState == "deleted") {
-                // App deleted on the EB control panel → re-register with the
-                // preserved credentials (RegistrationReview, pre-populated via
-                // the registration-info flow). No reset call — credentials kept.
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.RegistrationReview
-                loadRegistrationInfo()
-            } else if (status.appState == "inactiveNeverLinked") {
-                // Fresh PRODUCTION registration pending control-panel activation.
-                currentScreen = Screen.Onboarding
-                onboardingStep = OnboardingStep.ActivationGuide
-            } else if (status.appState == "inactiveButLinked") {
-                // Inactive but previously linked: keep the normal routing mechanics
-                // (same as active) and surface a non-blocking status note.
-                surfaceInactiveButLinkedNote()
-                routeByWhitelistAndSessions(state)
-            } else {
-                // appState == "active" or unknown (null / CP failure). Unknown
-                // degrades to the safest non-progressing route: the normal
-                // whitelist/eb_sessions logic already sends previously-authorized
-                // users to Dashboard and never-authorized users to BankSelection —
-                // no new failure routes. Non-null pendingAction on an active app
-                // carries an informational note (no gating).
-                surfacePendingActionNote(status)
-                routeByWhitelistAndSessions(state)
-            }
+        if (state.requiresRelogin) {
+            // Refresh token absent — full re-onboarding is required. Outranks
+            // every appState branch (deleted-app-detection 3.2).
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.EmailEntry
+        } else if (status.appState == "deleted") {
+            // App deleted on the EB control panel → re-register with the
+            // preserved credentials (RegistrationReview, pre-populated via
+            // the registration-info flow). No reset call — credentials kept.
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.RegistrationReview
+            loadRegistrationInfo()
+        } else if (status.appState == "inactiveNeverLinked") {
+            // Fresh PRODUCTION registration pending control-panel activation.
+            currentScreen = Screen.Onboarding
+            onboardingStep = OnboardingStep.ActivationGuide
         } else {
-            // State endpoint unreachable — fall back to status-only routing.
-            when (status.appState) {
-                "deleted" -> {
-                    currentScreen = Screen.Onboarding
-                    onboardingStep = OnboardingStep.RegistrationReview
-                    loadRegistrationInfo()
-                }
-                "inactiveNeverLinked" -> {
-                    currentScreen = Screen.Onboarding
-                    onboardingStep = OnboardingStep.ActivationGuide
-                }
-                "inactiveButLinked" -> {
-                    // Same-as-active fallback (whitelist routing is unavailable
-                    // without the state endpoint): Dashboard + non-blocking note.
-                    surfaceInactiveButLinkedNote()
-                    routeByStatusFallback()
-                }
-                "active" -> {
-                    currentScreen = Screen.Dashboard
-                }
-                else -> {
-                    // Unknown app state → safest non-progressing route consistent
-                    // with current behavior: never-authorized users start at bank
-                    // selection. No false deleted, no EmailEntry mis-route.
-                    currentScreen = Screen.Onboarding
-                    onboardingStep = OnboardingStep.BankSelection
+            // appState == "inactiveButLinked" / "active" / unknown (null / CP
+            // failure): normal whitelist/eb_sessions routing. Unknown degrades
+            // to the safest non-progressing route: the normal logic already
+            // sends previously-authorized users to Dashboard and
+            // never-authorized users to BankSelection — no new failure routes.
+            if (status.appState == "inactiveButLinked") surfaceInactiveButLinkedNote()
+            surfacePendingActionNote(status.pendingAction)
+            routeByWhitelistAndSessions(state)
+        }
+    }
+
+    /**
+     * Route `linking_progress` restore (5.3): LinkingProgress in resume mode
+     * with the stored bank triple — the user explicitly started a link and a
+     * refresh must not bounce them to ActivationGuide or the resume card.
+     * No server call is auto-started on cold entry.
+     */
+    private fun restoreLinkingProgress(state: OnboardingState) {
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.LinkingProgress
+        val bank = state.stageBank
+        if (bank != null) {
+            // Feed the existing resume machinery: selectedBankFromState drives
+            // isResumeMode (resume-mode UI, "Re-open linking page" via
+            // relinkAccount(), "I've completed linking" via checkLinkStatus()).
+            selectedBankFromState = bank
+            stageBankFromState = bank
+            resumeCardDismissed = false
+            // The stage triple carries the attempted psu_type — adopt it so
+            // the resume actions (relink/checkLinkStatus) target the right
+            // account type. Blank triple → keep the type unknown (never guess).
+            selectedPsuType = bank.psuType.orEmpty()
+            enrichResumeSelection(bank)
+        }
+    }
+
+    /**
+     * Route `auth_progress` restore (5.3): AuthProgress with the stored bank
+     * triple — cold entry (no in-memory authRedirectUrl). The failure display
+     * renders when auth_failed is also true (display-before-clear preserved —
+     * the SPA never auto-POSTs /api/auth on cold entry); in the non-failure
+     * restore the "Continue to your bank" action initiates a fresh
+     * POST /api/auth with the stored triple when CLICKED (user-initiated).
+     */
+    private fun restoreAuthProgress(state: OnboardingState) {
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.AuthProgress
+        val bank = state.stageBank
+        if (bank != null) {
+            // The stage bank triple feeds the same SelectedBank shape the
+            // resume card uses; retryAuth() reads it for the fresh POST /api/auth.
+            selectedBankFromState = bank
+            stageBankFromState = bank
+            selectedPsuType = bank.psuType.orEmpty()
+            enrichResumeSelection(bank)
+        }
+    }
+
+    /**
+     * Route `bank_selection` restore (5.3): the bank list. The resume card
+     * for the server-derived selected_bank shows only when NO stored
+     * `bank_selection` stage exists (display concern, not a route): the
+     * stage is written solely by deliberate full-list touchpoints
+     * (cancel-linking, ActivationGuide start, resume-card dismissal), so
+     * its presence means the user intentionally left the card behind —
+     * restore a plain full list. A stored stage therefore suppresses the
+     * card; a null stage with selected_bank present (fresh-session resume
+     * aid) shows it as before. Explicitly resets any stage-derived
+     * selection state so a fresh bank-list entry starts clean.
+     */
+    private fun restoreBankSelection(state: OnboardingState) {
+        currentScreen = Screen.Onboarding
+        val bank = state.selectedBank
+        if (bank != null && state.onboardingStage != "bank_selection") {
+            selectedBankFromState = bank
+            resumeCardDismissed = false
+            selectedPsuType = ""
+            onboardingStep = OnboardingStep.BankSelection
+            enrichResumeSelection(bank)
+        } else {
+            onboardingStep = OnboardingStep.BankSelection
+        }
+    }
+
+    /**
+     * Route `registration_progress` restore (9.5, D10): the registration
+     * task is running server-side — restore the existing "Verifying…" step
+     * (the same UI shown right after submitting the registration form) and
+     * keep polling the state endpoint. NO submit form is offered, so a
+     * confused refresh cannot re-submit and create a duplicate application.
+     *
+     * When the task terminates the marker clears server-side (finally
+     * semantics); the next poll observes a different `route` and re-routes
+     * through the same dumb switch ([checkOnboardingStatus]) — no second
+     * refresh needed.
+     */
+    private fun restoreRegistrationProgress() {
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.Verifying
+        onboardingIsVerifying = true
+        startRegistrationProgressPoll()
+    }
+
+    /**
+     * Poll GET /api/onboarding/state while the registration-in-flight marker
+     * resolves `registration_progress`; on any other route, cancel the poll
+     * and re-run the gate so the remaining rungs route the user on.
+     * A failed state call keeps polling (transient network error) — the
+     * marker is volatile server-side, so the route re-appears on retry.
+     */
+    private fun startRegistrationProgressPoll() {
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = viewModelScope.launch {
+            while (true) {
+                // Same cadence as the wait-for-authentication poll.
+                delay(1500L)
+                val state = apiClient.getOnboardingState()
+                if (state != null && state.route != "registration_progress") {
+                    registrationProgressPollJob = null
+                    // The verifying presentation is over — the task terminated
+                    // and the gate re-routes per the remaining rungs.
+                    onboardingIsVerifying = false
+                    checkOnboardingStatus()
+                    break
                 }
             }
         }
@@ -452,17 +621,10 @@ class AppViewModel(
     }
 
     /**
-     * Status-only fallback routing when the onboarding state endpoint is
-     * unreachable (deleted-app-detection 3.2): active (or unknown) →
-     * Dashboard, the safest non-blocking route.
-     */
-    private fun routeByStatusFallback() {
-        currentScreen = Screen.Dashboard
-    }
-
-    /**
-     * Surface the non-blocking "app inactive but linked" note when the gate
-     * routes on an [inactiveButLinked] app state (deleted-app-detection 3.3).
+     * Surface the non-blocking "app inactive but linked" note when the
+     * application state is [inactiveButLinked] (deleted-app-detection 3.3;
+     * persist-onboarding-view-position 5.3: driven by the state response's
+     * re-exported `app_state` field, regardless of route).
      * Purely informational — never gates routing, never resets credentials.
      */
     private fun surfaceInactiveButLinkedNote() {
@@ -471,14 +633,17 @@ class AppViewModel(
     }
 
     /**
-     * Surface an informational note for a non-null [pendingAction] on an app
-     * that routes through the normal (active) path (deleted-app-detection 3.3):
+     * Surface an informational note for a non-null [pendingAction]
+     * (deleted-app-detection 3.3; persist-onboarding-view-position 5.3: the
+     * dumb-switch gate consumes the state response's re-exported
+     * `pending_action` field — the separate GET /api/onboarding/status call
+     * is made only on the transitional fallback path):
      * - "activation" → activation-pending note
-     * - any other pending action on an active app → restricted/free-tier note
+     * - any other pending action → restricted/free-tier note
      * Advisory only — never gates routing.
      */
-    private fun surfacePendingActionNote(status: OnboardingStatus) {
-        when (val action = status.pendingAction) {
+    private fun surfacePendingActionNote(pendingAction: String?) {
+        when (pendingAction) {
             null -> Unit
             "activation" -> onboardingStatusNote =
                 "Your Enable Banking application is awaiting activation. Some banks may not respond until it is activated in the Enable Banking control panel."
@@ -494,14 +659,17 @@ class AppViewModel(
      * persisted state — callers set [selectedPsuType] (empty on gate routes) before
      * calling, since the server no longer reports a psu_type (BankTeller never
      * guesses between personal/business).
+     *
+     * D11: the catalog fetch is a background prefetch, not a user action — it
+     * does NOT set [isLoading] (a prefetch must not gate the app's action
+     * buttons via LocalActionBusy) and it dedups through the shared
+     * [aspspsFetchJob] so the BankSelectionStep enter effect joining the
+     * in-flight fetch does not fire a second request.
      */
     private fun enrichResumeSelection(bank: SelectedBank) {
+        fetchAspsps(markBusy = false)
         viewModelScope.launch {
-            val result = apiClient.getAspsps()
-            aspspsState = when (result) {
-                is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
-                is AspspsResult.Error -> AspspsState.Error(result.message)
-            }
+            aspspsFetchJob?.join()
             val match = (aspspsState as? AspspsState.Loaded)?.aspsps
                 ?.firstOrNull { it.name == bank.aspspName && it.country == bank.aspspCountry }
             val aspsp = match ?: Aspssp(
@@ -582,6 +750,8 @@ class AppViewModel(
     fun cancelOnboarding() {
         waitPollJob?.cancel()
         waitPollJob = null
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = null
         resetOnboardingState()
         onboardingStep = OnboardingStep.EmailEntry
     }
@@ -595,6 +765,8 @@ class AppViewModel(
     fun resetOnboarding() {
         waitPollJob?.cancel()
         waitPollJob = null
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = null
         isLoading = true
         viewModelScope.launch {
             apiClient.resetOnboardingCredentials()
@@ -694,21 +866,63 @@ class AppViewModel(
 
     fun startBankSetup() {
         onboardingStep = OnboardingStep.BankSelection
+        // Persist the view position (stage `bank_selection`) so an F5 on the
+        // bank list restores it instead of bouncing back to the ActivationGuide
+        // (the resolver's inactiveNeverLinked rung). The cancel-linking
+        // endpoint is the spec's touchpoint for "user deliberately at the bank
+        // list" — its contract covers this forward transition too (no linking
+        // state exists yet from ActivationGuide, so the extra clears are
+        // no-ops). Fire-and-forget: the local step flip is the UI truth, the
+        // cookie write just survives a refresh.
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+        }
         // Don't call loadAspsps() here — the BankSelectionStep composable's
         // LaunchedEffect loads when it enters composition (if state is Loading).
         // Calling it here too would fire two concurrent requests.
     }
 
     fun loadAspsps() {
+        fetchAspsps(markBusy = true)
+    }
+
+    /**
+     * Shared GET /api/aspsps (D11): dedups concurrent callers through
+     * [aspspsFetchJob] — only the first caller starts the request; later
+     * callers (e.g. the BankSelectionStep enter effect while a resume-card
+     * prefetch is in flight) join it. [markBusy] true raises [isLoading]
+     * for this caller's fetch (user-triggered [loadAspsps]); false leaves
+     * the busy flag untouched (background prefetch — a prefetch is not a
+     * user action and must not gate action buttons). The fetched list
+     * always populates [aspspsState] so all consumers observe the result.
+     */
+    private fun fetchAspsps(markBusy: Boolean) {
+        aspspsFetchJob?.let { job ->
+            if (job.isActive) {
+                // Join the in-flight fetch instead of firing a second
+                // request. A user-triggered join still raises (and, via
+                // the shared requested flag, later lowers) the busy flag.
+                if (markBusy) {
+                    aspspsFetchBusyRequested = true
+                    isLoading = true
+                }
+                return
+            }
+        }
         aspspsState = AspspsState.Loading
-        isLoading = true
-        viewModelScope.launch {
+        aspspsFetchBusyRequested = markBusy
+        if (markBusy) isLoading = true
+        aspspsFetchJob = viewModelScope.launch {
             val result = apiClient.getAspsps()
             aspspsState = when (result) {
                 is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
                 is AspspsResult.Error -> AspspsState.Error(result.message)
             }
-            isLoading = false
+            aspspsFetchJob = null
+            if (aspspsFetchBusyRequested) {
+                aspspsFetchBusyRequested = false
+                isLoading = false
+            }
         }
     }
 
@@ -729,12 +943,28 @@ class AppViewModel(
     /**
      * Abandon the resume card and revert to standard full bank selection.
      * Restores default PSU type ("personal") and clears any preselected ASPSP.
+     * The dismissal persists: the cancel-linking POST fires fire-and-forget
+     * (stage `bank_selection`), so the card stays suppressed across F5. A
+     * failed POST does not break the dismiss — the residual (dismissal lost
+     * during a server outage) is accepted per spec.
      */
     fun dismissResumeCard() {
         resumeCardDismissed = true
         selectedAspsp = null
         selectedPsuType = "personal"
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+        }
     }
+
+    /**
+     * persist-onboarding-view-position 5.5 (skip-linking): whether the bank
+     * selection is already linked per the server-derived `linked_banks` set
+     * (whitelist-derived — the SPA never guesses). Matching on {name, country}
+     * only: the whitelist carries no psu_type.
+     */
+    fun isBankLinked(bank: Aspssp): Boolean =
+        linkedBanks.any { it.aspspName == bank.name && it.aspspCountry == bank.country }
 
     fun linkAccounts() {
         val aspsp = selectedAspsp ?: run {
@@ -743,6 +973,15 @@ class AppViewModel(
         }
         if (selectedPsuType.isEmpty()) {
             linkError = "Confirm your account type to continue"
+            return
+        }
+        // Already-linked bank selected from the plain bank list → skip the
+        // LinkingProgress step and continue directly to authorization via the
+        // existing resume-card path (PSU type confirmed on the selected-bank
+        // card as usual). Not-linked / unknown (empty linked_banks) keeps the
+        // link-first path below.
+        if (isBankLinked(aspsp)) {
+            continueResumeWithBank()
             return
         }
         isLoading = true
@@ -808,6 +1047,7 @@ class AppViewModel(
             linkError = null
             linkStatusChecking = false
             selectedBankFromState = null
+            stageBankFromState = null
             resumeCardDismissed = false
             selectedAspsp = null
             selectedPsuType = "personal"
@@ -911,14 +1151,38 @@ class AppViewModel(
     }
 
     /**
-     * Retry authorization is NOT offered in the failure state (transitional,
-     * D3/oracle F3): on cold entry the attempted psu_type is unknown
-     * (selected_bank.psu_type is null), so a fresh POST /api/auth cannot target
-     * the right account type. The path forward is "Choose a different bank"
-     * (cancelLinking → bank list), where the resume card/bank chips re-confirm
-     * the account type. The parallel persist-onboarding-view-position change
-     * will reintroduce a retry via stage_bank.
+     * Re-introduced by persist-onboarding-view-position (5.4; the function was
+     * removed by the archived handle-authorization-failure change, whose
+     * removal-site kdoc above documented exactly this re-introduction): the
+     * failure-state retry ("Continue to your bank"). Offered whenever the
+     * attempted bank triple (including psu_type) is known — the stage bank
+     * stored at POST /api/auth restores it on cold entry, which the
+     * whitelist-derived selected_bank cannot know (it carries no psu_type and
+     * BankTeller never guesses between personal/business).
+     *
+     * Fires a fresh POST /api/auth with the stored bank triple — the same
+     * path the non-failure auth_progress restore uses when clicked. No bank
+     * re-selection, no new link attempt.
      */
+    fun retryAuth() {
+        // Prefer the stored stage bank triple (attempted at POST /api/auth);
+        // fall back to the in-session selection from the bank list.
+        val bank = stageBankFromState
+            ?: selectedAspsp?.let {
+                SelectedBank(aspspName = it.name, aspspCountry = it.country, psuType = selectedPsuType)
+            } ?: run {
+                linkError = "Bank information missing."
+                return
+            }
+        // The stored triple may carry a blank psu_type (pre-change cookie /
+        // unconfirmed selection) — BankTeller never guesses; no retry without
+        // an explicit account type.
+        if (bank.psuType.isNullOrBlank()) {
+            linkError = "Confirm your account type to continue"
+            return
+        }
+        startAuth(bank.aspspName, bank.aspspCountry, bank.psuType)
+    }
 
     /**
      * Dismiss the non-blocking onboarding status note (deleted-app-detection 3.3).
@@ -956,6 +1220,8 @@ class AppViewModel(
         authErrorKind = null
         authorizationId = null
         selectedBankFromState = null
+        stageBankFromState = null
+        linkedBanks = emptyList()
         authRedirectUrl = null
     }
 
@@ -970,6 +1236,8 @@ class AppViewModel(
     fun dispose() {
         waitPollJob?.cancel()
         waitPollJob = null
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = null
         viewModelScope.cancel()
     }
 }

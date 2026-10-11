@@ -27,6 +27,24 @@ import kotlinx.serialization.Serializable
  *   most recent `POST /api/auth` (the only key into EB's control-panel request
  *   logs for diagnosing a failed authorization). Overwritten on every new
  *   attempt; null when no attempt has been made.
+ * @property onboardingStage The onboarding view-position stage — one of
+ *   `linking_progress`, `auth_progress`, or `bank_selection` (see
+ *   `OnboardingStage`). Ephemeral flow-control data, NEVER progress
+ *   authority: it records where in the wizard the user is standing so a page
+ *   refresh within a session restores the exact screen; all completed-progress
+ *   flags remain derived server-side from EB state and `eb_sessions`. Written
+ *   at the link-accounts / auth / cancel-linking touchpoints; cleared at
+ *   auth-callback success, application (re-)registration, and login (fresh
+ *   cookie). Null when no stage is stored.
+ * @property stageAspspName The in-flight bank name of the stored stage
+ *   (from the touchpoint request's bank selection). Cleared together with
+ *   [onboardingStage]; null for the `bank_selection` stage (no bank in
+ *   flight) and when no stage is stored.
+ * @property stageAspspCountry The in-flight bank country of the stored
+ *   stage. Cleared together with [onboardingStage].
+ * @property stagePsuType The in-flight bank psu_type (`personal` /
+ *   `business`) of the stored stage. Cleared together with
+ *   [onboardingStage].
  */
 @Serializable
 data class UserSession(
@@ -34,6 +52,10 @@ data class UserSession(
     val authError: String? = null,
     val authErrorKind: String? = null,
     val authorizationId: String? = null,
+    val onboardingStage: String? = null,
+    val stageAspspName: String? = null,
+    val stageAspspCountry: String? = null,
+    val stagePsuType: String? = null,
 )
 
 @Serializable

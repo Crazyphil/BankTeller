@@ -788,7 +788,13 @@ private fun BankLogo(bank: Aspssp, modifier: Modifier = Modifier) {
 @Composable
 private fun BankSelectionStep(viewModel: AppViewModel) {
     LaunchedEffect(Unit) {
-        if (viewModel.aspspsState is AspspsState.Loading) {
+        // D11: on the resume-card path the gate's background prefetch already
+        // fetched (or is fetching) the catalog — the enter effect must not
+        // fire a second request, and it must not raise the busy flag
+        // (LocalActionBusy would disable the card's Continue button while
+        // the prefetch is still in flight). The plain full-list path keeps
+        // its fetch-on-enter behavior with its current busy semantics.
+        if (viewModel.aspspsState is AspspsState.Loading && !viewModel.isResumeMode) {
             viewModel.loadAspsps()
         }
     }
@@ -1394,8 +1400,9 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
         progress = { WizardProgressIndicator(currentStep = 7, totalSteps = 8) },
         // D7: back affordance once authorization has started — "Choose a
         // different bank" aborts via the cancel-linking flow (clears the
-        // one-shot authError and returns to the bank list). In the failure
-        // state it is the ONLY path forward (see forward slot below).
+        // one-shot authError and returns to the bank list). In the
+        // transitional no-stage-bank failure state it is the ONLY path
+        // forward (see forward slot below).
         onBack = { viewModel.cancelLinking() },
         backLabel = "Choose a different bank",
         backServerAction = true, // POST cancel-linking — disable while in flight
@@ -1405,13 +1412,23 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
             // automatically; once the redirect URL arrives, the domain
             // condition (authRedirectUrl != null) enables it.
             //
-            // Failure state (D3, transitional): the direct retry is NOT
-            // offered — the attempted psu_type is unknown on cold entry
-            // (selected_bank.psu_type is null) and BankTeller never guesses.
-            // The forward slot renders nothing; "Choose a different bank"
-            // (back slot) is the path forward, and the resume card re-confirms
-            // the account type explicitly.
-            if (!authFailed) {
+            // persist-onboarding-view-position 5.4: the "Continue to your bank"
+            // retry is re-surfaced in the failure state whenever the attempted
+            // bank triple (stage_bank, incl. psu_type) is known — retryAuth()
+            // fires a fresh POST /api/auth with the attempted type. Transitional
+            // fallback (no stage bank stored — pre-change cookie): the forward
+            // slot renders nothing; "Choose a different bank" (back slot) is the
+            // path forward, and the resume card re-confirms the account type.
+            val retryBank = viewModel.stageBankFromState
+            val retryPsuType = retryBank?.psuType
+            if (authFailed) {
+                if (retryBank != null && !retryPsuType.isNullOrBlank()) {
+                    ActionButton(
+                        onClick = { viewModel.retryAuth() },
+                        label = "Continue to your bank",
+                    )
+                }
+            } else if (authRedirectUrl != null) {
                 ActionButton(
                     onClick = {
                         authRedirectUrl?.let {
@@ -1420,7 +1437,15 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
                         }
                     },
                     label = "Continue to your bank",
-                    enabled = authRedirectUrl != null,
+                )
+            } else if (retryBank != null && !retryPsuType.isNullOrBlank()) {
+                // Non-failure stage restore (route auth_progress, no in-memory
+                // authRedirectUrl on cold boot): the click initiates a fresh
+                // POST /api/auth with the stored bank triple (user-initiated —
+                // the no-auto-start rule is not violated).
+                ActionButton(
+                    onClick = { viewModel.retryAuth() },
+                    label = "Continue to your bank",
                 )
             }
         },

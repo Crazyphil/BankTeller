@@ -184,7 +184,7 @@ fun Application.module(
     routing {
         // Onboarding routes (registered first so they are matched before the catch-all)
         onboardingRoutes(database, onboardingService, cpClient, ebClientFactory, stateJwt)
-        accountLinkingRoutes(database, cpClient, ebClientFactory, stateJwt)
+        accountLinkingRoutes(database, cpClient, ebClientFactory, stateJwt, onboardingService)
 
         // API routes
         post("/api/login") {

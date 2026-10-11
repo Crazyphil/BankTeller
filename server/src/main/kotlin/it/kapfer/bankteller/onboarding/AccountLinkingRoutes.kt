@@ -13,6 +13,7 @@ import it.kapfer.bankteller.enablebanking.Access
 import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
+import it.kapfer.bankteller.enablebanking.Environment
 import it.kapfer.bankteller.enablebanking.GetApplicationResult
 import it.kapfer.bankteller.enablebanking.IdTokenRefreshResult
 import it.kapfer.bankteller.enablebanking.LinkAccountsResult
@@ -148,12 +149,18 @@ data class AuthRequest(
  * state). All routes live under `/api/` and are protected by the SessionAuth
  * plugin; the explicit session reads below bind flow state to the caller's
  * session.
+ *
+ * The link-accounts / auth / cancel-linking routes also write the onboarding
+ * view position (stage + in-flight bank triple) to the session cookie
+ * (spec: onboarding-view-position) — ephemeral flow-control data, never
+ * progress authority; `GET /api/onboarding/state` resolves and reports it.
  */
 fun Route.accountLinkingRoutes(
     database: BankTellerDatabase,
     controlPlaneClient: EnableBankingControlPlaneClient,
     enableBankingClientFactory: () -> EnableBankingClient,
     stateJwt: StateJwt,
+    onboardingService: OnboardingService,
 ) {
     val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
@@ -273,6 +280,23 @@ fun Route.accountLinkingRoutes(
                 // /api/onboarding/state read fetches fresh data.
                 whitelistCache.invalidate("whitelist")
                 whitelistFailureCache.invalidate("whitelist")
+                // The first successful link also flips the application state
+                // from inactiveNeverLinked to inactiveButLinked — invalidate
+                // the 30 s application-status cache too (design risk: two-cache
+                // incoherence; combined invalidation mirrors registration).
+                onboardingService.invalidateStatusCache()
+                // Write the onboarding view position (spec: onboarding-view-position):
+                // the user is now on the linking step. Overwrites any prior
+                // stage (e.g. a stale auth_progress — the old authorization
+                // position is obsolete).
+                call.sessions.set(
+                    session.copy(
+                        onboardingStage = OnboardingStage.LINKING_PROGRESS,
+                        stageAspspName = request.aspsp_name,
+                        stageAspspCountry = request.country,
+                        stagePsuType = request.psu_type,
+                    ),
+                )
                 call.respond(buildJsonObject {
                     put("authorization_url", result.authorizationUrl)
                     put("psu_id_hash", result.psuIdHash)
@@ -352,7 +376,18 @@ fun Route.accountLinkingRoutes(
                     // into EB's control-panel request logs for diagnosing a
                     // failed authorization (design D2). Overwritten on every new
                     // attempt; it always refers to the current attempt only.
-                    call.sessions.set(cleanSession.copy(authorizationId = result.authorizationId))
+                    // Also write the onboarding view position (spec:
+                    // onboarding-view-position): the user is now on the
+                    // authorization step with this bank triple.
+                    call.sessions.set(
+                        cleanSession.copy(
+                            authorizationId = result.authorizationId,
+                            onboardingStage = OnboardingStage.AUTH_PROGRESS,
+                            stageAspspName = request.aspsp_name,
+                            stageAspspCountry = request.aspsp_country,
+                            stagePsuType = request.psu_type,
+                        ),
+                    )
                     call.respond(buildJsonObject {
                         put("url", result.url)
                         put("authorization_id", result.authorizationId)
@@ -419,7 +454,8 @@ fun Route.accountLinkingRoutes(
     }
 
     // -----------------------------------------------------------------------
-    // 6.5 — Onboarding state (routing flags + display-only fields, D10)
+    // 6.5 — Onboarding state (routing flags + display-only fields, D10;
+    // server-resolved route + view position per onboarding-view-position)
     // -----------------------------------------------------------------------
     get("/api/onboarding/state") {
         val session = call.sessions.get<UserSession>()
@@ -427,6 +463,8 @@ fun Route.accountLinkingRoutes(
 
         val refreshToken = database.systemConfigQueries
             .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val applicationId = database.systemConfigQueries
+            .selectValue("enable_banking_application_id").executeAsOneOrNull()
 
         // Cached whitelist read (60 s positive / 10 s failure TTL). On error treat
         // as null — conservative: linking_completed=false, selected_bank=null.
@@ -466,12 +504,84 @@ fun Route.accountLinkingRoutes(
                 }
             } ?: kotlinx.serialization.json.JsonNull
 
+        // Server-derived linked-bank set for the skip-linking check (spec:
+        // onboarding — D8): the deduplicated {name, country} pairs from the
+        // whitelist entries, the same source selected_bank uses. Empty when
+        // the whitelist is empty or its fetch failed (unknown state — the SPA
+        // never guesses a bank is linked).
+        val linkedBanks = JsonArray(
+            whitelist?.entries.orEmpty()
+                .mapNotNull { it.aspsp }
+                .mapNotNull { aspsp ->
+                    val name = aspsp.name ?: return@mapNotNull null
+                    val country = aspsp.country ?: return@mapNotNull null
+                    name to country
+                }
+                .distinct()
+                .map { (name, country) ->
+                    buildJsonObject {
+                        put("aspsp_name", name)
+                        put("aspsp_country", country)
+                    }
+                },
+        )
+
         val authCompleted = ebSessionStore.hasAnySession()
         val authError = session.authError
         // auth_failed: an auth error is only meaningful once linking completed
         // and auth has NOT yet completed (design D3). Before linking, or after
         // a successful auth, the error is stale/irrelevant.
         val authFailed = authError != null && linkingCompleted && !authCompleted
+
+        // Cached control-plane application-state derivation (30 s TTL) — the
+        // same source the resolver consumes. enableBankingConfigured=false or a
+        // failed lookup yield appState=null: unknown, NEVER deleted (a failed
+        // lookup must not masquerade as a deletion).
+        val status = onboardingService.getStatus()
+        val appState = when (status.appState) {
+            EbApplicationState.DELETED -> "deleted"
+            EbApplicationState.INACTIVE_NEVER_LINKED -> "inactiveNeverLinked"
+            EbApplicationState.INACTIVE_BUT_LINKED -> "inactiveButLinked"
+            EbApplicationState.ACTIVE -> "active"
+            null -> null
+        }
+
+        // The stored view position (spec: onboarding-view-position) — reported
+        // for presentation within the restored screen; routing itself is
+        // resolved server-side below. stage_bank requires a non-blank triple
+        // (bank_selection carries none by design).
+        val stageBankKnown =
+            !session.stageAspspName.isNullOrBlank() && !session.stageAspspCountry.isNullOrBlank()
+        val stageBank = if (session.onboardingStage != null && stageBankKnown) {
+            buildJsonObject {
+                put("aspsp_name", session.stageAspspName)
+                put("aspsp_country", session.stageAspspCountry)
+                put("psu_type", session.stagePsuType)
+            }
+        } else {
+            kotlinx.serialization.json.JsonNull
+        }
+
+        // The single routing decision (design D3/D5) — resolved here, consumed
+        // by the SPA gate as a dumb switch. The sandbox input (design D9) is
+        // resolved from the cached status derivation; a missing or
+        // unrecognized value is never guessed as sandbox. The
+        // registration-in-progress input (design D10) is the service's volatile
+        // in-memory marker.
+        val route = resolveOnboardingRoute(
+            OnboardingRouteInput(
+                registrationInProgress = onboardingService.isRegistrationInProgress(),
+                requiresRelogin = refreshToken.isNullOrBlank(),
+                applicationIdPresent = !applicationId.isNullOrBlank(),
+                appState = status.appState,
+                linkingCompleted = linkingCompleted,
+                authCompleted = authCompleted,
+                authFailed = authFailed,
+                onboardingStage = session.onboardingStage,
+                stageBankKnown = stageBankKnown,
+                sandboxEnvironment = status.environment == Environment.SANDBOX.name,
+            ),
+        )
 
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
@@ -482,17 +592,36 @@ fun Route.accountLinkingRoutes(
             put("authorization_id", session.authorizationId)
             put("auth_failed", authFailed)
             put("selected_bank", selectedBank)
+            put("route", route)
+            put("app_state", appState)
+            put("pending_action", status.pendingAction)
+            put("onboarding_stage", session.onboardingStage)
+            put("stage_bank", stageBank)
+            put("linked_banks", linkedBanks)
         })
     }
 
     // Cancel account linking — clears the one-shot auth_error so the user can
     // return to the bank list and start over with a different bank. Linking
     // progress itself is server-side (whitelist + eb_sessions), so nothing else
-    // needs clearing here.
+    // needs clearing here. The onboarding view position is written as stage
+    // `bank_selection` with the bank triple cleared (spec:
+    // onboarding-view-position): the user deliberately returned to the bank
+    // list, and a refresh there must restore the bank list, not bounce them
+    // elsewhere.
     post("/api/onboarding/cancel-linking") {
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
-        call.sessions.set(session.copy(authError = null, authErrorKind = null))
+        call.sessions.set(
+            session.copy(
+                authError = null,
+                authErrorKind = null,
+                onboardingStage = OnboardingStage.BANK_SELECTION,
+                stageAspspName = null,
+                stageAspspCountry = null,
+                stagePsuType = null,
+            ),
+        )
         call.respond(mapOf("success" to true))
     }
 }

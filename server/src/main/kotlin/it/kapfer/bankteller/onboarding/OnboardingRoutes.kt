@@ -140,7 +140,21 @@ fun Route.onboardingRoutes(
                                         EbSessionStore.MergedAccount(it.iban, it.uid, it.currency, it.name)
                                     },
                                 )
-                                call.sessions.set(session.copy(authError = null, authErrorKind = null))
+                                call.sessions.set(
+                                    session.copy(
+                                        authError = null,
+                                        authErrorKind = null,
+                                        // Clear the view position too (spec:
+                                        // onboarding-view-position): authorization
+                                        // completed — the next natural position is
+                                        // the Dashboard, and a stale stage must
+                                        // never fabricate progress.
+                                        onboardingStage = null,
+                                        stageAspspName = null,
+                                        stageAspspCountry = null,
+                                        stagePsuType = null,
+                                    ),
+                                )
                             } catch (e: Exception) {
                                 logger.warn("Failed to persist EB session ${result.sessionId}", e)
                                 call.sessions.set(session.copy(
@@ -303,7 +317,21 @@ fun Route.onboardingRoutes(
                 // Design D8: a recorded authorization failure / authorization ID
                 // refers to the defunct application — clear the one-shot
                 // diagnostics fields so they cannot surface against the new app.
-                call.sessions.set(session.copy(authError = null, authErrorKind = null, authorizationId = null))
+                // The stored onboarding view position is cleared for the same
+                // reason (spec: onboarding-view-position): it refers to the
+                // defunct application's flow and must not route the user past
+                // ActivationGuide into the new application's onboarding.
+                call.sessions.set(
+                    session.copy(
+                        authError = null,
+                        authErrorKind = null,
+                        authorizationId = null,
+                        onboardingStage = null,
+                        stageAspspName = null,
+                        stageAspspCountry = null,
+                        stagePsuType = null,
+                    ),
+                )
                 call.respond(
                     buildJsonObject {
                         put("success", true)
@@ -372,6 +400,19 @@ fun Route.onboardingRoutes(
                     put("success", false)
                     put("error", result.message)
                     put("retryable", true)
+                },
+            )
+            is CompleteResult.RegistrationInProgress -> call.respond(
+                // Design D10 concurrent-call guard: a second completion call
+                // while the registration task is in flight. Structured error
+                // in the file's existing style — the SPA shows it on the
+                // registration form; no registration steps ran, so no
+                // duplicate application can be created.
+                HttpStatusCode.Conflict,
+                buildJsonObject {
+                    put("success", false)
+                    put("error", "Registration is already in progress. Please wait for it to finish.")
+                    put("retryable", false)
                 },
             )
         }

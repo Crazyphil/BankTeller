@@ -18,6 +18,7 @@ import it.kapfer.bankteller.util.TtlCache
 import org.slf4j.LoggerFactory
 import java.security.SecureRandom
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicBoolean
 
 // ---------------------------------------------------------------------------
 // Top-level helpers
@@ -95,6 +96,13 @@ data class OnboardingStatusResponse(
     val appState: EbApplicationState? = null,
     /** Informational only (from the control-plane `pendingActionType`); never gates routing. */
     val pendingAction: String? = null,
+    /**
+     * Registration environment parsed from the matched control-plane entry
+     * (`SANDBOX` / `PRODUCTION`); null on any failed/incomplete lookup (an
+     * unknown state carries no environment — it is never guessed). Consumed by
+     * the route resolver's sandbox rung via the state endpoint.
+     */
+    val environment: String? = null,
 )
 
 /**
@@ -146,6 +154,14 @@ sealed class CompleteResult {
      * the SPA as a 400 with `retryable: true` — NOT a 500.
      */
     data class ReregisterError(val message: String) : CompleteResult()
+
+    /**
+     * A registration task is already in flight (design D10 concurrent-call
+     * guard): the completion endpoint was called again while the marker was
+     * set. No registration steps ran — no duplicate application can be
+     * created.
+     */
+    data object RegistrationInProgress : CompleteResult()
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +185,23 @@ class OnboardingService(
      * must not leak memory forever.
      */
     private val contexts = mutableMapOf<String, ContextEntry>()
+
+    /**
+     * Volatile in-memory registration-in-flight marker (design D10): set for
+     * the duration of the completion endpoint's registration task, cleared in
+     * a `finally` block on every termination path (success, retryable failure,
+     * non-retryable failure, exception). Never persisted and never a session
+     * field — the server *knows* the task is running (same JVM), and the
+     * marker dies with the JVM, so a restart mid-registration leaves no stale
+     * marker trapping the user on a verifying step. Doubles as the
+     * concurrent-call guard: a second completion call while the marker is set
+     * is rejected ([CompleteResult.RegistrationInProgress]) without running
+     * any registration steps.
+     */
+    private val registrationInProgress = AtomicBoolean(false)
+
+    /** True while the completion endpoint's registration task is running (design D10). */
+    fun isRegistrationInProgress(): Boolean = registrationInProgress.get()
 
     /** Wrapper pairing a context with its creation time for TTL expiry. */
     private class ContextEntry(
@@ -255,6 +288,7 @@ class OnboardingService(
                         enableBankingConfigured = true,
                         appState = appState,
                         pendingAction = result.pendingActionType,
+                        environment = result.environment,
                     )
                 }
                 is GetApplicationResult.Deleted -> OnboardingStatusResponse(
@@ -401,6 +435,31 @@ class OnboardingService(
         environment: Environment,
         redirectUrl: String,
         productionOverrides: ProductionFieldOverrides? = null,
+    ): CompleteResult {
+        // Concurrent-call guard (design D10): the registration task runs for a
+        // few seconds; a second completion call while it is in flight is
+        // rejected without running any registration steps — the duplicate-
+        // registration hazard is eliminated at the API level, not just via
+        // routing. CAS so only one caller ever proceeds.
+        if (!registrationInProgress.compareAndSet(false, true)) {
+            return CompleteResult.RegistrationInProgress
+        }
+        try {
+            return completeOnboardingLocked(state, ownerUsername, environment, redirectUrl, productionOverrides)
+        } finally {
+            // The marker is cleared on EVERY termination path — success,
+            // retryable failure, non-retryable failure, exception — so the
+            // resolver's top rung stops firing as soon as the task ends.
+            registrationInProgress.set(false)
+        }
+    }
+
+    private suspend fun completeOnboardingLocked(
+        state: String,
+        ownerUsername: String,
+        environment: Environment,
+        redirectUrl: String,
+        productionOverrides: ProductionFieldOverrides?,
     ): CompleteResult {
         // --- Re-registration mode: no in-memory context exists ---
         // The login gate routes an inactive/deleted app directly to

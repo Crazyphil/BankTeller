@@ -295,6 +295,28 @@ open class ApiClient {
                         SelectedBank(aspspName = name, aspspCountry = country, psuType = psuType)
                     } else null
                 }
+
+                // persist-onboarding-view-position 5.1: server-resolved route +
+                // re-exported application-state fields + stored view position +
+                // linked-bank set. All nullable/defaulted so a server predating
+                // the change (fields absent) keeps the old SPA contract intact.
+                val route = extractJsonStringOrNull(body, "route")
+                val appState = extractJsonStringOrNull(body, "app_state")
+                val pendingAction = extractJsonStringOrNull(body, "pending_action")
+                val onboardingStage = extractJsonStringOrNull(body, "onboarding_stage")
+                val stageBankObj = extractJsonObject(body, "stage_bank")
+                val stageBank = stageBankObj?.let {
+                    val name = extractJsonString(it, "aspsp_name")
+                    val country = extractJsonString(it, "aspsp_country")
+                    // Unlike selected_bank, the stage triple carries the real
+                    // attempted psu_type (written at POST /api/auth).
+                    val psuType = extractJsonStringOrNull(it, "psu_type")
+                    if (name.isNotEmpty() && country.isNotEmpty()) {
+                        SelectedBank(aspspName = name, aspspCountry = country, psuType = psuType)
+                    } else null
+                }
+                val linkedBanks = parseLinkedBanks(body)
+
                 return OnboardingState(
                     requiresRelogin = requiresRelogin,
                     linkingCompleted = linkingCompleted,
@@ -304,6 +326,12 @@ open class ApiClient {
                     authFailed = authFailed,
                     authErrorKind = authErrorKind,
                     authorizationId = authorizationId,
+                    route = route,
+                    appState = appState,
+                    pendingAction = pendingAction,
+                    onboardingStage = onboardingStage,
+                    stageBank = stageBank,
+                    linkedBanks = linkedBanks,
                 )
             }
             return null
@@ -392,6 +420,61 @@ open class ApiClient {
         } catch (_: Exception) {
             return null
         }
+    }
+
+    /**
+     * Parses the `linked_banks` array of `{aspsp_name, aspsp_country}` objects
+     * from the onboarding state response. Empty when the field is absent, the
+     * whitelist is empty, or its fetch failed (unknown state — the SPA never
+     * guesses a bank is linked).
+     */
+    private fun parseLinkedBanks(json: String): List<LinkedBank> {
+        val key = "\"linked_banks\":"
+        val start = json.indexOf(key)
+        if (start < 0) return emptyList()
+        val remainder = json.substring(start + key.length).trimStart()
+        if (!remainder.startsWith("[")) return emptyList()
+
+        val result = mutableListOf<LinkedBank>()
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        var objectStart = -1
+        val arrayEnd = remainder.indexOf(']')
+        if (arrayEnd < 0) return emptyList()
+        val arrayContent = remainder.substring(0, arrayEnd + 1)
+
+        for (i in arrayContent.indices) {
+            val c = arrayContent[i]
+            if (inString) {
+                if (isEscaped) {
+                    isEscaped = false
+                } else if (c == '\\') {
+                    isEscaped = true
+                } else if (c == '"') {
+                    inString = false
+                }
+            } else {
+                if (c == '"') {
+                    inString = true
+                } else if (c == '{') {
+                    if (depth == 0) objectStart = i
+                    depth++
+                } else if (c == '}') {
+                    depth--
+                    if (depth == 0 && objectStart != -1) {
+                        val objJson = arrayContent.substring(objectStart, i + 1)
+                        val name = extractJsonString(objJson, "aspsp_name")
+                        val country = extractJsonString(objJson, "aspsp_country")
+                        if (name.isNotEmpty() && country.isNotEmpty()) {
+                            result.add(LinkedBank(aspspName = name, aspspCountry = country))
+                        }
+                        objectStart = -1
+                    }
+                }
+            }
+        }
+        return result
     }
 
     private fun extractJsonStringOrNull(json: String, field: String): String? {
@@ -655,6 +738,18 @@ data class OnboardingState(
     val authFailed: Boolean = false,
     val authErrorKind: String? = null,
     val authorizationId: String? = null,
+    /** Server-resolved onboarding route (persist-onboarding-view-position); null on a server predating the change. */
+    val route: String? = null,
+    /** Re-exported control-plane application state (`deleted`/`inactiveNeverLinked`/`inactiveButLinked`/`active`, or null). */
+    val appState: String? = null,
+    /** Re-exported pending-action type (per the eb-application-status capability), or null. */
+    val pendingAction: String? = null,
+    /** Stored onboarding view-position stage (`linking_progress`/`auth_progress`/`bank_selection`), or null. */
+    val onboardingStage: String? = null,
+    /** Stored in-flight bank triple for the current stage (includes the attempted psu_type), or null. */
+    val stageBank: SelectedBank? = null,
+    /** Deduplicated `{aspsp_name, aspsp_country}` pairs derived from the whitelist; empty when unknown. */
+    val linkedBanks: List<LinkedBank> = emptyList(),
 )
 
 /**
@@ -667,6 +762,17 @@ data class SelectedBank(
     val aspspName: String,
     val aspspCountry: String,
     val psuType: String?
+)
+
+/**
+ * A `{aspsp_name, aspsp_country}` pair from the state endpoint's
+ * `linked_banks` array — server-derived linked-bank truth (the whitelist),
+ * used for the bank-list skip-linking match. The match keys on name AND
+ * country only (the whitelist carries no psu_type).
+ */
+data class LinkedBank(
+    val aspspName: String,
+    val aspspCountry: String,
 )
 
 /** ASPSP bank information. */
