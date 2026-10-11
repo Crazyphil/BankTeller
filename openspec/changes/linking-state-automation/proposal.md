@@ -1,0 +1,33 @@
+## Why
+
+The LinkingProgress onboarding step requires the user to click "I've completed linking" at exactly the right moment — after the external Enable Banking (EB) linking process has finished, but the user has no way to know when that is. Users click too early (while still on their bank's success page) or too late (after logging into the EB control panel, which is not required for the process to finish). EB's own AIS web app tracks the linking session's state via an (undocumented) session-status endpoint; BankTeller can poll the same endpoint server-side and advance the step automatically, removing the timing burden from the user entirely.
+
+## What Changes
+
+- **Server-side linking session status polling**: a new Enable Banking client method calls `GET https://tilisy.enablebanking.com/ais/get_session_status` with only a `sessionid` cookie (verified: no query params, referer, or browser UA required; the `current_uri` parameter is cosmetic). The sessionid is parsed from the `?sessionid=` query parameter of the `authorization_url` that `POST /api/link-accounts` already returns — no new EB handshake needed.
+- **Sessionid storage**: the linking sessionid is stored alongside the existing `linking_progress` view-position stage data (session cookie, ephemeral), so a cold-boot refresh mid-linking resumes polling.
+- **New poll endpoint**: an authenticated SPA-facing endpoint reports the linking session state (`waiting` / `done` / `unconfirmed` / `cancelled` / `failed` / `unavailable`), running ONE whitelist confirmation check (existing link-status logic, forceRefresh) only after the poll reports the terminal done state.
+- **Minimal status interpretation over a closed vocabulary**: only the three terminal statuses are acted on — `AuthDone` (done), `Cancelled` (cancelled), and `Invalid` (failed — EB's server-side failure terminal status, discovered by reverse-engineering the Tilisy AIS frontend bundle, which dispatches statuses via dynamic method lookup so the vocabulary is exactly its set of `handle*` methods). Every other status *value* (e.g. `NotReady`, `AuthStarted`, `WaitingUserUIAuth`, `WaitingUserDecoupledAuth`, `BankUI`, `ReturnedFromBank`, `WaitingUserDataSharingConsent`, or unknown values) is treated as `waiting`. A missing or unparseable `status` field is treated as an error (→ `unavailable`, the manual fallback) — response-shape drift is not an unknown value.
+- **Failure states mirror the auth error kinds**: `Cancelled` maps to the auth flow's `cancelled` kind (the raw EB response carries `error=access_denied` — the same OAuth code as the auth callback's user cancellation), `Invalid` maps to the `technical` kind (server-side failure, user did nothing wrong) — each renders kind-specific copy in a failure panel mirroring the AuthProgress failure-panel pattern, with a "Try linking again" action.
+- **No automatic retry on mismatch**: if the done state is reported but the whitelist check returns `linked: false`, the manual check button is shown immediately (today's fallback) — surfacing a wrong assumption loudly instead of papering over it.
+- **SPA LinkingProgress rework** (per designer consultation): a calm auto-advancing waiting experience modeled on the email-link waiting screen — live spinner, no forward button while polling is healthy, "Re-open linking page" link always present (accidental tab-close recovery), failure panels mirroring the auth-failure pattern with kind-specific copy (`cancelled` and `technical` kinds) and a "Try linking again" action, and silent degradation to today's static manual-button screen whenever polling is unavailable (endpoint change, `INVALID_SESSION`, network failure). No poll cap — the page waits indefinitely, consistent with the email-link waiting phase.
+- **Copy constraint**: the waiting screen makes no claims about closing the tab or returning later — mid-linking state is not recoverable after session expiry (it is server-side indistinguishable from "bank selected"), so such promises would break user expectations.
+
+## Capabilities
+
+### New Capabilities
+
+- `linking-session-polling`: Server-side polling of the EB AIS session-status endpoint during account linking — the client method, the sessionid source and storage, the SPA-facing poll endpoint with its state interpretation (done → single whitelist confirm; cancelled/failed → terminal failure states with auth-flow-mirroring error kinds; everything else → `waiting`; errors → unavailable), and the fallback-first degradation contract.
+
+### Modified Capabilities
+
+- `onboarding`: The SPA LinkingProgress step requirement changes from a static manual-check screen to an auto-polling waiting screen (six UI states: waiting, auto-advance, done-but-unconfirmed fallback, cancelled panel, failed panel, degraded manual fallback); the `POST /api/link-accounts` endpoint requirement gains sessionid parsing from the returned `authorization_url`.
+- `enable-banking-client`: New client method for the EB AIS `get_session_status` endpoint (cookie-authenticated GET, distinct error contract: HTTP 400 `INVALID_SESSION` for invalid/expired sessionid).
+- `onboarding-view-position`: The `linking_progress` stage data gains the EB AIS sessionid field (ephemeral view-position data, overwritten on every new link attempt, cleared with the stage).
+
+## Impact
+
+- **Server**: `EnableBankingControlPlaneClient.kt` (or a dedicated client) — new session-status method; `AccountLinkingRoutes.kt` — sessionid parsing in `POST /api/link-accounts`, new poll route; session cookie DTO — extended stage data.
+- **SPA**: `AppViewModel.kt` — polling loop, state machine, auto-advance; `OnboardingScreen.kt` — LinkingProgress step rework per the design consultation.
+- **External dependency risk**: the polled endpoint is undocumented (internal to EB's AIS web app, same class as the already-used undocumented control-plane API). Mitigated by design: any poll failure degrades to the current manual UX, never worse. The poll URL's host is derived from the returned `authorization_url` rather than hardcoded, hedging against the visible `tilisy.enablebanking.com` → `auth.enablebanking.com` host migration.
+- **No breaking changes**: the manual check button and `GET /api/onboarding/link-status` endpoint remain as the fallback path; no existing API contract is removed.
