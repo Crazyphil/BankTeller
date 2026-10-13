@@ -122,6 +122,38 @@ sealed class AspspStatusResult {
     data class Error(val message: String) : AspspStatusResult()
 }
 
+/**
+ * Result of [EnableBankingControlPlaneClient.getAisSessionStatus] — the EB AIS
+ * linking session-status lookup (spec: enable-banking-client, design D1/D3).
+ *
+ * The function NEVER throws — failures are surfaced as
+ * [AisSessionStatusResult.Error]. Only three terminal statuses are ever
+ * interpreted by the caller (`AuthDone`, `Cancelled`, `Invalid`); every other
+ * value is an intermediate (the vocabulary is closed by reverse-engineering —
+ * design D4).
+ */
+sealed class AisSessionStatusResult {
+    /** HTTP 200 with a parseable `{"response":{"status": ...}}` body. */
+    data class Ok(val status: String) : AisSessionStatusResult()
+
+    sealed class Error : AisSessionStatusResult() {
+        /**
+         * HTTP 400 with `{"detail":{"code":"INVALID_SESSION"}}` — the sessionid
+         * is invalid/expired. The expected end-of-life signal, NOT a transient
+         * failure (spec: enable-banking-client scenario "Invalid or expired
+         * sessionid").
+         */
+        data object InvalidSession : Error()
+
+        /**
+         * Network failure, unexpected non-200, unparseable body, or a 200 whose
+         * `status` field is missing/unparseable — response-shape drift is an
+         * error, not an unknown value (design D4).
+         */
+        data class Generic(val message: String) : Error()
+    }
+}
+
 // --- Response DTOs ---
 
 @Serializable
@@ -213,6 +245,33 @@ private data class TodayStatsEntry(
 @Serializable
 private data class GitErrorDetail(
     val message: String? = null,
+)
+
+/**
+ * EB AIS `GET /ais/get_session_status` success response shape:
+ * `{"response":{"status": <string>}}`. The `status` field is nullable so a
+ * missing/unparseable value is distinguishable from a parseable one (design D4:
+ * shape drift is an error, not an unknown value).
+ */
+@Serializable
+private data class AisSessionStatusResponse(
+    val response: AisSessionStatusResponseBody? = null,
+)
+
+@Serializable
+private data class AisSessionStatusResponseBody(
+    val status: String? = null,
+)
+
+/** EB AIS error response shape: `{"detail":{"code":"INVALID_SESSION"}}`. */
+@Serializable
+private data class AisSessionStatusErrorResponse(
+    val detail: AisSessionStatusErrorDetail? = null,
+)
+
+@Serializable
+private data class AisSessionStatusErrorDetail(
+    val code: String? = null,
 )
 
 private val json = Json { ignoreUnknownKeys = true }
@@ -459,6 +518,69 @@ class EnableBankingControlPlaneClient(
         } catch (e: Exception) {
             logger.warn("linkAccounts failed", e)
             LinkAccountsResult.Error(statusCode = null, message = e.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * EB AIS linking session-status lookup — `GET <baseUrl>/ais/get_session_status`
+     * (spec: enable-banking-client, design D1/D3).
+     *
+     * The request is authenticated SOLELY by a `Cookie: sessionid=<sessionId>`
+     * header — no query parameters, no Referer, no browser User-Agent, no JWT or
+     * idToken (verified by live probe: the endpoint accepts a minimal server-side
+     * request; the `current_uri` query parameter is cosmetic). The `baseUrl`
+     * (scheme + host of the linking `authorization_url`, persisted at link time —
+     * spec: onboarding-view-position) is caller-supplied — the host is NEVER
+     * hardcoded because EB is visibly migrating the AIS host
+     * (`tilisy.enablebanking.com` → `auth.enablebanking.com`); only the path
+     * `/ais/get_session_status` is pinned.
+     *
+     * The response is parsed as `{"response":{"status": <string>}}`; a missing
+     * or unparseable `status` field is an [AisSessionStatusResult.Error.Generic] —
+     * response-shape drift is an error, not an unknown value (design D4).
+     *
+     * The sessionid is a capability token — it is NEVER written to any log line
+     * (design D1, spec: linking-sessionid privacy). It never enters the request
+     * URL (it travels only in the Cookie header), so no exception message can
+     * carry it either.
+     */
+    suspend fun getAisSessionStatus(sessionId: String, baseUrl: String): AisSessionStatusResult {
+        return try {
+            val response = client.get("$baseUrl/ais/get_session_status") {
+                header(HttpHeaders.Cookie, "sessionid=$sessionId")
+            }
+            val body = response.bodyAsText()
+            if (response.status == HttpStatusCode.OK) {
+                val parsed = try {
+                    json.decodeFromString<AisSessionStatusResponse>(body)
+                } catch (_: Exception) {
+                    return AisSessionStatusResult.Error.Generic(
+                        "AIS session status response unparseable (HTTP ${response.status.value})",
+                    )
+                }
+                val status = parsed.response?.status
+                if (status.isNullOrBlank()) {
+                    // Response-shape drift — an error, never an unknown value (D4).
+                    AisSessionStatusResult.Error.Generic(
+                        "AIS session status response missing status field",
+                    )
+                } else {
+                    AisSessionStatusResult.Ok(status)
+                }
+            } else if (response.status.value == 400 && isInvalidSessionError(body)) {
+                AisSessionStatusResult.Error.InvalidSession
+            } else {
+                AisSessionStatusResult.Error.Generic(
+                    "AIS session status lookup failed (HTTP ${response.status.value})",
+                )
+            }
+        } catch (e: Exception) {
+            // Network/transport failure. The sessionid never enters the request
+            // URL (it travels only in the Cookie header), so the exception
+            // message cannot contain it — and the method never logs the
+            // sessionid itself (design D1).
+            logger.warn("getAisSessionStatus failed", e)
+            AisSessionStatusResult.Error.Generic(e.message ?: "Unknown error")
         }
     }
 
@@ -748,6 +870,21 @@ class EnableBankingControlPlaneClient(
             parsed.error?.message
         } catch (_: Exception) {
             null
+        }
+    }
+
+    /**
+     * True when the body matches the EB AIS invalid-session error shape
+     * `{"detail":{"code":"INVALID_SESSION"}}` (spec: enable-banking-client —
+     * the expected end-of-life signal, distinct from network/parse failures).
+     * A body that does not parse or lacks the code is NOT an invalid session.
+     */
+    private fun isInvalidSessionError(body: String): Boolean {
+        return try {
+            val parsed = json.decodeFromString<AisSessionStatusErrorResponse>(body)
+            parsed.detail?.code == "INVALID_SESSION"
+        } catch (_: Exception) {
+            false
         }
     }
 

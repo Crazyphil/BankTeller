@@ -56,6 +56,10 @@ class AccountLinkingRoutesTest {
         dbFile.deleteOnExit()
         System.setProperty("database.path", dbFile.absolutePath)
         clearWhitelistCacheForTests()
+        // The per-sessionid linking-session confirm cache is top-level server
+        // state surviving across testApplication instances — clear it so poll
+        // tests start cold.
+        clearLinkingSessionConfirmCacheForTests()
     }
 
     // -----------------------------------------------------------------------
@@ -121,12 +125,23 @@ class AccountLinkingRoutesTest {
      *   `whitelisted_accounts` array content (for multi-entry scenarios).
      * @param todayStatsJson When non-null, serves `get_today_stats` with this
      *   body; when null, `get_today_stats` returns 500 (status-fetch failure).
+     * @param linkAuthorizationUrl The authorization_url served by
+     *   `link_accounts` (default matches the historical fixture WITHOUT a
+     *   sessionid; poll tests pass a sessionid-bearing URL explicitly).
+     * @param aisStatusJson When non-null, the AIS host derived from
+     *   [linkAuthorizationUrl] serves `/ais/get_session_status` with this body
+     *   (HTTP 200); when null, the AIS lookup throws (network failure).
+     * @param aisStatusRequests When non-null, incremented on every AIS
+     *   session-status request (call-count assertions).
      */
     private fun controlPlaneEngine(
         appActive: Boolean = true,
         whitelisted: Boolean = true,
         whitelistAccountsJson: String? = null,
         todayStatsJson: String? = null,
+        linkAuthorizationUrl: String = "https://eb.example/auth",
+        aisStatusJson: String? = null,
+        aisStatusRequests: IntArray? = null,
     ): MockEngine = MockEngine { request ->
         val url = request.url.toString()
         when {
@@ -138,10 +153,22 @@ class AccountLinkingRoutesTest {
                 )
             url.contains("enablebanking.com/api/link_accounts") ->
                 respond(
-                    content = """{"url":"https://eb.example/auth","psu_id_hash":"hash-1"}""",
+                    content = """{"url":"$linkAuthorizationUrl","psu_id_hash":"hash-1"}""",
                     status = HttpStatusCode.OK,
                     headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
                 )
+            url.contains("/ais/get_session_status") -> {
+                if (aisStatusRequests != null) aisStatusRequests[0]++
+                if (aisStatusJson != null) {
+                    respond(
+                        content = aisStatusJson,
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                } else {
+                    throw java.io.IOException("AIS host unreachable")
+                }
+            }
             url.contains("enablebanking.com/api/applications") ->
                 respond(
                     content = if (whitelistAccountsJson != null) {
@@ -185,9 +212,22 @@ class AccountLinkingRoutesTest {
         whitelisted: Boolean = true,
         whitelistAccountsJson: String? = null,
         todayStatsJson: String? = null,
+        linkAuthorizationUrl: String = "https://eb.example/auth",
+        aisStatusJson: String? = null,
+        aisStatusRequests: IntArray? = null,
     ): EnableBankingControlPlaneClient =
         EnableBankingControlPlaneClient(
-            client = HttpClient(controlPlaneEngine(appActive, whitelisted, whitelistAccountsJson, todayStatsJson)),
+            client = HttpClient(
+                controlPlaneEngine(
+                    appActive,
+                    whitelisted,
+                    whitelistAccountsJson,
+                    todayStatsJson,
+                    linkAuthorizationUrl,
+                    aisStatusJson,
+                    aisStatusRequests,
+                ),
+            ),
             database = DatabaseFactory.init(),
         )
 
@@ -1634,5 +1674,777 @@ class AccountLinkingRoutesTest {
         whitelisted = false
         stateJson = sessionClient.stateJson()
         assertEquals(false, stateJson.bool("linking_completed"))
+    }
+
+    // =====================================================================
+    // Task 2.5 — link-accounts stores sessionid + poll base URL;
+    // cancel-linking clears them; state never exposes them
+    // =====================================================================
+
+    /** Runs POST /api/link-accounts with the default Test Bank request. */
+    private suspend fun HttpClient.linkAccounts(): HttpResponse =
+        post("/api/link-accounts") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"country":"DE","psu_type":"personal","aspsp_name":"Test Bank"}""")
+        }
+
+    /** GET /api/onboarding/linking-session-status → parsed `state` value. */
+    private suspend fun HttpClient.linkingSessionState(): String {
+        val response = get("/api/onboarding/linking-session-status")
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        return body["state"]?.jsonPrimitive?.content
+            ?: fail("poll response missing state: ${response.bodyAsText()}")
+    }
+
+    @Test
+    fun `2_5 link-accounts success stores stage sessionid and base URL for the poll`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"BankUI"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val response = sessionClient.linkAccounts()
+        assertEquals(HttpStatusCode.OK, response.status)
+
+        // The stage is stored (state reports linking_progress + stage_bank)…
+        val stateJson = sessionClient.stateJson()
+        assertEquals("linking_progress", stateJson.str("onboarding_stage"))
+        val stageBank = stateJson["stage_bank"]?.jsonObject
+        assertNotNull(stageBank)
+        assertEquals("Test Bank", stageBank["aspsp_name"]?.jsonPrimitive?.content)
+        // …and the poll endpoint can use the stored sessionid + base URL: the
+        // AIS lookup runs (BankUI is an intermediate → waiting).
+        assertEquals("waiting", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `2_5 authorization URL without sessionid still returns 200 and degrades to unavailable`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?other=1",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val response = sessionClient.linkAccounts()
+        assertEquals(HttpStatusCode.OK, response.status, "A URL without a sessionid must not fail the link")
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertEquals("https://eb.example/auth?other=1", body["authorization_url"]?.jsonPrimitive?.content)
+
+        // Stage stored, but no sessionid → the poll degrades to unavailable
+        // WITHOUT contacting EB (the AIS engine throws if hit).
+        val stateJson = sessionClient.stateJson()
+        assertEquals("linking_progress", stateJson.str("onboarding_stage"))
+        assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `2_5 cancel-linking clears sessionid and base URL alongside the bank triple`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"BankUI"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("waiting", sessionClient.linkingSessionState())
+
+        val cancelResponse = sessionClient.post("/api/onboarding/cancel-linking")
+        assertEquals(HttpStatusCode.OK, cancelResponse.status)
+
+        // Stage reset to bank_selection → the poll no longer has a
+        // linking_progress stage and degrades to unavailable without EB.
+        val stateJson = sessionClient.stateJson()
+        assertEquals("bank_selection", stateJson.str("onboarding_stage"))
+        assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `2_5 state endpoint response contains neither sessionid nor base URL`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        val rawState = sessionClient.get("/api/onboarding/state").bodyAsText()
+        // The sessionid is a capability token — it must never leak into any
+        // SPA-facing response (spec: linking-sessionid privacy).
+        assertFalse(rawState.contains("sess-1"), "state must not expose the sessionid")
+        assertFalse(rawState.contains("eb.example"), "state must not expose the poll base URL")
+    }
+
+    @Test
+    fun `2_5 state route promotes a stored linking stage to auth when the stage bank is linked`() = testApplication {
+        // Cold boot after a completed link (the user's live-tested scenario):
+        // the session stage says the linking page was last shown, but the
+        // server side can tell linking has completed (whitelist entry for the
+        // stage's bank) → the resolved route is auth_progress IMMEDIATELY —
+        // no linking-page flash, no poll round-trip. The session state
+        // enhances the server state; it never replaces it.
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    whitelisted = true, // Test Bank/DE — matches the linkAccounts stage triple
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        val state = sessionClient.stateJson()
+        assertEquals("auth_progress", state.str("route"))
+    }
+
+    @Test
+    fun `2_5 state route keeps a stored linking stage on linking when the whitelist is empty`() = testApplication {
+        // Mid-link cold boot (linking NOT completed): the linking-page resume
+        // IS the enhancement — better than ActivationGuide / the resume card.
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    whitelisted = false,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        val state = sessionClient.stateJson()
+        assertEquals("linking_progress", state.str("route"))
+    }
+
+    // =====================================================================
+    // Task 3.4 — GET /api/onboarding/linking-session-status
+    // =====================================================================
+
+    @Test
+    fun `3_4 linking-session-status without session returns 401`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val response = client.get("/api/onboarding/linking-session-status")
+        assertEquals(HttpStatusCode.Unauthorized, response.status)
+    }
+
+    @Test
+    fun `3_4 linking-session-status without prior link returns unavailable without EB call`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // No link-accounts call → no stored stage/sessionid/base URL. The AIS
+        // engine throws if hit, proving the endpoint degrades without EB.
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 non-terminal AIS status maps to waiting`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"BankUI"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("waiting", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 unknown AIS status value maps to waiting`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"SomeFutureStatus"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("waiting", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 200 with missing status field maps to unavailable`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 AuthDone with whitelist entry for stage bank maps to done`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"AuthDone"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("done", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 AuthDone with whitelist entry only for a different bank maps to confirming`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"AuthDone"}}""",
+                    whitelistAccountsJson = """[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Other Bank","country":"FR"}}]""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("confirming", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 AuthDone with empty whitelist maps to confirming and retries on the backoff schedule`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // Count whitelist fetches: one idToken refresh + one getApplication per
+        // forceRefresh fetch. The first confirm runs immediately; a poll
+        // before the next-due timestamp returns confirming WITHOUT a new
+        // whitelist call.
+        var applicationRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") ->
+                    respond(
+                        content = """{"response":{"status":"AuthDone"}}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") -> {
+                    applicationRequests++
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("confirming", sessionClient.linkingSessionState())
+        assertEquals(1, applicationRequests, "The first confirm must run immediately")
+
+        // A second poll before the next-due timestamp (backoff 5 s) returns
+        // confirming WITHOUT a new whitelist call.
+        assertEquals("confirming", sessionClient.linkingSessionState())
+        assertEquals(1, applicationRequests, "A poll before next-due must not re-fetch the whitelist")
+    }
+
+    @Test
+    fun `3_4 AuthDone confirm success is sticky and skips the AIS endpoint on subsequent polls`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        var aisRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") -> {
+                    aisRequests++
+                    respond(
+                        content = """{"response":{"status":"AuthDone"}}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("done", sessionClient.linkingSessionState())
+        assertEquals(1, aisRequests, "The first AuthDone poll must call the AIS endpoint once")
+
+        // Sticky: a second poll returns done from the marker WITHOUT a new EB
+        // (AIS or whitelist) call.
+        assertEquals("done", sessionClient.linkingSessionState())
+        assertEquals(1, aisRequests, "The sticky marker must skip the AIS endpoint on subsequent polls")
+    }
+
+    @Test
+    fun `3_4 marker active skips the AIS endpoint even when tilisy would answer INVALID_SESSION`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // First AIS call answers AuthDone; after the marker is stored the AIS
+        // host flips to 400 INVALID_SESSION (the tilisy session was cleaned
+        // up after AuthDone). The marker must absorb this — NOT degrade to
+        // unavailable.
+        var aisRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") -> {
+                    aisRequests++
+                    if (aisRequests == 1) {
+                        respond(
+                            content = """{"response":{"status":"AuthDone"}}""",
+                            status = HttpStatusCode.OK,
+                            headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                        )
+                    } else {
+                        respond(
+                            content = """{"detail":{"code":"INVALID_SESSION"}}""",
+                            status = HttpStatusCode.BadRequest,
+                            headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                        )
+                    }
+                }
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("confirming", sessionClient.linkingSessionState())
+        assertEquals(1, aisRequests, "The first AuthDone poll must call the AIS endpoint once")
+
+        // The tilisy session is gone (INVALID_SESSION) — the marker absorbs
+        // it: confirming, not unavailable, and no new AIS call.
+        assertEquals("confirming", sessionClient.linkingSessionState())
+        assertEquals(1, aisRequests, "The marker must skip the AIS endpoint while active")
+    }
+
+    @Test
+    fun `3_4 confirm budget exhaustion maps to unconfirmed`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // Shrink the schedule + budget so the exhaustion path runs without
+        // really waiting 2 minutes (task 3.4: injectable/overridable).
+        linkingSessionConfirmBackoffScheduleMillis = longArrayOf(50L)
+        linkingSessionConfirmBudgetMillis = 120L
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") ->
+                    respond(
+                        content = """{"response":{"status":"AuthDone"}}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("confirming", sessionClient.linkingSessionState())
+
+        // Wait out the (shrunken) budget, then poll: unconfirmed (sticky).
+        Thread.sleep(200)
+        assertEquals("unconfirmed", sessionClient.linkingSessionState())
+        assertEquals("unconfirmed", sessionClient.linkingSessionState(), "unconfirmed must be sticky")
+    }
+
+    @Test
+    fun `3_4 confirm check network failure consumes a retry and stays confirming`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // The control plane (getApplication) fails on every confirm attempt —
+        // a failed check consumes a retry, it is NOT unavailable.
+        var applicationRequests = 0
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") ->
+                    respond(
+                        content = """{"response":{"status":"AuthDone"}}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") -> {
+                    applicationRequests++
+                    respond(
+                        content = """control plane down""",
+                        status = HttpStatusCode.InternalServerError,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                }
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("confirming", sessionClient.linkingSessionState())
+        assertTrue(applicationRequests >= 1, "The confirm attempt must have hit the control plane")
+    }
+
+    @Test
+    fun `3_4 Cancelled maps to cancelled`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"Cancelled"}}""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("cancelled", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 Invalid with not-linked whitelist maps to failed`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"Invalid"}}""",
+                    whitelisted = false,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("failed", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 Invalid after completed link maps to done via whitelist confirmation`() = testApplication {
+        // Dead-session scenario (live-tested): the tilisy AIS session is
+        // cleaned up after completion, so a page refresh after a successful
+        // link observes `Invalid` from the dead session. The whitelist is the
+        // authoritative signal — the stage's bank being linked → `done`
+        // (auto-advance), NOT a false failure panel.
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    linkAuthorizationUrl = "https://eb.example/auth?sessionid=sess-1",
+                    aisStatusJson = """{"response":{"status":"Invalid"}}""",
+                    whitelisted = true, // Test Bank/DE — matches the linkAccounts stage triple
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("done", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 INVALID_SESSION after completed link maps to done via cached whitelist`() = testApplication {
+        // Dead-session variant: the AIS host answers 400 INVALID_SESSION
+        // (session cleaned up after completion), but the cached whitelist
+        // proves the stage's bank linked → `done`, not `unavailable`.
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") ->
+                    respond(
+                        content = """{"detail":{"code":"INVALID_SESSION"}}""",
+                        status = HttpStatusCode.BadRequest,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        // Prime the whitelist cache with a linked snapshot — mirrors the real
+        // cold-boot sequence: the SPA's startup GET /api/onboarding/state
+        // fetches the whitelist AFTER the stage was stored (the link POST
+        // happened in the earlier session, before the refresh; its cache
+        // invalidation is long past). The poll then reads the cached snapshot.
+        sessionClient.get("/api/onboarding/state")
+        assertEquals("done", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 AIS network failure maps to unavailable`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // aisStatusJson = null → the AIS host throws (network failure).
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    @Test
+    fun `3_4 AIS INVALID_SESSION error maps to unavailable`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient()
+        // A dedicated engine: the AIS host answers 400 INVALID_SESSION.
+        val engine = MockEngine { request ->
+            val url = request.url.toString()
+            when {
+                url.contains("securetoken.googleapis.com/v1/token") ->
+                    respond(
+                        content = """{"id_token":"it","refresh_token":"rt2","expires_in":"3600"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/link_accounts") ->
+                    respond(
+                        content = """{"url":"https://eb.example/auth?sessionid=sess-1","psu_id_hash":"hash-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("/ais/get_session_status") ->
+                    respond(
+                        content = """{"detail":{"code":"INVALID_SESSION"}}""",
+                        status = HttpStatusCode.BadRequest,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                url.contains("enablebanking.com/api/applications") ->
+                    respond(
+                        content = """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[]}]""",
+                        status = HttpStatusCode.OK,
+                        headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                    )
+                else -> error("Unexpected control-plane request: $url")
+            }
+        }
+        application {
+            module(
+                controlPlaneClient = EnableBankingControlPlaneClient(
+                    client = HttpClient(engine),
+                    database = DatabaseFactory.init(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        sessionClient.linkAccounts()
+        assertEquals("unavailable", sessionClient.linkingSessionState())
     }
 }

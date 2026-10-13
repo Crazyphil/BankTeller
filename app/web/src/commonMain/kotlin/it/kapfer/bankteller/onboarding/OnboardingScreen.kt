@@ -80,6 +80,7 @@ import it.kapfer.bankteller.ApiClient
 import it.kapfer.bankteller.AppViewModel
 import it.kapfer.bankteller.Aspssp
 import it.kapfer.bankteller.AspspsState
+import it.kapfer.bankteller.LinkingSessionPollState
 import it.kapfer.bankteller.OnboardingStep
 import it.kapfer.bankteller.ProductionFieldOverrides
 import it.kapfer.bankteller.createHttpClient
@@ -1287,36 +1288,137 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
         if (linkUrl != null && (isResumeMode || pendingAutoOpen)) {
             openUrlInNewTab(linkUrl)
             viewModel.consumeLinkAuthorizationUrl()
+            // The tab is open — the status can now realistically change, so
+            // the poll starts here (not when the POST succeeded).
+            viewModel.startLinkingSessionPoll()
             pendingAutoOpen = false
+        }
+    }
+
+    // State composition per design D9 / linking-state-automation 5.1–5.5.
+    // The poll state is null only outside a poll context (defensive: treat as
+    // unavailable → today's manual screen).
+    val pollState = viewModel.linkingPollState ?: LinkingSessionPollState.Unavailable
+
+    // Tab-opened flag: the fresh entry (linking tab not yet opened) holds the
+    // authorization URL; consuming it (opening the tab) flips the flag. The
+    // forward slot and the one-liner are functions of poll state AND this
+    // flag (D9 table).
+    val tabOpened = linkUrl == null
+
+    // Forward slot composition (D9 table): "Open linking page" while the tab
+    // has not yet been opened (waiting/unavailable); empty in waiting once
+    // opened (the manual check is hidden while polling is healthy); manual
+    // check button in unconfirmed and in unavailable once opened; "Try
+    // linking again" on the failure panels.
+    val forward: (@Composable () -> Unit)? = when (pollState) {
+        LinkingSessionPollState.Waiting,
+        LinkingSessionPollState.Confirming,
+        LinkingSessionPollState.Done,
+        -> if (!tabOpened) {
+            {
+                ActionButton(
+                    onClick = {
+                        openUrlInNewTab(linkUrl!!)
+                        viewModel.consumeLinkAuthorizationUrl()
+                        // Tab opened by user gesture — start the poll now.
+                        viewModel.startLinkingSessionPoll()
+                    },
+                    label = "Open linking page",
+                )
+            }
+        } else {
+            null // empty — spinner layout; the ball is in the other tab
+        }
+        LinkingSessionPollState.Unconfirmed -> {
+            {
+                ActionButton(
+                    onClick = { viewModel.checkLinkStatus() },
+                    label = "I've completed linking",
+                )
+            }
+        }
+        LinkingSessionPollState.Unavailable -> if (!tabOpened) {
+            {
+                ActionButton(
+                    onClick = {
+                        openUrlInNewTab(linkUrl!!)
+                        viewModel.consumeLinkAuthorizationUrl()
+                        // Tab opened by user gesture — start the poll now.
+                        viewModel.startLinkingSessionPoll()
+                    },
+                    label = "Open linking page",
+                )
+            }
+        } else {
+            {
+                ActionButton(
+                    onClick = { viewModel.checkLinkStatus() },
+                    label = "I've completed linking",
+                )
+            }
+        }
+        LinkingSessionPollState.Cancelled,
+        LinkingSessionPollState.Failed,
+        -> {
+            {
+                ActionButton(
+                    onClick = { viewModel.relinkAccount() },
+                    label = "Try linking again",
+                )
+            }
+        }
+    }
+
+    // The one-liner switches with the tab-opened flag AND the poll state
+    // (D9): the fresh entry explains the redirect and points at the forward
+    // button; once the tab is open and polling is healthy, the copy explains
+    // the waiting and the button's disappearance. In the states where
+    // polling has STOPPED (unconfirmed, cancelled, failed, unavailable) the
+    // auto-advance promise would be a lie — those get copy matching their
+    // composition instead (unavailable: the resume one-liner per D9(6)).
+    val oneLiner = when {
+        !tabOpened -> {
+            "You'll be redirected to Enable Banking's control panel to link your account. " +
+                    "This verifies your identity so BankTeller can securely access your bank accounts. " +
+                    "Click below to open the connection page in a new window."
+        }
+        pollState == LinkingSessionPollState.Waiting ||
+                pollState == LinkingSessionPollState.Confirming ||
+                pollState == LinkingSessionPollState.Done -> {
+            "Complete the connection in the Enable Banking window. " +
+                    "This page will advance automatically once confirmed."
+        }
+        pollState == LinkingSessionPollState.Unconfirmed -> {
+            "The automatic confirmation is still pending. " +
+                    "If you've completed the linking steps, continue below."
+        }
+        pollState == LinkingSessionPollState.Unavailable -> {
+            "Account linking was started in a previous session. " +
+                    "If you've completed linking in the Enable Banking control panel, " +
+                    "click below to continue to authorization."
+        }
+        else -> { // Cancelled, Failed — the body panel carries the details
+            "The linking attempt did not complete. " +
+                    "See below for what happened and how to try again."
         }
     }
 
     WizardScaffold(
         eyebrow = "STEP 7 OF 8",
         title = "Linking your account",
-        oneLiner = if (isResumeMode) {
-            "Account linking was started in a previous session. " +
-                    "If you've completed linking in the Enable Banking control panel, " +
-                    "click below to continue to authorization."
-        } else {
-            "You'll be redirected to Enable Banking's control panel to link your account. " +
-                    "This verifies your identity so BankTeller can securely access your bank accounts."
-        },
+        oneLiner = oneLiner,
         progress = { WizardProgressIndicator(currentStep = 6, totalSteps = 8) },
         onBack = { viewModel.cancelLinking() },
         backLabel = "Back to bank list",
         backServerAction = true, // POST cancel-linking — disable while in flight
-        forward = {
-            ActionButton(
-                onClick = { viewModel.checkLinkStatus() },
-                label = "I've completed linking",
-            )
-        },
+        forward = forward,
     ) {
         // Commitment warning (advisory, D6 touchpoint 2/4): top of the LinkingProgress
         // frame when the selected psu_type's status is non-green — linking uses the same
         // per-bank mechanisms as authorization, so the same advisory warning is warranted.
         // psu_type is already fixed at bank selection, so the type-specific copy applies.
+        // Unchanged placement per aspsp-availability-status touchpoint 2 (5.5).
         val aspsp = viewModel.selectedAspsp
         val selectedPsu = viewModel.selectedPsuType
         val perTypeStatus = if (selectedPsu.isNotEmpty()) {
@@ -1330,56 +1432,239 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                 status = psuStatus,
                 psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
             )
-            Spacer(modifier = Modifier.height(Dimens.md))
+            // No explicit spacer here: WizardScaffold's content column already
+            // applies spacedBy(Dimens.lg) between children — an extra Spacer
+            // would stack on top of it (lg + md + lg ≈ 64dp gap).
         }
 
-        if (!isResumeMode) {
-            Text(
-                text = "After completing the linking process, close that tab and return here to continue.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
+        // Flow-level error banner (linking-flow errors only — 5.3 spec):
+        // link-status check failures / linking-page errors, rendered with the
+        // design-system DecisionBox banner pattern. Authorization failures
+        // route to AuthProgress and never render here.
         viewModel.linkError?.let { err ->
-            Text(
-                text = err,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodyMedium,
-            )
+            DecisionBox(
+                tint = MaterialTheme.colorScheme.error,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = err,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
         }
 
         if (viewModel.linkStatusChecking) {
             WaitingIndicator.Inline()
         }
 
-        if (linkUrl != null) {
-            Button(
-                onClick = {
-                    openUrlInNewTab(linkUrl)
-                    viewModel.consumeLinkAuthorizationUrl()
-                },
-            ) {
-                Text("Open linking page")
+        when (pollState) {
+            LinkingSessionPollState.Waiting,
+            LinkingSessionPollState.Done,
+            -> {
+                if (!tabOpened) {
+                    // Fresh entry: the forward slot carries the "Open linking
+                    // page" primary button (set above); the body explains the
+                    // new-tab mechanics (Tier 2 explanation).
+                    Text(
+                        text = "Linking happens in a new tab — it stays open while you sign in at your bank.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    // Waiting layout (5.1): spinner, heading, reassurance copy,
+                    // re-open affordance in a Tier-4 info box. Empty forward
+                    // slot (set above). No close-tab claims (D10).
+                    WaitingIndicator.Zone(verticalPadding = Dimens.lg)
+                    Text(
+                        text = "Waiting for you to complete the linking steps…",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Text(
+                        text = "Take as long as you need — this page will continue automatically once linking is confirmed.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    LinkingReopenBox(
+                        onReopen = {
+                            pendingAutoOpen = true
+                            viewModel.relinkAccount()
+                        },
+                    )
+                }
             }
+            LinkingSessionPollState.Confirming -> {
+                // 5.2: the same spinner layout as waiting, but the heading and
+                // reassurance switch to the completed-but-confirming copy —
+                // the waiting copy is stale once the user has completed their
+                // part. Forward slot empty (set above); the re-open affordance
+                // stays available (re-opening the linking page re-enters EB's
+                // AuthDone redirect — the recovery path when the tab was
+                // closed before the EB callback fired). The SPA keeps its
+                // normal poll cadence (the state is not terminal — the server
+                // owns the retry schedule).
+                WaitingIndicator.Zone(verticalPadding = Dimens.lg)
+                Text(
+                    text = "Linking completed — confirming the connection…",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    text = "This usually takes just a few seconds.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                LinkingReopenBox(
+                    onReopen = {
+                        pendingAutoOpen = true
+                        viewModel.relinkAccount()
+                    },
+                )
+            }
+            LinkingSessionPollState.Unconfirmed -> {
+                // 5.3: manual check button in the forward slot (set above) +
+                // honest explainer that the automatic confirmation did not
+                // succeed within its retry window (the server attempted for
+                // 2 minutes); spinner hidden.
+                Text(
+                    text = "The automatic confirmation did not succeed within its retry window " +
+                            "(the server attempted for 2 minutes). If you've finished the linking " +
+                            "steps, check manually below.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                LinkingReopenBox(
+                    onReopen = {
+                        pendingAutoOpen = true
+                        viewModel.relinkAccount()
+                    },
+                )
+            }
+            LinkingSessionPollState.Cancelled,
+            LinkingSessionPollState.Failed,
+            -> {
+                // 5.3: error-tinted DecisionBox failure panel mirroring the
+                // AuthProgress failure pattern, keyed on the error kind
+                // (cancelled vs technical). Only "Try linking again" (forward
+                // slot, set above) — no re-open affordance on failure panels.
+                LinkingFailurePanel(kind = if (pollState == LinkingSessionPollState.Cancelled) "cancelled" else "technical")
+            }
+            LinkingSessionPollState.Unavailable -> {
+                // 5.4: silently render the static manual screen composed
+                // mode-dependently — no error banner. Fresh mode: the forward
+                // slot carries "Open linking page" (set above) + this new-tab
+                // explainer; resume/re-open mode (tab previously opened):
+                // re-open quiet action + manual check button in the forward
+                // slot (set above).
+                if (!tabOpened) {
+                    Text(
+                        text = "Linking happens in a new tab — it stays open while you sign in at your bank.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LinkingReopenBox(
+                        onReopen = {
+                            pendingAutoOpen = true
+                            viewModel.relinkAccount()
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Tier-4 info box with the "Re-open linking page" quiet action
+ * (linking-state-automation 5.1): the accidental-close recovery affordance,
+ * available in the waiting, confirming, unconfirmed, and unavailable states —
+ * never on the failure panels. Re-opening never interrupts the polling loop.
+ */
+@Composable
+private fun LinkingReopenBox(onReopen: () -> Unit) {
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(Dimens.md),
+            verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
             Text(
-                text = "Click the button above to open the Enable Banking control panel in a new tab.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            Text(
-                text = "If you closed the tab by accident, you can re-open the linking page.",
-                style = MaterialTheme.typography.bodySmall,
+                text = "Closed the window by accident?",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
             )
             QuietActionButton(
-                onClick = {
-                    pendingAutoOpen = true
-                    viewModel.relinkAccount()
-                },
+                onClick = onReopen,
                 label = "Re-open linking page",
             )
         }
+    }
+}
+
+/**
+ * Failure panel for the cancelled/failed linking poll states (5.3): the same
+ * error-tinted DecisionBox structure as the AuthProgress failure panel,
+ * keyed on the linking error kind — `cancelled` (user cancellation copy
+ * family) vs `technical` (server-disruption copy family), per design D8/D9.
+ */
+@Composable
+private fun LinkingFailurePanel(kind: String) {
+    val error = MaterialTheme.colorScheme.error
+
+    val title: String
+    val body: String
+    val guidance: String
+    when (kind) {
+        "cancelled" -> {
+            title = "Linking cancelled"
+            body = "The linking was cancelled at the bank or consent screen before it was completed. No accounts were linked and no data was shared."
+            guidance = "If this was unintended, you can try linking again. You can also pick a different bank."
+        }
+        else -> {
+            title = "Linking could not be completed"
+            body = "You did nothing wrong — this is usually a temporary disruption on Enable Banking's or the bank's side."
+            guidance = "You can try linking again in a few moments, or return to the bank list to connect another institution."
+        }
+    }
+
+    DecisionBox(
+        tint = error,
+        borderColor = error,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Error,
+                contentDescription = null,
+                tint = error,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = error,
+            )
+        }
+        Spacer(modifier = Modifier.height(Dimens.xs))
+        Text(
+            text = body,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(modifier = Modifier.height(Dimens.xs))
+        Text(
+            text = guidance,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

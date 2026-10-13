@@ -45,6 +45,23 @@ import kotlinx.serialization.Serializable
  * @property stagePsuType The in-flight bank psu_type (`personal` /
  *   `business`) of the stored stage. Cleared together with
  *   [onboardingStage].
+ * @property sessionid The EB AIS sessionid parsed from the linking
+ *   `authorization_url` at link time (spec: onboarding-view-position, design
+ *   D2). Meaningful only for the `linking_progress` stage; consumed exclusively
+ *   server-side by the linking-session-status poll endpoint. A capability
+ *   token: never exposed by `GET /api/onboarding/state`, never logged.
+ *   Overwritten on every new link attempt; cleared together with
+ *   [onboardingStage]. Null when no sessionid was stored (a cookie issued
+ *   before this change, or an `authorization_url` without a parseable
+ *   `sessionid`).
+ * @property stageSessionBaseUrl The poll base URL (scheme + host of the
+ *   linking `authorization_url`) persisted at link time (spec:
+ *   onboarding-view-position, design D2/D3). Meaningful only for the
+ *   `linking_progress` stage; the poll endpoint needs it at cold-boot time to
+ *   construct the session-status request (the `authorization_url` itself is
+ *   returned to the SPA and never stored server-side). The host is never
+ *   hardcoded — it follows the `authorization_url`. Overwritten on every new
+ *   link attempt; cleared together with [onboardingStage].
  */
 @Serializable
 data class UserSession(
@@ -56,6 +73,8 @@ data class UserSession(
     val stageAspspName: String? = null,
     val stageAspspCountry: String? = null,
     val stagePsuType: String? = null,
+    val sessionid: String? = null,
+    val stageSessionBaseUrl: String? = null,
 )
 
 @Serializable

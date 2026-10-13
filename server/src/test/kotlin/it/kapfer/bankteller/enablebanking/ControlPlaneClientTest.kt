@@ -865,4 +865,138 @@ class ControlPlaneClientTest {
         assertTrue(result is AspspStatusResult.Error)
         client.close()
     }
+
+    // =====================================================================
+    // Task 1.3 — getAisSessionStatus (EB AIS session-status lookup)
+    // =====================================================================
+
+    @Test
+    fun `getAisSessionStatus returns Ok with status on 200`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"response":{"status":"BankUI"}}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Ok, "Expected Ok but got: $result")
+        assertEquals("BankUI", (result as AisSessionStatusResult.Ok).status)
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns Generic Error on 200 with missing status field`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"response":{}}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.Generic, "Expected Generic Error but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns Generic Error on 200 with unparseable body`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"response":"not-an-object"}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.Generic, "Expected Generic Error but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns InvalidSession on 400 INVALID_SESSION`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"detail":{"code":"INVALID_SESSION"}}""",
+                status = HttpStatusCode.BadRequest,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.InvalidSession, "Expected InvalidSession but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns Generic Error on 400 with a different code`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"detail":{"code":"SOME_OTHER_ERROR"}}""",
+                status = HttpStatusCode.BadRequest,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.Generic, "Expected Generic Error but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns Generic Error on unexpected non-200`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"error":"boom"}""",
+                status = HttpStatusCode.InternalServerError,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.Generic, "Expected Generic Error but got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus returns Generic Error on network failure`() = runBlocking {
+        val engine = MockEngine { request ->
+            throw java.io.IOException("Broken pipe")
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Error.Generic, "Expected Generic Error but got: $result")
+        assertTrue((result as AisSessionStatusResult.Error.Generic).message.contains("Broken pipe"))
+        client.close()
+    }
+
+    @Test
+    fun `getAisSessionStatus sends Cookie header and pinned path with no query parameters`() = runBlocking {
+        val capturedRequests = mutableListOf<HttpRequestData>()
+        val engine = MockEngine { request ->
+            capturedRequests.add(request)
+            respond(
+                content = """{"response":{"status":"BankUI"}}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val result = client.getAisSessionStatus("sess-1", "https://tilisy.enablebanking.com")
+        assertTrue(result is AisSessionStatusResult.Ok)
+        val request = capturedRequests.single()
+        // The host is NEVER hardcoded — the request follows the caller-supplied
+        // base URL, and only the path /ais/get_session_status is pinned.
+        assertEquals("https://tilisy.enablebanking.com/ais/get_session_status", request.url.toString())
+        // Authenticated SOLELY by the sessionid cookie — no query params, no
+        // Authorization header, no browser UA, no Referer.
+        assertTrue(request.url.parameters.isEmpty(), "The sessionid must never travel in the URL")
+        assertEquals("sessionid=sess-1", request.headers[HttpHeaders.Cookie])
+        assertNull(request.headers[HttpHeaders.Authorization])
+        assertNull(request.headers["Referer"])
+        client.close()
+    }
 }

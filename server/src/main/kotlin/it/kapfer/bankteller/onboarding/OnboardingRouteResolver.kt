@@ -60,6 +60,14 @@ object OnboardingRoute {
  *   bank triple (`stageAspspName`/`stageAspspCountry` non-blank; psu_type is
  *   not required for rendering). A `linking_progress`/`auth_progress` stage
  *   with a missing/blank triple is treated as no stage.
+ * @property stageBankLinked True when the whitelist carries an entry for the
+ *   STAGE's bank (aspsp_name + aspsp_country of the stored triple). Used by
+ *   the `linking_progress` promotion rule: server state always fixes the
+ *   coarse level and the session stage only refines within it — when linking
+ *   has completed and the stage's bank is the linked one, the stage promotes
+ *   the route to `auth_progress` (the next step per server state) instead of
+ *   restoring the linking page. False when the whitelist lookup failed
+ *   (conservative — the stage is then honored for linking only).
  * @property sandboxEnvironment True when the environment parsed from the
  *   control-plane application entry is `SANDBOX`. Resolved by the caller from
  *   the cached [it.kapfer.bankteller.onboarding.OnboardingService.getStatus]
@@ -77,6 +85,7 @@ data class OnboardingRouteInput(
     val authFailed: Boolean,
     val onboardingStage: String?,
     val stageBankKnown: Boolean,
+    val stageBankLinked: Boolean = false,
     val sandboxEnvironment: Boolean = false,
 )
 
@@ -102,11 +111,19 @@ data class OnboardingRouteInput(
  *    application works, even for a previously-authorized user).
  * 4. Stored stage honored (only when `auth_completed == false` — a stale stage
  *    never beats real authorization): `auth_progress` iff
- *    `linking_completed == true`; `linking_progress` always (even when
- *    `linking_completed == true` — the user explicitly started a new link);
- *    `bank_selection` always (consumable without a bank triple); a
- *    `linking_progress`/`auth_progress` stage with a missing/blank bank
- *    triple is treated as no stage.
+ *    `linking_completed == true`; `linking_progress` iff
+ *    `linking_completed == false` — the session state ENHANCES the server
+ *    state, it never replaces it: once the server side can tell that linking
+ *    has completed, the user routes to the auth step no matter that the
+ *    fine-grained stage says the linking page was last shown. A
+ *    `linking_progress` stage with `linking_completed == true` promotes to
+ *    `auth_progress` when the stage's bank is the linked one (the stage
+ *    triple feeds the auth step exactly like a stored `auth_progress`
+ *    stage); when the stage's bank is NOT linked (an in-flight link of a
+ *    different bank), the stage is ignored — the resume card for the linked
+ *    bank is the safe destination. `bank_selection` is always consumable
+ *    (it carries no triple by design); a `linking_progress`/`auth_progress`
+ *    stage with a missing/blank bank triple is treated as no stage.
  * 5. At least one `eb_sessions` row → [OnboardingRoute.DASHBOARD]. Expired or
  *    revoked consent does NOT regress to onboarding.
  * 6. `inactiveButLinked` → best-effort continuation: evaluation continues
@@ -202,9 +219,15 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
  *
  * Stage consistency rules (spec): `auth_progress` requires
  * `linking_completed == true` (authorization cannot start before linking
- * completes); `linking_progress`/`auth_progress` require a non-blank bank
- * triple (both restored screens need the bank data to render);
- * `bank_selection` is always consumable (it carries no triple by design).
+ * completes); `linking_progress` requires `linking_completed == false` —
+ * once linking has completed, the server state outranks the stage: the stage
+ * promotes to `auth_progress` when its bank is the linked one (the session
+ * state enhances — same coarse level, finer presentation), and is ignored
+ * otherwise (an in-flight link of a different bank; the resume card for the
+ * linked bank is the safe destination). Both `linking_progress`/
+ * `auth_progress` require a non-blank bank triple (both restored screens
+ * need the bank data to render); `bank_selection` is always consumable (it
+ * carries no triple by design).
  */
 private fun honoredStageRoute(input: OnboardingRouteInput): String? {
     // A stale stage never beats real authorization (e.g. the authorization
@@ -214,8 +237,26 @@ private fun honoredStageRoute(input: OnboardingRouteInput): String? {
     return when (input.onboardingStage) {
         OnboardingStage.AUTH_PROGRESS ->
             if (input.linkingCompleted && input.stageBankKnown) OnboardingRoute.AUTH_PROGRESS else null
-        OnboardingStage.LINKING_PROGRESS ->
-            if (input.stageBankKnown) OnboardingRoute.LINKING_PROGRESS else null
+        OnboardingStage.LINKING_PROGRESS -> when {
+            // Linking completed and the stage's bank is the linked one → the
+            // session state enhances the server state: promote to the auth
+            // step (the next step per server state), with the stage triple
+            // feeding the auth step exactly like a stored auth_progress
+            // stage. The user is routed there immediately on cold boot — no
+            // linking-page flash, no poll round-trip needed.
+            input.linkingCompleted && input.stageBankKnown && input.stageBankLinked ->
+                OnboardingRoute.AUTH_PROGRESS
+            // Linking NOT completed → the linking page resume is the
+            // enhancement (better than ActivationGuide / the resume card,
+            // which is all the EB-side state alone could infer).
+            !input.linkingCompleted && input.stageBankKnown -> OnboardingRoute.LINKING_PROGRESS
+            // Linking completed but the stage's bank is NOT linked (an
+            // in-flight link of a different bank) → the stage is ignored;
+            // the ladder falls through to the resume card for the linked
+            // bank (the safe destination — authorizing the unlinked stage
+            // bank would fail at EB's side).
+            else -> null
+        }
         OnboardingStage.BANK_SELECTION -> OnboardingRoute.BANK_SELECTION
         else -> null
     }

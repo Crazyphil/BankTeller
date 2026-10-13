@@ -23,6 +23,7 @@ class OnboardingRouteResolverTest {
         authFailed: Boolean = false,
         onboardingStage: String? = null,
         stageBankKnown: Boolean = true,
+        stageBankLinked: Boolean = false,
         sandboxEnvironment: Boolean = false,
     ) = OnboardingRouteInput(
         registrationInProgress = registrationInProgress,
@@ -34,6 +35,7 @@ class OnboardingRouteResolverTest {
         authFailed = authFailed,
         onboardingStage = onboardingStage,
         stageBankKnown = stageBankKnown,
+        stageBankLinked = stageBankLinked,
         sandboxEnvironment = sandboxEnvironment,
     )
 
@@ -204,15 +206,60 @@ class OnboardingRouteResolverTest {
     }
 
     @Test
-    fun `stored linking_progress is honored even when linking_completed is true (explicit new link beats resume card)`() {
+    fun `stored linking_progress with linking_completed true promotes to auth_progress when the stage bank is linked`() {
+        // Server state outranks the fine-grained stage: once the server side
+        // can tell linking has completed, the user routes to the auth step
+        // immediately — no matter that the stage says the linking page was
+        // last shown. The session state enhances (same coarse level, finer
+        // presentation), it never replaces.
         assertEquals(
-            OnboardingRoute.LINKING_PROGRESS,
+            OnboardingRoute.AUTH_PROGRESS,
             resolveOnboardingRoute(
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
                     authCompleted = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
+                    stageBankLinked = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `stored linking_progress with linking_completed true is ignored when the stage bank is not linked`() {
+        // In-flight link of a DIFFERENT bank (the linked bank is another one):
+        // the stage cannot enhance — authorizing the unlinked stage bank
+        // would fail at EB's side. The ladder falls through to the resume
+        // card for the linked bank.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = true,
+                    authCompleted = false,
+                    onboardingStage = OnboardingStage.LINKING_PROGRESS,
+                    stageBankLinked = false,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `stored linking_progress with linking_completed true and unknown whitelist state is ignored conservatively`() {
+        // Whitelist lookup failed (stageBankLinked conservatively false):
+        // the stage is honored for linking only when linking has NOT
+        // completed — here it is ignored, falling through to the resume card.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = true,
+                    authCompleted = false,
+                    onboardingStage = OnboardingStage.LINKING_PROGRESS,
+                    stageBankLinked = false,
                 ),
             ),
         )

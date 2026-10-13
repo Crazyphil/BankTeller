@@ -7,6 +7,7 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import it.kapfer.bankteller.database.BankTellerDatabase
+import it.kapfer.bankteller.enablebanking.AisSessionStatusResult
 import it.kapfer.bankteller.enablebanking.AspsspListResult
 import it.kapfer.bankteller.enablebanking.AspspStatusResult
 import it.kapfer.bankteller.enablebanking.Access
@@ -26,7 +27,14 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.slf4j.LoggerFactory
+import java.time.Duration
 import java.time.Instant
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
+
+private val logger = LoggerFactory.getLogger("AccountLinkingRoutes")
 
 // Whitelist caches shared by /api/onboarding/state (cached read) and
 // /api/onboarding/link-status (forced refresh, primes the cache).
@@ -41,8 +49,84 @@ private data class WhitelistSnapshot(
     val entries: List<WhitelistedAccountEntry>,
 )
 
+/** True when the snapshot carries a whitelist entry for the stage's bank
+ *  (aspsp_name + aspsp_country from the stored view-position triple,
+ *  mirroring link-status's filtered mode — an entry for a different bank does
+ *  not confirm this session). Null-safe: a failed/absent fetch never
+ *  confirms. */
+private fun WhitelistSnapshot?.linkedForStage(session: UserSession): Boolean =
+    this?.entries?.any { entry ->
+        entry.aspsp?.name == session.stageAspspName &&
+            entry.aspsp?.country == session.stageAspspCountry
+    } == true
+
 private val whitelistCache = TtlCache<String, WhitelistSnapshot>(60_000L)
 private val whitelistFailureCache = TtlCache<String, Unit>(10_000L)
+
+/**
+ * Sticky per-sessionid marker for the linking-session-status poll's whitelist
+ * confirmation (spec: linking-session-polling, design D5 — reworked after live
+ * testing). Stored on the FIRST `AuthDone` observation; while active it IS the
+ * session's state — the endpoint does not call the EB AIS endpoint at all
+ * (robust against the tilisy session being cleaned up after `AuthDone`, e.g.
+ * an `INVALID_SESSION` response on subsequent calls). The marker carries the
+ * first-observed timestamp, the next-due timestamp, and the current result;
+ * confirmation attempts that return not-linked (or fail — control-plane
+ * network errors included, they consume a retry) are retried on a backoff
+ * schedule within a 2-minute budget from first observation. Top-level server
+ * state — survives across `testApplication` instances, hence the test-clear
+ * hook below.
+ */
+private class LinkingSessionMarker(
+    val firstObservedAt: Instant,
+    var nextDueAt: Instant,
+    var result: LinkingSessionMarkerResult,
+    var attemptCount: Int = 0,
+) {
+    /**
+     * Serializes confirmation runs for this marker. Two browser tabs sharing
+     * the session cookie can poll the same sessionid concurrently; without
+     * the mutex both could pass the next-due check and run duplicate
+     * `forceRefresh` whitelist fetches (benign, but the retry schedule would
+     * drift). The lock is held across the fetch on purpose: the second poll
+     * then sees the updated `nextDueAt` and returns `confirming` without a
+     * second fetch.
+     */
+    val mutex = Mutex()
+}
+
+private enum class LinkingSessionMarkerResult { CONFIRMING, DONE, UNCONFIRMED }
+
+/** Wire value of the marker result for the poll endpoint's state field. */
+private fun LinkingSessionMarkerResult.stateWireValue(): String = when (this) {
+    LinkingSessionMarkerResult.CONFIRMING -> "confirming"
+    LinkingSessionMarkerResult.DONE -> "done"
+    LinkingSessionMarkerResult.UNCONFIRMED -> "unconfirmed"
+}
+
+/**
+ * Backoff schedule for the confirmation retries (design D5): 5 s, 10 s, 20 s,
+ * 40 s, capped at 40 s. Mutable so tests can shrink the schedule and the
+ * 2-minute budget without really waiting (task 3.4).
+ */
+internal var linkingSessionConfirmBackoffScheduleMillis = longArrayOf(5_000L, 10_000L, 20_000L, 40_000L)
+
+/** Confirmation retry budget from first `AuthDone` observation (design D5). */
+internal var linkingSessionConfirmBudgetMillis = 120_000L
+
+/**
+ * Marker map: sessionid -> marker. Entries expire after the 15-minute TTL
+ * below and are removed on read when expired (and swept on insert), so the
+ * map does not accumulate dead markers over the process lifetime.
+ */
+private val linkingSessionMarkers = ConcurrentHashMap<String, LinkingSessionMarker>()
+
+/** Marker TTL — a marker older than this is treated as gone (stale session). */
+private val linkingSessionMarkerTtlMillis = 15 * 60_000L
+
+/** Whether the marker is still within its TTL. */
+private fun LinkingSessionMarker.isLive(now: Instant): Boolean =
+    Duration.between(firstObservedAt, now).toMillis() <= linkingSessionMarkerTtlMillis
 
 /**
  * Clears the shared whitelist caches (positive + failure snapshots). Called by
@@ -60,6 +144,19 @@ internal fun clearWhitelistCache() {
 internal fun clearWhitelistCacheForTests() = clearWhitelistCache()
 
 /**
+ * Test hook: clears the per-sessionid linking-session markers so tests start
+ * cold (the map is top-level server state surviving across
+ * `testApplication` instances — spec: linking-session-polling, design D5).
+ * Also resets the backoff schedule and budget to production values in case a
+ * test shrank them.
+ */
+internal fun clearLinkingSessionConfirmCacheForTests() {
+    linkingSessionMarkers.clear()
+    linkingSessionConfirmBackoffScheduleMillis = longArrayOf(5_000L, 10_000L, 20_000L, 40_000L)
+    linkingSessionConfirmBudgetMillis = 120_000L
+}
+
+/**
  * Fetches the application state (active flag + whitelisted accounts) from the
  * Enable Banking control plane, with caching per D7.
  *
@@ -71,6 +168,58 @@ internal fun clearWhitelistCacheForTests() = clearWhitelistCache()
  *   (missing/blank refresh token or application id — a cheap local check,
  *   not cached) or the refresh/getApplication call failed (cached for 10 s).
  */
+/**
+ * Runs (or re-runs) the whitelist confirmation for an active linking-session
+ * marker (design D5). Called on the first `AuthDone` observation and on every
+ * poll whose arrival time is past the marker's next-due timestamp. A poll
+ * arriving BEFORE next-due returns the marker's current result without a
+ * check. Not-linked or a failed check (control-plane network errors included —
+ * they consume a retry, NOT `unavailable`) schedules the next attempt on the
+ * backoff schedule within the 2-minute budget; budget exhaustion →
+ * `UNCONFIRMED` (sticky). Confirm success → `DONE` (sticky).
+ *
+ * The confirmation matches the STAGE's bank (aspsp_name + aspsp_country from
+ * the stored view-position triple, mirroring link-status's filtered mode — a
+ * whitelist entry for a different bank does not confirm this session).
+ */
+private suspend fun runConfirm(
+    marker: LinkingSessionMarker,
+    session: UserSession,
+    controlPlaneClient: EnableBankingControlPlaneClient,
+    database: BankTellerDatabase,
+): LinkingSessionMarkerResult = marker.mutex.withLock {
+    val now = Instant.now()
+    if (marker.result == LinkingSessionMarkerResult.CONFIRMING && now.isBefore(marker.nextDueAt)) {
+        // A poll before the next-due timestamp returns `confirming` without
+        // running a check (design D5).
+        return@withLock marker.result
+    }
+    // Budget exhausted → `unconfirmed` (sticky).
+    if (Duration.between(marker.firstObservedAt, now).toMillis() > linkingSessionConfirmBudgetMillis) {
+        marker.result = LinkingSessionMarkerResult.UNCONFIRMED
+        return@withLock marker.result
+    }
+    val snapshot = fetchWhitelist(controlPlaneClient, database, forceRefresh = true)
+    val linked = snapshot?.entries?.any { entry ->
+        entry.aspsp?.name == session.stageAspspName &&
+            entry.aspsp?.country == session.stageAspspCountry
+    } == true
+    if (linked) {
+        marker.result = LinkingSessionMarkerResult.DONE
+        return@withLock marker.result
+    }
+    // Not-linked (or failed check — snapshot == null): consume a retry, back off.
+    val elapsedAttempts = marker.attemptCount
+    val backoffMillis = if (elapsedAttempts < linkingSessionConfirmBackoffScheduleMillis.size) {
+        linkingSessionConfirmBackoffScheduleMillis[elapsedAttempts]
+    } else {
+        linkingSessionConfirmBackoffScheduleMillis.last()
+    }
+    marker.attemptCount++
+    marker.nextDueAt = now.plusMillis(backoffMillis)
+    marker.result
+}
+
 private suspend fun fetchWhitelist(
     controlPlaneClient: EnableBankingControlPlaneClient,
     database: BankTellerDatabase,
@@ -289,12 +438,27 @@ fun Route.accountLinkingRoutes(
                 // the user is now on the linking step. Overwrites any prior
                 // stage (e.g. a stale auth_progress — the old authorization
                 // position is obsolete).
+                //
+                // The EB AIS sessionid and the poll base URL (the
+                // authorization_url's scheme + host) are parsed from the
+                // returned authorization_url and stored alongside the stage's
+                // bank triple (design D2/D3): the poll endpoint needs both at
+                // cold-boot time, and the authorization_url itself is returned
+                // to the SPA and never stored server-side. Every new link
+                // attempt overwrites the previous values. A URL without a
+                // parseable sessionid stores the stage without one and still
+                // succeeds — the SPA later degrades via the poll's
+                // `unavailable` state (spec: onboarding scenario "Authorization
+                // URL without a sessionid does not fail the link").
+                val (sessionid, stageSessionBaseUrl) = parseAisSession(result.authorizationUrl)
                 call.sessions.set(
                     session.copy(
                         onboardingStage = OnboardingStage.LINKING_PROGRESS,
                         stageAspspName = request.aspsp_name,
                         stageAspspCountry = request.country,
                         stagePsuType = request.psu_type,
+                        sessionid = sessionid,
+                        stageSessionBaseUrl = stageSessionBaseUrl,
                     ),
                 )
                 call.respond(buildJsonObject {
@@ -454,6 +618,136 @@ fun Route.accountLinkingRoutes(
     }
 
     // -----------------------------------------------------------------------
+    // Linking-session-status poll (spec: linking-session-polling, design D1–D7)
+    // -----------------------------------------------------------------------
+    get("/api/onboarding/linking-session-status") {
+        val session = call.sessions.get<UserSession>()
+            ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
+
+        // No stored sessionid, no stored base URL, or no stored stage →
+        // `unavailable` WITHOUT contacting EB (spec: linking-session-polling
+        // scenario "No stored sessionid or base URL degrades to unavailable" —
+        // a cookie issued before this change, or no stored stage).
+        val sessionid = session.sessionid
+        val baseUrl = session.stageSessionBaseUrl
+        if (session.onboardingStage != OnboardingStage.LINKING_PROGRESS ||
+            sessionid.isNullOrBlank() || baseUrl.isNullOrBlank()
+        ) {
+            call.respond(buildJsonObject { put("state", "unavailable") })
+            return@get
+        }
+
+        // While a marker is active it IS the session's state (design D5): the
+        // EB AIS endpoint is not called at all — robust against the tilisy
+        // session being cleaned up after `AuthDone` (e.g. `INVALID_SESSION`
+        // on subsequent calls). A stale marker (older than the 15-minute TTL)
+        // is treated as gone. A poll arriving past the marker's next-due
+        // timestamp runs the confirmation check (or exhausts the budget); a
+        // poll before it returns `confirming` without a check.
+        val activeMarker = linkingSessionMarkers[sessionid]?.let { marker ->
+            if (marker.isLive(Instant.now())) {
+                marker
+            } else {
+                // Expired: treated as gone — and physically removed so the map
+                // does not accumulate dead markers.
+                linkingSessionMarkers.remove(sessionid, marker)
+                null
+            }
+        }
+        if (activeMarker != null) {
+            val result = if (activeMarker.result == LinkingSessionMarkerResult.CONFIRMING) {
+                runConfirm(activeMarker, session, controlPlaneClient, database)
+            } else {
+                activeMarker.result
+            }
+            call.respond(buildJsonObject { put("state", result.stateWireValue()) })
+            return@get
+        }
+
+        when (val result = controlPlaneClient.getAisSessionStatus(sessionid, baseUrl)) {
+            is AisSessionStatusResult.Ok -> {
+                // Drift canary (spec: linking-session-polling, design D4): log
+                // every observed status value at info level, including unknown
+                // values. The sessionid is NEVER logged.
+                logger.info("linking-session-status: observed AIS status={}", result.status)
+                when (result.status) {
+                    "AuthDone" -> {
+                        // Sticky marker + bounded server-side confirmation
+                        // retry (design D5, reworked after live testing): the
+                        // whitelist (getApplication) remains the authoritative
+                        // "is the account linked" signal, and it lags the
+                        // tilisy `AuthDone` flip by (milli-)seconds in the
+                        // common case — a single-shot confirm loses that race.
+                        // The confirmation matches the STAGE's bank
+                        // (aspsp_name + aspsp_country from the stored
+                        // view-position triple, mirroring link-status's
+                        // filtered mode — a whitelist entry for a different
+                        // bank does not confirm this session).
+                        // Sweep expired markers on insert so the map does not
+                        // accumulate dead entries even for sessionids that are
+                        // never polled again.
+                        val insertTime = Instant.now()
+                        linkingSessionMarkers.entries.removeIf { !it.value.isLive(insertTime) }
+                        val marker = LinkingSessionMarker(
+                            firstObservedAt = insertTime,
+                            nextDueAt = insertTime,
+                            result = LinkingSessionMarkerResult.CONFIRMING,
+                        )
+                        linkingSessionMarkers[sessionid] = marker
+                        call.respond(buildJsonObject { put("state", runConfirm(marker, session, controlPlaneClient, database).stateWireValue()) })
+                    }
+                    "Cancelled" -> call.respond(buildJsonObject { put("state", "cancelled") })
+                    "Invalid" -> {
+                        // The whitelist is the authoritative "is the account
+                        // linked" signal (design D5) — it outranks any
+                        // failure-reporting AIS status. The tilisy session is
+                        // cleaned up after completion, so a page refresh (or a
+                        // server restart) after a successful link can observe
+                        // `Invalid` from the dead session even though the link
+                        // succeeded. Confirm against the whitelist BEFORE
+                        // reporting failure: stage's bank linked → `done`
+                        // (the auto-advance signal); genuinely not linked →
+                        // `failed`; whitelist unreachable → `unavailable`
+                        // (cannot confirm — the manual fallback's check
+                        // button resolves it with its own fresh fetch). No
+                        // marker/retry here: the session is dead, no retry
+                        // can ever succeed.
+                        val snapshot = fetchWhitelist(controlPlaneClient, database, forceRefresh = true)
+                        val state = when {
+                            snapshot.linkedForStage(session) -> "done"
+                            snapshot != null -> "failed"
+                            else -> "unavailable"
+                        }
+                        call.respond(buildJsonObject { put("state", state) })
+                    }
+                    // Any other status value — known intermediates AND unknown
+                    // values — is `waiting` (design D4: the vocabulary is closed
+                    // by reverse-engineering, so an unrecognized value is with
+                    // certainty an intermediate).
+                    else -> call.respond(buildJsonObject { put("state", "waiting") })
+                }
+            }
+            // Any Error (both kinds) → `unavailable` without distinguishing
+            // the cause to the SPA (design D7 — the degradation is identical:
+            // the manual fallback screen) — EXCEPT when the cached whitelist
+            // already proves the stage's bank linked: the tilisy session is
+            // cleaned up after completion, so a page refresh (or a server
+            // restart) after a successful link can observe INVALID_SESSION (or
+            // a network error) from the dead session even though the link
+            // succeeded. The whitelist outranks the dead session's error:
+            // linked → `done` (the auto-advance signal). The CACHED snapshot
+            // only (no fresh fetch — the AIS call already failed, and the
+            // manual fallback's check button resolves ambiguity with its own
+            // fresh fetch): a cached not-linked/absent snapshot keeps the
+            // `unavailable` degradation.
+            is AisSessionStatusResult.Error -> {
+                val state = if (whitelistCache.get("whitelist").linkedForStage(session)) "done" else "unavailable"
+                call.respond(buildJsonObject { put("state", state) })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 6.5 — Onboarding state (routing flags + display-only fields, D10;
     // server-resolved route + view position per onboarding-view-position)
     // -----------------------------------------------------------------------
@@ -579,6 +873,11 @@ fun Route.accountLinkingRoutes(
                 authFailed = authFailed,
                 onboardingStage = session.onboardingStage,
                 stageBankKnown = stageBankKnown,
+                // The stage's bank is linked (whitelist entry matching the
+                // stored triple) → a linking_progress stage promotes to the
+                // auth step (server state outranks the fine-grained stage).
+                // Conservative false when the whitelist lookup failed.
+                stageBankLinked = whitelist.linkedForStage(session),
                 sandboxEnvironment = status.environment == Environment.SANDBOX.name,
             ),
         )
@@ -612,6 +911,10 @@ fun Route.accountLinkingRoutes(
     post("/api/onboarding/cancel-linking") {
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
+        // The sessionid and poll base URL are cleared alongside the bank triple
+        // (spec: onboarding-view-position scenario "Stage write at
+        // cancel-linking"): the user deliberately returned to the bank list,
+        // and a refresh there must not resume polling against a stale session.
         call.sessions.set(
             session.copy(
                 authError = null,
@@ -620,6 +923,8 @@ fun Route.accountLinkingRoutes(
                 stageAspspName = null,
                 stageAspspCountry = null,
                 stagePsuType = null,
+                sessionid = null,
+                stageSessionBaseUrl = null,
             ),
         )
         call.respond(mapOf("success" to true))
@@ -639,4 +944,38 @@ private fun worstStatus(statuses: Collection<String>): String {
     return statuses.filter { rank.containsKey(it) }
         .maxByOrNull { rank.getValue(it) }
         ?: "green"
+}
+
+/**
+ * Parses the EB AIS sessionid and the poll base URL (scheme + host) from a
+ * linking `authorization_url` (spec: onboarding-view-position, design D2/D3).
+ *
+ * Returns `(sessionid, baseUrl)`; both are null when the URL is unparseable or
+ * carries no `sessionid` query parameter — the stage is then stored without a
+ * sessionid and the SPA degrades via the poll's `unavailable` state (spec:
+ * onboarding scenario "Authorization URL without a sessionid does not fail the
+ * link"). The base URL is the URL's scheme + host only (never hardcoded — the
+ * host follows the `authorization_url` so a migrated AIS host moves with the
+ * linking URLs, design D3).
+ */
+private fun parseAisSession(authorizationUrl: String): Pair<String?, String?> {
+    val uri = try {
+        java.net.URI(authorizationUrl)
+    } catch (_: Exception) {
+        return null to null
+    }
+    val sessionid = uri.rawQuery
+        ?.split('&')
+        ?.firstOrNull { it.startsWith("sessionid=") }
+        ?.substringAfter('=')
+        ?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+        ?.takeIf { it.isNotBlank() }
+    // Base URL = scheme + host, plus the port when the authorization URL
+    // carries a non-default one (URI.getPort() returns -1 for default/absent).
+    val baseUrl = if (uri.scheme != null && uri.host != null) {
+        if (uri.port > 0) "${uri.scheme}://${uri.host}:${uri.port}" else "${uri.scheme}://${uri.host}"
+    } else {
+        null
+    }
+    return sessionid to baseUrl
 }

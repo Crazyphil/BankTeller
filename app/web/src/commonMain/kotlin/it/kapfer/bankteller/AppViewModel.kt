@@ -159,6 +159,17 @@ class AppViewModel(
     var linkStatusChecking: Boolean by mutableStateOf(false)
         private set
 
+    /**
+     * Current linking-session poll state (linking-state-automation 4.2):
+     * [LinkingSessionPollState.Waiting] while the poll loop is healthy, a
+     * terminal state (`Done`/`Unconfirmed`/`Cancelled`/`Failed`/`Unavailable`)
+     * once the loop stopped, or null when no poll context exists (step not
+     * active). Exposed for the LinkingProgress UI's six-state composition
+     * (design D9).
+     */
+    var linkingPollState: LinkingSessionPollState? by mutableStateOf(null)
+        private set
+
     var authError: String? by mutableStateOf(null)
         private set
 
@@ -212,6 +223,21 @@ class AppViewModel(
 
     /** Non-null while the registration-in-flight re-route poll is active (9.5). */
     private var registrationProgressPollJob: Job? = null
+
+    /** Non-null while the linking-session status poll is active (4.2). */
+    private var linkingSessionPollJob: Job? = null
+
+    /**
+     * Stops the linking-session poll (4.2) and clears the exposed poll state.
+     * Called on every poll-stop condition: a received terminal state, leaving
+     * the LinkingProgress step (back navigation / cancelLinking), logout,
+     * onboarding reset, and view-model disposal.
+     */
+    private fun stopLinkingSessionPoll() {
+        linkingSessionPollJob?.cancel()
+        linkingSessionPollJob = null
+        linkingPollState = null
+    }
 
     /**
      * The in-flight GET /api/aspsps job, if any (persist-onboarding-view-
@@ -308,6 +334,7 @@ class AppViewModel(
         waitPollJob = null
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
+        stopLinkingSessionPoll()
         viewModelScope.launch {
             apiClient.logout()
             isAuthenticated = false
@@ -453,6 +480,10 @@ class AppViewModel(
     private fun restoreLinkingProgress(state: OnboardingState) {
         currentScreen = Screen.Onboarding
         onboardingStep = OnboardingStep.LinkingProgress
+        // The stored stage carries the sessionid + poll base URL server-side —
+        // resume polling on cold entry (4.2; the poll disambiguates actual
+        // completion per the linking_progress restore spec).
+        startLinkingSessionPoll()
         val bank = state.stageBank
         if (bank != null) {
             // Feed the existing resume machinery: selectedBankFromState drives
@@ -752,6 +783,7 @@ class AppViewModel(
         waitPollJob = null
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
+        stopLinkingSessionPoll()
         resetOnboardingState()
         onboardingStep = OnboardingStep.EmailEntry
     }
@@ -767,6 +799,7 @@ class AppViewModel(
         waitPollJob = null
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
+        stopLinkingSessionPoll()
         isLoading = true
         viewModelScope.launch {
             apiClient.resetOnboardingCredentials()
@@ -994,6 +1027,14 @@ class AppViewModel(
                     psuIdHash = result.psuIdHash
                     linkAuthorizationUrl = result.authorizationUrl
                     onboardingStep = OnboardingStep.LinkingProgress
+                    // The POST stored a fresh sessionid + poll base URL
+                    // server-side. Arm the waiting state but do NOT start
+                    // polling yet: until the user opens the linking tab
+                    // (the "Open linking page" gesture), the status cannot
+                    // realistically change. The poll starts when the tab
+                    // is opened (see startLinkingSessionPoll, called from
+                    // the UI's tab-open sites).
+                    linkingPollState = LinkingSessionPollState.Waiting
                 }
                 is LinkAccountsResult.Error -> {
                     linkError = result.message
@@ -1021,6 +1062,11 @@ class AppViewModel(
             linkError = "Confirm your account type to continue"
             return
         }
+        // 4.4 (D8 window (a)): the poll stays stopped while the re-link POST is
+        // in flight — a stale terminal reading of the old sessionid cannot
+        // re-show the failure panel mid-retry. It restarts only on success,
+        // against the fresh sessionid.
+        stopLinkingSessionPoll()
         isLoading = true
         linkError = null
         viewModelScope.launch {
@@ -1029,6 +1075,11 @@ class AppViewModel(
             when (result) {
                 is LinkAccountsResult.Ok -> {
                     linkAuthorizationUrl = result.authorizationUrl
+                    // Fresh sessionid + base URL are stored server-side by the
+                    // POST. As in linkAccounts(), only arm the waiting state;
+                    // the poll restarts when the re-opened tab is actually
+                    // opened (4.4) — against the fresh sessionid.
+                    linkingPollState = LinkingSessionPollState.Waiting
                 }
                 is LinkAccountsResult.Error -> {
                     linkError = result.message
@@ -1038,6 +1089,8 @@ class AppViewModel(
     }
 
     fun cancelLinking() {
+        // Leaving the step stops the poll (4.2).
+        stopLinkingSessionPoll()
         isLoading = true
         viewModelScope.launch {
             apiClient.cancelLinking()
@@ -1096,6 +1149,79 @@ class AppViewModel(
     }
 
     /**
+     * Starts the linking-session status poll (4.2): GET
+     * /api/onboarding/linking-session-status every 5 seconds with no cap while
+     * the LinkingProgress step is active. Called when the linking tab is
+     * actually opened (fresh "Open linking page" click, re-open, or resume
+     * auto-open) — polling before the user has seen the authorization page
+     * would be pointless. The loop stops on a received terminal state
+     * (`done`/`unconfirmed`/`cancelled`/`failed`/`unavailable` — the
+     * `confirming` state is NOT terminal and the loop continues through it at
+     * the normal cadence), on leaving the step, and on view-model disposal; a
+     * transient failure of the poll request itself does NOT stop it. Exposes
+     * the current state via [linkingPollState] for the UI composition (design
+     * D9).
+     */
+    fun startLinkingSessionPoll() {
+        stopLinkingSessionPoll()
+        linkingPollState = LinkingSessionPollState.Waiting
+        linkingSessionPollJob = viewModelScope.launch {
+            while (true) {
+                delay(5000L)
+                val state = apiClient.getLinkingSessionStatus()
+                if (state == null) {
+                    // Transient poll-request failure (network blip, timeout,
+                    // non-200): does NOT stop the loop (4.2 — mirrors the
+                    // registration-progress poll convention). Only a RECEIVED
+                    // terminal state ends it.
+                    continue
+                }
+                when (state) {
+                    LinkingSessionPollState.Waiting -> Unit
+                    // Non-terminal (design D5/D6): AuthDone observed, the
+                    // server owns the confirmation retry schedule — the SPA
+                    // keeps its normal cadence through this state.
+                    LinkingSessionPollState.Confirming -> Unit
+                    LinkingSessionPollState.Done -> {
+                        linkingSessionPollJob = null
+                        linkingPollState = null
+                        // Auto-advance exactly like the checkLinkStatus()
+                        // success path (4.3): startAuth with the bank triple,
+                        // transitioning to AuthProgress with no user action.
+                        advanceToAuthAfterLinking()
+                        break
+                    }
+                    LinkingSessionPollState.Unconfirmed,
+                    LinkingSessionPollState.Cancelled,
+                    LinkingSessionPollState.Failed,
+                    LinkingSessionPollState.Unavailable,
+                    -> {
+                        linkingSessionPollJob = null
+                        linkingPollState = state
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The `done` auto-advance (4.3): identical to the checkLinkStatus()
+     * success path — startAuth with the bank triple from the in-session
+     * selection, falling back to the state-derived selections.
+     */
+    private fun advanceToAuthAfterLinking() {
+        val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
+        val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
+        val psuType = selectedPsuType.ifEmpty { selectedBankFromState?.psuType ?: "personal" }
+        if (aspspName != null && aspspCountry != null) {
+            startAuth(aspspName, aspspCountry, psuType)
+        } else {
+            linkError = "Bank information missing."
+        }
+    }
+
+    /**
      * Continue from the resume card to authorization with the confirmed account type.
      * Skips LinkingProgress since linking is already completed on the backend.
      * Validates that an account type (psu_type) has been explicitly chosen.
@@ -1112,23 +1238,6 @@ class AppViewModel(
             return
         }
         startAuth(aspspName, aspspCountry, selectedPsuType)
-    }
-
-    /**
-     * Continue directly to authorization when linking is already confirmed
-     * complete (per persisted onboarding state), skipping the link-status poll.
-     * Uses the bank selected this session, falling back to the bank stored in
-     * the server-side onboarding state (resume flow).
-     */
-    fun continueToAuthorization() {
-        val aspspName = selectedAspsp?.name ?: selectedBankFromState?.aspspName
-        val aspspCountry = selectedAspsp?.country ?: selectedBankFromState?.aspspCountry
-        val psuType = selectedPsuType.ifEmpty { selectedBankFromState?.psuType ?: "personal" }
-        if (aspspName != null && aspspCountry != null) {
-            startAuth(aspspName, aspspCountry, psuType)
-        } else {
-            linkError = "Bank information missing."
-        }
     }
 
     fun startAuth(aspspName: String, aspspCountry: String, psuType: String) {
@@ -1215,6 +1324,7 @@ class AppViewModel(
         linkAuthorizationUrl = null
         linkError = null
         linkStatusChecking = false
+        linkingPollState = null
         authError = null
         authFailed = false
         authErrorKind = null
@@ -1238,6 +1348,7 @@ class AppViewModel(
         waitPollJob = null
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
+        stopLinkingSessionPoll()
         viewModelScope.cancel()
     }
 }

@@ -423,6 +423,27 @@ open class ApiClient {
     }
 
     /**
+     * Server-side linking-session-status poll (spec: linking-session-polling,
+     * design D1/D6). Returns the received state on a 200, or null when the
+     * request itself failed (non-200, network error, unparseable body) — the
+     * caller treats null as a TRANSIENT failure that must not stop the poll
+     * loop, distinct from a received [LinkingSessionPollState.Unavailable].
+     */
+    open suspend fun getLinkingSessionStatus(): LinkingSessionPollState? {
+        return try {
+            val response = client.get("/api/onboarding/linking-session-status")
+            if (response.status.value == 200) {
+                val state = extractJsonString(response.bodyAsText(), "state")
+                LinkingSessionPollState.entries.firstOrNull { it.value == state }
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * Parses the `linked_banks` array of `{aspsp_name, aspsp_country}` objects
      * from the onboarding state response. Empty when the field is absent, the
      * whitelist is empty, or its fetch failed (unknown state — the SPA never
@@ -803,4 +824,35 @@ sealed class LinkAccountsResult {
 sealed class StartAuthResult {
     data class Ok(val url: String) : StartAuthResult()
     data class Error(val message: String) : StartAuthResult()
+}
+
+/**
+ * Linking-session poll state from GET /api/onboarding/linking-session-status
+ * (spec: linking-session-polling, design D4/D5/D6). `waiting`, `confirming`,
+ * and the terminal states arrive as `{"state": "<value>"}`; an unrecognized
+ * value is treated as `waiting` server-side, so the SPA only ever sees these
+ * seven.
+ */
+enum class LinkingSessionPollState(val value: String) {
+    /** Intermediate — keep polling. */
+    Waiting("waiting"),
+
+    /** Intermediate (non-terminal) — AuthDone observed, whitelist confirmation
+     *  in progress server-side with bounded retries; keep the normal cadence. */
+    Confirming("confirming"),
+
+    /** Terminal — whitelist confirmed the stage's bank; auto-advance to auth. */
+    Done("done"),
+
+    /** Terminal — AuthDone seen but the whitelist did not confirm; manual check. */
+    Unconfirmed("unconfirmed"),
+
+    /** Terminal — the user (or bank) cancelled; failure panel, kind `cancelled`. */
+    Cancelled("cancelled"),
+
+    /** Terminal — the session went Invalid; failure panel, kind `technical`. */
+    Failed("failed"),
+
+    /** Terminal — no stored sessionid/base URL or an EB error; silent manual fallback. */
+    Unavailable("unavailable"),
 }

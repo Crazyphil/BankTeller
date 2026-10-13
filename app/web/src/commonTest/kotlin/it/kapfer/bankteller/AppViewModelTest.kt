@@ -1409,18 +1409,176 @@ class AppViewModelTest {
         assertEquals("TestBank" to "FI", fakeApi.linkStatusCalls.last())
     }
 
-    @Test
-    fun continueToAuthorization_usesSelectedBankFromState() = runTest(testDispatcher) {
-        // Mid-wizard resume scenario (8.2/8.3): select the bank via public API.
-        val bank = Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L)
-        vm.selectAspsp(bank)
-        vm.selectPsuType("business")
+    // ---------------------------------------------------------------
+    // Linking-session poll (linking-state-automation 4.2–4.7)
+    // ---------------------------------------------------------------
 
+    @Test
+    fun linkingSessionPoll_terminalStateStopsTheLoop() = runTest(testDispatcher) {
+        // Cancelled is terminal: the loop stops and the state is exposed for
+        // the failure panel (4.4).
+        fakeApi.linkingSessionStatusSequence = listOf(
+            LinkingSessionPollState.Waiting,
+            LinkingSessionPollState.Waiting,
+            LinkingSessionPollState.Cancelled,
+        )
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Cancelled, vm.linkingPollState)
+        // No further polls after the terminal state.
+        val callsAtTerminal = fakeApi.linkingSessionStatusCalls
+        advanceTimeBy(30_000L)
+        runCurrent()
+        assertEquals(callsAtTerminal, fakeApi.linkingSessionStatusCalls)
+    }
+
+    @Test
+    fun linkingSessionPoll_transientFailureKeepsTheLoopRunning() = runTest(testDispatcher) {
+        // null = transient poll-request failure (network blip / non-200) —
+        // must NOT stop the loop (4.2); the next tick polls again and a
+        // received terminal state ends it.
+        fakeApi.linkingSessionStatusSequence = listOf(
+            null,
+            null,
+            LinkingSessionPollState.Waiting,
+            LinkingSessionPollState.Failed,
+        )
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(20_000L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Failed, vm.linkingPollState)
+        assertTrue(fakeApi.linkingSessionStatusCalls >= 4)
+    }
+
+    @Test
+    fun linkingSessionPoll_doneAutoAdvancesLikeCheckLinkStatusSuccess() = runTest(testDispatcher) {
+        // 4.3: done → startAuth with the bank triple, transitioning to
+        // AuthProgress with no user action — exactly the checkLinkStatus()
+        // success path.
+        val bank = Aspssp("TestBank", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        vm.selectPsuType("personal")
+
+        fakeApi.linkingSessionStatusSequence = listOf(LinkingSessionPollState.Done)
         fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
-        vm.continueToAuthorization()
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(5_000L)
+        runCurrent()
         advanceUntilIdle()
+
         assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
         assertEquals("https://bank.com/sca", vm.authRedirectUrl)
+        assertEquals(1, fakeApi.startAuthCalls.size)
+        assertEquals("TestBank", fakeApi.startAuthCalls.last().aspspName)
+        assertEquals("FI", fakeApi.startAuthCalls.last().aspspCountry)
+        assertEquals("personal", fakeApi.startAuthCalls.last().psuType)
+        // The poll state is cleared on auto-advance (left the step).
+        assertNull(vm.linkingPollState)
+    }
+
+    @Test
+    fun linkingSessionPoll_unconfirmedStopsPollAndExposesState() = runTest(testDispatcher) {
+        fakeApi.linkingSessionStatusSequence = listOf(LinkingSessionPollState.Unconfirmed)
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Unconfirmed, vm.linkingPollState)
+        val callsAtTerminal = fakeApi.linkingSessionStatusCalls
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertEquals(callsAtTerminal, fakeApi.linkingSessionStatusCalls)
+    }
+
+    @Test
+    fun linkingSessionPoll_confirmingDoesNotStopTheLoop() = runTest(testDispatcher) {
+        // 4.7: the `confirming` state is NOT terminal — the loop continues at
+        // the normal cadence (the server owns the confirmation retry
+        // schedule); a subsequent terminal state ends it.
+        fakeApi.linkingSessionStatusSequence = listOf(
+            LinkingSessionPollState.Confirming,
+            LinkingSessionPollState.Confirming,
+            LinkingSessionPollState.Done,
+        )
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(15_000L)
+        runCurrent()
+        // The loop ran through both confirming ticks (3 calls) and the done
+        // tick auto-advanced — poll state cleared, step left.
+        assertTrue(fakeApi.linkingSessionStatusCalls >= 3)
+        assertNull(vm.linkingPollState)
+    }
+
+    @Test
+    fun linkingSessionPoll_cancelLinkingStopsTheLoop() = runTest(testDispatcher) {
+        fakeApi.linkingSessionStatusSequence = listOf(LinkingSessionPollState.Waiting)
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Waiting, vm.linkingPollState)
+
+        vm.cancelLinking()
+        advanceUntilIdle()
+        // Leaving the step stops the poll and clears the exposed state (4.2).
+        assertNull(vm.linkingPollState)
+        val callsAtCancel = fakeApi.linkingSessionStatusCalls
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertEquals(callsAtCancel, fakeApi.linkingSessionStatusCalls)
+    }
+
+    @Test
+    fun relinkAccount_keepsPollStoppedWhilePostInFlightAndRestartsOnSuccess() = runTest(testDispatcher) {
+        // 4.4 (D8 window (a)): the poll stays stopped while the re-link POST
+        // is in flight — a stale terminal reading of the old sessionid cannot
+        // re-show the failure panel mid-retry — and restarts on success.
+        val bank = Aspssp("TestBank", "FI", "BIC1", null, listOf("personal"), 86400L)
+        vm.selectAspsp(bank)
+        vm.selectPsuType("personal")
+
+        // First poll run ends in the failure state that offers the retry.
+        fakeApi.linkingSessionStatusSequence = listOf(LinkingSessionPollState.Failed)
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Failed, vm.linkingPollState)
+
+        // Re-link POST in flight: the call suspends, so the poll must be
+        // stopped (no further status calls) while it runs.
+        fakeApi.linkAccountsCallDelayMs = 300L
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://eb.example/auth?sessionid=sess-2", "hash-2")
+        vm.relinkAccount()
+        // Mid-POST (100ms < 300ms delay): no poll activity, poll state
+        // cleared synchronously by stopLinkingSessionPoll() (waiting reset
+        // only on success).
+        advanceTimeBy(100L)
+        runCurrent()
+        assertNull(vm.linkingPollState)
+        assertEquals(1, fakeApi.linkingSessionStatusCalls)
+
+        // POST completes → the step is armed in the waiting state, but the
+        // poll does NOT run yet: the user has not opened the fresh linking
+        // tab, so the status cannot realistically change (poll starts on the
+        // tab-open gesture, mirroring the fresh-link entry).
+        fakeApi.linkingSessionStatusSequence = listOf(LinkingSessionPollState.Waiting)
+        advanceTimeBy(300L)
+        runCurrent()
+        assertEquals(LinkingSessionPollState.Waiting, vm.linkingPollState)
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals(1, fakeApi.linkingSessionStatusCalls)
+
+        // Tab-open gesture (LaunchedEffect auto-open / button click calls
+        // startLinkingSessionPoll): the poll restarts against the fresh
+        // sessionid.
+        vm.startLinkingSessionPoll()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals(2, fakeApi.linkingSessionStatusCalls)
+        // The restarted loop is alive (waiting is non-terminal) — stop it
+        // explicitly; dispose() in tearDown would also cancel it.
+        vm.cancelLinking()
+        advanceUntilIdle()
     }
 
     // ---------------------------------------------------------------
@@ -2223,8 +2381,31 @@ private class FakeApiClient : ApiClient() {
     var nextRegistrationInfo: RegistrationInfo? = null
     var nextAspspsResult: AspspsResult = AspspsResult.Ok(emptyList())
     var nextLinkAccountsResult: LinkAccountsResult = LinkAccountsResult.Error("not configured")
+    var linkAccountsCallDelayMs: Long = 0L
     var nextStartAuthResult: StartAuthResult = StartAuthResult.Error("not configured")
     var nextLinkStatus: Boolean? = null
+
+    /**
+     * Sequence of linking-session poll results (linking-state-automation
+     * 4.7); a null entry simulates a transient poll-request failure. Once
+     * exhausted, the last value repeats (a terminal state keeps the loop
+     * stopped, so exhaustion only matters for waiting sequences).
+     *
+     * DEFAULT is a single [LinkingSessionPollState.Unavailable]: tests that
+     * trigger the poll incidentally (linkAccounts success, linking_progress
+     * restore, relinkAccount success) get a terminal first response, so the
+     * loop stops and advanceUntilIdle() cannot hang on the infinite delay
+     * loop. Tests for the poll itself configure the sequence explicitly.
+     */
+    var linkingSessionStatusSequence: List<LinkingSessionPollState?> =
+        listOf(LinkingSessionPollState.Unavailable)
+        set(value) {
+            field = value
+            linkingSessionStatusIndex = 0
+        }
+    var linkingSessionStatusCalls: Int = 0
+        private set
+    private var linkingSessionStatusIndex = 0
 
     // Delay hooks for busy-state regression tests: when > 0, the corresponding
     // API call suspends for this long, letting tests observe mid-request state
@@ -2276,7 +2457,10 @@ private class FakeApiClient : ApiClient() {
         cancelLinkingCallCount++
         return true
     }
-    override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult = nextLinkAccountsResult
+    override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult {
+        if (linkAccountsCallDelayMs > 0) delay(linkAccountsCallDelayMs)
+        return nextLinkAccountsResult
+    }
     override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult {
         startAuthCalls.add(StartAuthCall(aspspName, aspspCountry, psuType))
         return nextStartAuthResult
@@ -2284,6 +2468,17 @@ private class FakeApiClient : ApiClient() {
     override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {
         linkStatusCalls.add(aspspName to aspspCountry)
         return nextLinkStatus
+    }
+    override suspend fun getLinkingSessionStatus(): LinkingSessionPollState? {
+        linkingSessionStatusCalls++
+        if (linkingSessionStatusSequence.isEmpty()) return LinkingSessionPollState.Unavailable
+        val index = linkingSessionStatusIndex
+        return if (index < linkingSessionStatusSequence.size) {
+            linkingSessionStatusIndex++
+            linkingSessionStatusSequence[index]
+        } else {
+            linkingSessionStatusSequence.last()
+        }
     }
 
     /** Sequence of poll results; if `waitStatusRepeat` is true, the last value repeats. */

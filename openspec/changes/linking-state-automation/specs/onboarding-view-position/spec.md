@@ -55,6 +55,10 @@ The stage and bank triple SHALL also be exposed by `GET /api/onboarding/state` a
 - **WHEN** the route resolver runs with a stored `auth_progress` stage but `auth_completed == true` (e.g. the authorization completed in another tab before the refresh)
 - **THEN** the stage is ignored and the resolved route is `dashboard`
 
+#### Scenario: Stage enhances, never replaces — linking completed outranks a stored linking stage
+- **WHEN** the route resolver runs with a stored `linking_progress` stage but `linking_completed == true` and the stage's bank is the linked one
+- **THEN** the stage promotes the route to `auth_progress` (the next step per server state — the user lands on the auth step immediately on cold boot, no linking-page flash); when the stage's bank is NOT the linked one, the stage is ignored and the ladder falls through to the resume card for the linked bank
+
 #### Scenario: New session falls back to closest-possible inference
 - **WHEN** the user logs in fresh (no stored stage) mid-linking
 - **THEN** the resolver falls through to the inference rules (`inactiveNeverLinked` → `activation_guide`; linked-never-authorized → `bank_selection` with resume card) — the view position refines routing only within a session, never replacing server-side inference

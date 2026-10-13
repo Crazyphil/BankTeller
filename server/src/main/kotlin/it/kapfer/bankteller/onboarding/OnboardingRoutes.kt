@@ -148,11 +148,16 @@ fun Route.onboardingRoutes(
                                         // onboarding-view-position): authorization
                                         // completed — the next natural position is
                                         // the Dashboard, and a stale stage must
-                                        // never fabricate progress.
+                                        // never fabricate progress. The EB AIS
+                                        // sessionid and poll base URL are cleared
+                                        // alongside the stage (they are meaningful
+                                        // only for the linking_progress stage).
                                         onboardingStage = null,
                                         stageAspspName = null,
                                         stageAspspCountry = null,
                                         stagePsuType = null,
+                                        sessionid = null,
+                                        stageSessionBaseUrl = null,
                                     ),
                                 )
                             } catch (e: Exception) {
@@ -330,6 +335,8 @@ fun Route.onboardingRoutes(
                         stageAspspName = null,
                         stageAspspCountry = null,
                         stagePsuType = null,
+                        sessionid = null,
+                        stageSessionBaseUrl = null,
                     ),
                 )
                 call.respond(
