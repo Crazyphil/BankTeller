@@ -11,7 +11,7 @@ BankTeller is a **self-hosted banking automation assistant** — a Docker-deploy
 1. **User control is absolute** — No payment is ever initiated without the user's explicit approval. The system prepares, notifies, and waits.
 2. **Single-user by design** — BankTeller serves one user. Enable Banking's free production tier only permits linking your own accounts; multi-user would require a "bring your own key" model that adds complexity without proportional value for this product.
 3. **Self-hosted and private** — The user owns their data. No cloud dependencies beyond Enable Banking API calls. SQLite database, local Docker deployment.
-4. **Simple by default** — Background sync happens automatically. No manual refresh buttons. The system works without the user thinking about it.
+4. **Simple by default** — Sync happens automatically: once on login, then on a background schedule. The user never *needs* to refresh to trust the data. A single explicit "sync now" action exists for the rare case of wanting live data (e.g., waiting for an expected payment); it is debounced and never required for normal use.
 5. **Incrementally configurable** — Essential config (auth credentials, port) in `.env`. Everything else (bank connections, notifications, workflows) configured through a friendly onboarding UI after login.
 
 ## 3. Architecture
@@ -124,7 +124,7 @@ Browser support: Chrome 119+, Firefox 120+, Safari 18.2+, Edge 119+, Samsung Int
 | **SQLite only** | Single-user, self-hosted, no concurrency needs beyond one user |
 | **SQLDelight** | KMP-compatible (goes in `:core`), built-in schema migrations, type-safe SQL access, SQLite-first-class |
 | **No encryption** | Standard SQLite — security is the admin's responsibility (same model as Nextcloud, Home Assistant, Firefly III). Admin protects the Docker volume via filesystem permissions, LUKS, or other mechanisms. Technology-neutral, keeps Docker image simple |
-| **WAL mode + busy_timeout (5s)** | Background sync + on-demand sync + workflow evaluation + payment submission run concurrently. WAL mode enables safe concurrent reads/writes. Busy timeout prevents immediate failures under contention |
+| **WAL mode + busy_timeout (5s)** | Background sync + login/manual sync + workflow evaluation + payment submission run concurrently. WAL mode enables safe concurrent reads/writes. Busy timeout prevents immediate failures under contention |
 | **No DB config in .env** | Fixed convention: file in persistent Docker volume |
 
 SQLite is sufficient for a single-user application. No configuration options are offered — the database lives at a fixed path inside the container, mapped to a persistent Docker volume. SQLDelight provides both the DB access layer and migration framework — `.sq` files define queries, migrations are versioned and applied automatically via `SqlSchema.migrate()`. No external migration tool (Flyway, dbmate) is needed.
@@ -183,15 +183,18 @@ Items NOT in .env (configured via onboarding or auto-generated):
 
 **Critical rule**: Every payment requires explicit user approval. The system never silently initiates a transfer.
 
-### 4.7 Sync Strategy: Background + On-Demand
+### 4.7 Sync Strategy: Background + Login + Manual
 
 | Mode | PSU Headers | Frequency | Rate Limit |
 |------|------------|-----------|------------|
 | **Background sync** | None (offline mode) | ~4x/day (scheduled) | ASPSP rate limit (~4 fetches/day) |
-| **On-demand sync** | All required (online mode) | Unlimited when user is in app | No rate limit |
+| **Login sync** | All required (online mode) | Once per login | No rate limit |
 | **Initial sync** | All required (online mode) | Immediate after account connection | Captures 90-day history window |
+| **Manual sync** | All required (online mode) | User-initiated, debounced (max 1/min, one in-flight sync at a time) | Rare, for live-data needs |
 
-The system does not offer a manual "refresh" button. Sync happens automatically — background by schedule, on-demand when the user opens the app. This keeps the experience simple.
+Sync happens automatically — once on login, then on a background schedule. The user never needs to refresh to trust the data. A single explicit "sync now" action exists for the rare case of wanting live data (e.g., waiting for an expected payment): it sends PSU headers (the user just clicked, so they are demonstrably present), shows a visible syncing state, and is debounced so repeated clicks cannot hammer the API. Workflows never depend on manual sync — they run off the background scheduler's data. Manual sync is purely for the human's eyes.
+
+Banking data is low-frequency (SEPA transfers settle in minutes to hours, card transactions post with delay), so aggressive presence-based polling would burn volume-based API costs and ASPSP goodwill for freshness no one can perceive. The manual sync covers the one legitimate live-data need without that cost.
 
 **90-day history constraint**: Under PSD2, ASPSPs are only required to provide 90 days of transaction history after initial PSU authorization. This is an Enable Banking / regulatory limitation, not a design choice — more than 90 days is only available at the moment of first connection. The system must sync aggressively with PSU headers right after connection to capture this window. The sync engine should use `strategy=longest` when fetching initial transactions to request the maximum available history from each ASPSP. Whatever the bank provides at connection time is all we'll ever get for that period — after the window closes, only ongoing transactions are accessible.
 
@@ -232,7 +235,8 @@ Key constraints:
 
 Responsibilities:
 - Scheduled background sync (~4x/day, no PSU headers)
-- On-demand sync when user is in app (with PSU headers, unlimited)
+- Login sync (with PSU headers, once per login)
+- Manual sync (with PSU headers, user-initiated, debounced — max 1/min, one in-flight sync at a time)
 - Aggressive initial sync after account connection (with PSU headers, capture 90-day history)
 - Track which transactions have been synced (avoid duplicates using `entry_reference` + `identification_hash`)
 - Handle session expiry gracefully (mark session as expired, notify user to re-authorize)
@@ -402,7 +406,7 @@ The first change establishes the infrastructure skeleton. It does NOT implement 
 - Workflow engine and rule evaluation
 - Notification system (Email, Web Push, Apprise)
 - Onboarding UI content
-- Sync engine (background + on-demand)
+- Sync engine (background + login + manual)
 - Account/transaction display
 - Payment initiation and approval flow
 
