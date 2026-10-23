@@ -50,6 +50,9 @@ fun LoginScreen(viewModel: AppViewModel) {
         ScreenShell(
             maxWidth = Dimens.formMaxWidth,
             verticalArrangement = Arrangement.Center,
+            // Explicit (task 8.21): bespoke centered presentation — a scroll
+            // zone would break bounded-height centering.
+            scrollable = false,
         ) {
             // Brand lockup (task 16.4): 48dp theme-aware logo + wordmark in Fraunces headlineMedium.
             BrandLogo(size = Dimens.xxl)

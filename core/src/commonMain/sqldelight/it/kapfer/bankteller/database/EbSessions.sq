@@ -16,7 +16,9 @@ CREATE TABLE eb_sessions (
     aspsp_name TEXT,
     aspsp_country TEXT,
     psu_type TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    valid_until TEXT,
+    logo TEXT
 );
 
 CREATE TABLE accounts (
@@ -33,8 +35,11 @@ CREATE TABLE accounts (
 -- ---------------------------------------------------------------------------
 
 insertSession:
-INSERT INTO eb_sessions(session_id, aspsp_name, aspsp_country, psu_type, created_at)
-VALUES (?, ?, ?, ?, ?);
+INSERT INTO eb_sessions(session_id, aspsp_name, aspsp_country, psu_type, created_at, valid_until, logo)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+updateSessionConsent:
+UPDATE eb_sessions SET valid_until = ? WHERE id = ?;
 
 selectSessionBySessionId:
 SELECT * FROM eb_sessions WHERE session_id = ?;

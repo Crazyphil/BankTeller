@@ -87,6 +87,7 @@ fun Route.onboardingRoutes(
         when {
             // Email-link flow — no session cookie required (regression path, 6.11)
             oobCode != null -> {
+                logger.info("EB callback: email-link branch (oobCode present, state={})", state)
                 service.handleCallback(state, oobCode) // captures oobCode as side-effect
                 serveSpaBundle(call)
             }
@@ -99,6 +100,7 @@ fun Route.onboardingRoutes(
                     // not the EB email-link flow). The code is single-use and
                     // time-limited, so it is discarded; the SPA resumes via
                     // GET /api/onboarding/state after re-login.
+                    logger.warn("EB callback: auth branch WITHOUT session cookie — code discarded, redirecting to login")
                     call.respondRedirect("/")
                     return@get
                 }
@@ -106,6 +108,10 @@ fun Route.onboardingRoutes(
                 // Decode the state JWT and bind it to this session.
                 val sessionId = state?.let { stateJwt?.verify(it) }
                 if (sessionId == null || sessionId != session.username) {
+                    logger.warn(
+                        "EB callback: state mismatch — stateJwt resolved={}, session username={}",
+                        sessionId, session.username,
+                    )
                     call.sessions.set(session.copy(
                         authError = "State mismatch — please retry the authorization",
                         authErrorKind = "unexpected",
@@ -116,6 +122,7 @@ fun Route.onboardingRoutes(
 
                 val client = enableBankingClientFactory?.invoke()
                 if (client == null) {
+                    logger.warn("EB callback: no Enable Banking client factory configured")
                     call.sessions.set(session.copy(
                         authError = "Technical error",
                         authErrorKind = "unexpected",
@@ -126,11 +133,20 @@ fun Route.onboardingRoutes(
                 try {
                     when (val result = client.authorizeSession(code)) {
                         is AuthorizeSessionResult.Ok -> {
+                            logger.info(
+                                "EB callback: authorizeSession OK — sessionId={}, accounts={}",
+                                result.sessionId, result.accounts.size,
+                            )
                             // Phase 2 of the auth-callback handling: persist the
                             // session + merge accounts server-side (phase 1 was
                             // the authorizeSession() call above). On failure keep
                             // the user logged in but surface a retryable error.
                             try {
+                                // The authorize response's `aspsp` object uses EB's
+                                // minimal ASPSP schema (name + country only — no
+                                // logo, per the OpenAPI). The logo staged at
+                                // POST /api/auth (from the already-fetched bank
+                                // list) is the authoritative fallback.
                                 ebSessionStore.mergeSession(
                                     sessionId = result.sessionId,
                                     aspspName = result.aspsp?.name,
@@ -139,7 +155,11 @@ fun Route.onboardingRoutes(
                                     accounts = result.accounts.map {
                                         EbSessionStore.MergedAccount(it.iban, it.uid, it.currency, it.name)
                                     },
+                                    validUntil = result.access?.validUntil,
+                                    logo = result.aspsp?.logo?.takeIf { it.isNotEmpty() }
+                                        ?: session.stageAspspLogo,
                                 )
+                                logger.info("EB callback: session persisted, stage cleared, pendingInitialImport set")
                                 call.sessions.set(
                                     session.copy(
                                         authError = null,
@@ -158,6 +178,12 @@ fun Route.onboardingRoutes(
                                         stagePsuType = null,
                                         sessionid = null,
                                         stageSessionBaseUrl = null,
+                                        stageAspspLogo = null,
+                                        // One-shot signal (spec: wizard-initial-import):
+                                        // a freshly authorized session's initial
+                                        // balance import is pending. Cleared on the
+                                        // next GET /api/onboarding/state read.
+                                        pendingInitialImport = true,
                                     ),
                                 )
                             } catch (e: Exception) {
@@ -169,6 +195,7 @@ fun Route.onboardingRoutes(
                             }
                         }
                         is AuthorizeSessionResult.Error -> {
+                            logger.warn("EB callback: authorizeSession ERROR — {}", result.message)
                             call.sessions.set(session.copy(
                                 authError = result.message,
                                 authErrorKind = "unexpected",
@@ -214,6 +241,10 @@ fun Route.onboardingRoutes(
 
             // Neither param — preserve the previous missing-oobCode behavior
             else -> {
+                logger.warn(
+                    "EB callback: neither oobCode nor code nor error present — state={}, params={}",
+                    state, call.request.queryParameters.names(),
+                )
                 service.handleCallback(state, null)
                 serveSpaBundle(call)
             }

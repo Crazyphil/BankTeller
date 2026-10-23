@@ -9,6 +9,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import it.kapfer.bankteller.onboarding.WizardFlowContext
+import it.kapfer.bankteller.onboarding.wizardFlowContextFor
 
 /**
  * The possible screens in the SPA.
@@ -36,6 +38,22 @@ enum class OnboardingStep {
     AuthProgress,
 }
 
+/**
+ * The connect step set reachable in add-mode (spec: add-bank entry point,
+ * design D15/D16; task 7.4 structural mode separation). The wizard's
+ * add-bank flow reuses exactly these connect steps; the onboarding-only
+ * steps (email entry, waiting for authentication, registration review,
+ * verifying, activation guide) are STRUCTURALLY excluded — mode-aware step
+ * resolution ([AppViewModel.resolvedWizardStep]) never renders them while
+ * add-mode is active. The import step is signal-driven, not an enum member,
+ * and therefore needs no mode gating.
+ */
+val AddModeSteps: Set<OnboardingStep> = setOf(
+    OnboardingStep.BankSelection,
+    OnboardingStep.LinkingProgress,
+    OnboardingStep.AuthProgress,
+)
+
 /** State for bank list fetching. */
 sealed class AspspsState {
     data object Loading : AspspsState()
@@ -52,6 +70,31 @@ data class ProductionFieldOverrides(
     val gdprEmail: String,
     val privacyUrl: String,
     val termsUrl: String,
+)
+
+/**
+ * The pre-selected bank of a direct re-authorization flow (spec:
+ * account-overview consent health — tasks 9.3/9.5; onboarding 10.1/10.2):
+ * entered from the dashboard's consent notices or the auth-failure notice's
+ * retry, the wizard starts DIRECTLY at AuthProgress with this bank — bank
+ * selection (which blocks connected banks) is skipped entirely.
+ *
+ * Client-side flow state, exactly like add-mode: no server round-trip marks
+ * the mode, and a reload abandons it.
+ */
+data class ReAuthBank(
+    val name: String,
+    val country: String,
+    /** The authorization's PSU type — feeds POST /api/auth without a selection. */
+    val psuType: String,
+    /** Bank logo URL for display; null when unknown. */
+    val logo: String? = null,
+    /**
+     * True when the connected bank carries stored accounts — gates the
+     * replacement explainer at AuthProgress (the new account selection
+     * replaces the previous one for this bank).
+     */
+    val hasStoredAccounts: Boolean = false,
 )
 
 /**
@@ -93,6 +136,78 @@ class AppViewModel(
     // ---------------------------------------------------------------
 
     var onboardingStep by mutableStateOf(OnboardingStep.EmailEntry)
+        private set
+
+    /**
+     * Enabled while the dashboard's "Add bank" control has navigated the user
+     * into the wizard in add-mode (spec: add-bank entry point; tasks 7.3–7.5).
+     *
+     * Add-mode is CLIENT-SIDE STATE ONLY: it is set by [startAddBankFlow] and
+     * cleared by [exitAddMode] — no server round-trip marks the mode, and a
+     * page reload at any point abandons the flow to the dashboard (the normal
+     * resolver never re-enters add-mode: every dashboard user holds an
+     * eb_sessions row, so the gate's route switch resolves `dashboard`).
+     */
+    var addModeActive: Boolean by mutableStateOf(false)
+        private set
+
+    /** Convenience accessor for callers that phrase the flag as a mode query. */
+    val isAddMode: Boolean
+        get() = addModeActive
+
+    /**
+     * Enabled while a direct re-authorization flow is active (spec:
+     * account-overview consent health — tasks 9.3/9.5): the wizard is
+     * entered directly at AuthProgress with [reAuthBank] pre-selected,
+     * skipping bank selection entirely (bank selection blocks connected
+     * banks — the bank being re-authorized is by definition connected).
+     *
+     * Client-side state only, mirroring [addModeActive]: set by
+     * [startReauthorizationFlow], cleared by [exitReAuthMode]; a page
+     * reload at any point abandons the flow to the dashboard.
+     */
+    var reAuthActive: Boolean by mutableStateOf(false)
+        private set
+
+    /** Convenience accessor for callers that phrase the flag as a mode query. */
+    val isReAuthMode: Boolean
+        get() = reAuthActive
+
+    /** The pre-selected bank of the active re-authorization flow; null outside it. */
+    var reAuthBank: ReAuthBank? by mutableStateOf(null)
+        private set
+
+    /**
+     * The bank triple the AuthProgress retry actions target: the
+     * re-authorization bank when a re-auth flow is active, otherwise the
+     * server-stored stage bank (cold-boot restore).
+     */
+    val authRetryBank: SelectedBank?
+        get() = reAuthBank?.let { SelectedBank(it.name, it.country, it.psuType) }
+            ?: stageBankFromState
+
+    /**
+     * The re-authorization bank looked up in the loaded ASPSP catalog (for
+     * advisory status display at AuthProgress); null outside a re-auth flow
+     * or when the catalog is not loaded.
+     */
+    val reAuthBankAspsp: Aspssp?
+        get() {
+            val bank = reAuthBank ?: return null
+            val loaded = aspspsState as? AspspsState.Loaded ?: return null
+            return loaded.aspsps.firstOrNull { it.name == bank.name && it.country == bank.country }
+        }
+
+    /**
+     * The known registration environment (`"SANDBOX"`/`"PRODUCTION"`), or
+     * null when unknown. Populated from the state endpoint's `environment`
+     * re-export on cold boot ([checkOnboardingStatus]) and from the in-session
+     * registration selection ([submitRegistration]). Consumed by the
+     * BankSelection environment branch (spec: SPA BankSelection step): a known
+     * SANDBOX selection advances directly to authorization — the SPA never
+     * guesses sandbox (null keeps the link-first path).
+     */
+    var registrationEnvironment: String? by mutableStateOf(null)
         private set
 
     var onboardingStateToken by mutableStateOf<String?>(null)
@@ -209,10 +324,81 @@ class AppViewModel(
         private set
 
     val isResumeMode: Boolean
-        get() = selectedBankFromState != null && !resumeCardDismissed
+        // Add-mode structural exclusion (task 7.4): the resume-card / stage
+        // restoration machinery is never active while add-mode is — the
+        // add-flow always starts with a fresh selection.
+        get() = selectedBankFromState != null && !resumeCardDismissed && !addModeActive
+
+    /**
+     * Mode-aware step resolution (spec: add-bank entry point — structural
+     * mode separation; task 7.4). The wizard dispatch reads this value, never
+     * [onboardingStep] directly. In add-mode an onboarding-only step
+     * (email entry, waiting for authentication, registration review,
+     * verifying, activation guide) is STRUCTURALLY unreachable: the resolved
+     * step is coerced to [OnboardingStep.BankSelection], which the
+     * add-mode exit affordance observes to abandon to the dashboard. The
+     * connect steps (BankSelection / LinkingProgress / AuthProgress — the
+     * [AddModeSteps] set) pass through unchanged. The import step stays
+     * signal-driven (it is not an enum member) and needs no mode gating.
+     */
+    val resolvedWizardStep: OnboardingStep
+        get() = if (addModeActive && onboardingStep !in AddModeSteps) {
+            OnboardingStep.BankSelection
+        } else {
+            onboardingStep
+        }
+
+    /**
+     * Flow-derived wizard chrome (spec: onboarding — wizard flow context,
+     * task 10.1): identity, canonical step set, position, eyebrow, and
+     * progress composition for the CURRENT flow — derived in this single
+     * place (precedence: re-authorization > add-bank > initial setup,
+     * split by registration environment) and consumed by every
+     * [it.kapfer.bankteller.onboarding.OnboardingScreen] scaffold call.
+     */
+    internal fun wizardFlowContext(): WizardFlowContext = wizardFlowContextFor(
+        step = resolvedWizardStep,
+        reAuthMode = reAuthActive,
+        addMode = addModeActive,
+        environment = registrationEnvironment,
+    )
 
     var authRedirectUrl: String? by mutableStateOf(null)
         private set
+
+    // ---------------------------------------------------------------
+    // Dashboard state (account-overview)
+    // ---------------------------------------------------------------
+
+    /** Last-known /api/accounts payload; null until the first successful fetch. */
+    var accountsData: AccountsData? by mutableStateOf(null)
+        private set
+
+    /** True while a dashboard fetch is in flight (stale-while-revalidate keeps old data visible). */
+    var accountsLoading: Boolean by mutableStateOf(false)
+        private set
+
+    /** True while a manual refresh (POST /api/sync) was accepted and its run is in flight. */
+    var refreshRequested: Boolean by mutableStateOf(false)
+        private set
+
+    /** Non-null when the manual refresh is in cooldown (seconds remaining) — quiet, no countdown. */
+    var refreshCooldownSeconds: Long? by mutableStateOf(null)
+        private set
+
+    /** True while the wizard initial-import step is active (transient client state only). */
+    var importInProgress: Boolean by mutableStateOf(false)
+        private set
+
+    /** True when the wizard initial import failed and retry / continue-anyway are offered. */
+    var importFailed: Boolean by mutableStateOf(false)
+        private set
+
+    /** Non-null while the dashboard poll (accounts while sync in flight) is active. */
+    private var accountsPollJob: Job? = null
+
+    /** Non-null while a cooldown tick timer is active. */
+    private var cooldownJob: Job? = null
 
     // ---------------------------------------------------------------
     // Dependencies
@@ -335,6 +521,10 @@ class AppViewModel(
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
         stopLinkingSessionPoll()
+        stopAccountsPoll()
+        stopCooldownTimer()
+        importInProgress = false
+        importFailed = false
         viewModelScope.launch {
             apiClient.logout()
             isAuthenticated = false
@@ -343,6 +533,181 @@ class AppViewModel(
             loginError = null
             isRateLimited = false
             resetOnboardingState()
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Actions — dashboard (account-overview)
+    // ---------------------------------------------------------------
+
+    /**
+     * Fetches GET /api/accounts into [accountsData]. Stale-while-revalidate
+     * (design D6): a failed fetch keeps the last-known data — the dashboard
+     * never blocks on a transient error. Does NOT set [isLoading] (a data
+     * prefetch must not gate the app's action buttons).
+     */
+    fun refreshAccounts(quiet: Boolean = true) {
+        viewModelScope.launch {
+            if (!quiet) accountsLoading = true
+            val data = apiClient.getAccounts()
+            if (data != null) {
+                accountsData = data
+                if (data.syncInProgress) {
+                    startAccountsPoll()
+                } else {
+                    stopAccountsPoll()
+                }
+            }
+            accountsLoading = false
+        }
+    }
+
+    /**
+     * Manual refresh (POST /api/sync). On acceptance, arms [refreshRequested]
+     * and polls /api/accounts until the run completes (sync_in_progress=false)
+     * — the dashboard updates silently (design D6). On cooldown, arms the
+     * quiet cooldown state (no countdown; design D7).
+     */
+    fun triggerRefresh() {
+        viewModelScope.launch {
+            val result = apiClient.triggerSync()
+            when {
+                result == null -> {
+                    // Transient request failure — nothing to show (quiet).
+                }
+                result.started -> {
+                    refreshRequested = true
+                    // Arm the local cooldown window at trigger time — the
+                    // server anchors its debounce at the run's START, so the
+                    // window is already ticking while the sync is in flight.
+                    // During syncing the waiting indicator shadows the
+                    // cooldown state; when the run completes, the control
+                    // renders the cooldown presentation for the remainder
+                    // of the window instead of returning to clickable
+                    // (spec: refresh affordance — visibly disabled through
+                    // the whole debounce window, not discover-on-click).
+                    refreshCooldownSeconds = MANUAL_REFRESH_COOLDOWN_SECONDS
+                    startCooldownTimer(MANUAL_REFRESH_COOLDOWN_SECONDS)
+                    startAccountsPoll()
+                }
+                result.cooldownRemainingSeconds != null -> {
+                    refreshCooldownSeconds = result.cooldownRemainingSeconds
+                    startCooldownTimer(result.cooldownRemainingSeconds)
+                }
+            }
+        }
+    }
+
+    /**
+     * Wizard initial import (spec: wizard-initial-import). Called when the
+     * one-shot pending_initial_import signal is consumed after the resolver
+     * returns dashboard. Triggers POST /api/onboarding/import-balances and
+     * observes completion via the /api/accounts in-flight flag. Failure
+     * offers retry + continue-anyway; continue routes to the dashboard in
+     * its degraded (never_synced) presentation.
+     */
+    fun startInitialImport() {
+        importInProgress = true
+        importFailed = false
+        viewModelScope.launch {
+            val result = apiClient.importBalances()
+            if (result == null || !result.started) {
+                // The trigger itself failed — offer retry / continue-anyway.
+                importFailed = true
+                return@launch
+            }
+            // Observe completion via the in-flight flag (poll /api/accounts).
+            var attempts = 0
+            while (attempts < 600) { // bounded: ~30 min at 3s cadence
+                delay(3000L)
+                val data = apiClient.getAccounts()
+                if (data == null) {
+                    attempts++
+                    continue // transient fetch failure — keep waiting
+                }
+                accountsData = data
+                if (!data.syncInProgress) {
+                    importInProgress = false
+                    importFailed = false
+                    currentScreen = Screen.Dashboard
+                    return@launch
+                }
+                attempts++
+            }
+            // Bounded wait exhausted — treat as failure (retry offered).
+            importInProgress = false
+            importFailed = true
+        }
+    }
+
+    /** Retry the wizard initial import after a failure. */
+    fun retryInitialImport() {
+        startInitialImport()
+    }
+
+    /**
+     * Continue-anyway after a failed/abandoned import: route to the
+     * dashboard with whatever data exists (degraded never_synced
+     * presentation). Transient client state only — a reload routes per
+     * the normal resolver.
+     */
+    fun continueToDashboard() {
+        importInProgress = false
+        importFailed = false
+        currentScreen = Screen.Dashboard
+        refreshAccounts()
+    }
+
+    /** Stops the accounts poll (sync-in-flight observation). */
+    private fun stopAccountsPoll() {
+        accountsPollJob?.cancel()
+        accountsPollJob = null
+    }
+
+    /**
+     * Polls /api/accounts at a modest cadence while a sync run is in flight
+     * (design D13). Stops itself once the run completes. Silent — updates
+     * land in [accountsData] and recompose the dashboard quietly.
+     */
+    private fun startAccountsPoll() {
+        if (accountsPollJob?.isActive == true) return
+        accountsPollJob = viewModelScope.launch {
+            while (true) {
+                delay(3000L)
+                val data = apiClient.getAccounts()
+                if (data != null) {
+                    accountsData = data
+                    if (!data.syncInProgress) {
+                        refreshRequested = false
+                        accountsPollJob = null
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    /** Stops the cooldown tick timer. */
+    private fun stopCooldownTimer() {
+        cooldownJob?.cancel()
+        cooldownJob = null
+    }
+
+    /**
+     * Ticks the quiet cooldown down to zero. No countdown is ever shown
+     * (design D7) — the state only drives the disabled refresh control.
+     */
+    private fun startCooldownTimer(seconds: Long) {
+        stopCooldownTimer()
+        var remaining = seconds
+        cooldownJob = viewModelScope.launch {
+            while (remaining > 0) {
+                delay(1000L)
+                remaining--
+                refreshCooldownSeconds = remaining.coerceAtLeast(0L)
+            }
+            refreshCooldownSeconds = null
+            cooldownJob = null
         }
     }
 
@@ -393,6 +758,9 @@ class AppViewModel(
         authErrorKind = state.authErrorKind
         authorizationId = state.authorizationId
         linkedBanks = state.linkedBanks
+        // Cold-boot environment re-export (design D16): the SPA branches on
+        // the server-resolved value — it never guesses sandbox itself.
+        registrationEnvironment = state.environment
 
         // Presentation-only notes (5.3): surfaced regardless of route.
         if (state.appState == "inactiveButLinked") surfaceInactiveButLinkedNote()
@@ -424,7 +792,7 @@ class AppViewModel(
                 "bank_selection" -> restoreBankSelection(state)
                 // "dashboard" and any unknown value: server said onboarding is
                 // complete (or an unrecognized future route) → don't block.
-                else -> currentScreen = Screen.Dashboard
+                else -> routeDashboard(state)
             }
             return
         }
@@ -468,6 +836,35 @@ class AppViewModel(
             if (status.appState == "inactiveButLinked") surfaceInactiveButLinkedNote()
             surfacePendingActionNote(status.pendingAction)
             routeByWhitelistAndSessions(state)
+        }
+    }
+
+    /**
+     * Route `dashboard` (and unknown routes): the account overview. When the
+     * one-shot pending_initial_import signal was consumed by this very state
+     * read (fresh authorization), the wizard import step runs first (spec:
+     * wizard-initial-import) — otherwise the dashboard loads with a
+     * stale-while-revalidate accounts fetch.
+     *
+     * A failed authorization cold-boots here too (task 9.5): the server keeps
+     * authCompleted outranking every stored stage, so the failed re-auth /
+     * add-flow lands on the dashboard with `auth_error` set — and with the
+     * staged bank still reported (stage_bank is only cleared on auth
+     * SUCCESS). The staged triple is captured for the notice's retry
+     * derivation ([retryAuthFailureNotice] matches it against the loaded
+     * /api/accounts banks: connected → direct re-authorization, not →
+     * add-flow at bank selection). Captured ONLY in the failure window —
+     * a clean dashboard load never touches the restore machinery.
+     */
+    private fun routeDashboard(state: OnboardingState) {
+        currentScreen = Screen.Dashboard
+        if (state.authError != null) {
+            stageBankFromState = state.stageBank
+        }
+        if (state.pendingInitialImport) {
+            startInitialImport()
+        } else {
+            refreshAccounts()
         }
     }
 
@@ -834,8 +1231,21 @@ class AppViewModel(
             onboardingIsVerifying = false
             if (result.success) {
                 onboardingResultActive = result.active
-                if (result.active == true) {
+                if (result.active == true && environment != "SANDBOX") {
+                    // PRODUCTION: auto-activated → the onboarding gate closes.
                     currentScreen = Screen.Dashboard
+                } else if (result.active == true) {
+                    // SANDBOX (spec: SPA BankSelection step, scenario 7.2):
+                    // auto-activated, but the onboarding gate stays OPEN — the
+                    // registration only counts as done once a session has been
+                    // authorized. Continue at bank selection directly, skipping
+                    // the ActivationGuide (its two-step copy covers account
+                    // linking, which sandbox onboarding does not include).
+                    // The in-session environment is recorded so the sandbox
+                    // branch applies to the upcoming selection immediately.
+                    registrationEnvironment = environment
+                    currentScreen = Screen.Onboarding
+                    onboardingStep = OnboardingStep.BankSelection
                 } else {
                     onboardingStep = OnboardingStep.ActivationGuide
                 }
@@ -913,6 +1323,220 @@ class AppViewModel(
         // Don't call loadAspsps() here — the BankSelectionStep composable's
         // LaunchedEffect loads when it enters composition (if state is Loading).
         // Calling it here too would fire two concurrent requests.
+    }
+
+    // ---------------------------------------------------------------
+    // Add-mode (spec: add-bank entry point; tasks 7.3 – 7.5)
+    // ---------------------------------------------------------------
+
+    /**
+     * Client-side navigation into the wizard at bank selection in add-mode
+     * (spec: add-bank entry point — "No server-side mode, no server call to
+     * enter"): the dashboard "Add bank" control routes here. The flow reuses
+     * the wizard's connect steps with a fresh selection:
+     * - add-mode is in-memory client state only — a reload at any point
+     *   abandons it (the resolver never re-enters the wizard for a user who
+     *   already holds an eb_sessions row);
+     * - selection residue from a prior linking/auth attempt is cleared so
+     *   every entry starts clean;
+     * - resume-mode machinery stays off (see [isResumeMode]) while the
+     *   server-derived `linked_banks` selection-routing remains active.
+     */
+    fun startAddBankFlow() {
+        stopLinkingSessionPoll()
+        selectedAspsp = null
+        selectedPsuType = "personal"
+        psuIdHash = null
+        linkAuthorizationUrl = null
+        linkError = null
+        linkStatusChecking = false
+        authRedirectUrl = null
+        addModeActive = true
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.BankSelection
+        // No loadAspsps() here — the BankSelectionStep enter effect fetches
+        // on composition (the dashboard visit already cached the catalog).
+    }
+
+    /**
+     * Abandon add-mode and return to the dashboard (spec: add-bank entry
+     * point — "Wizard exit in add-mode abandons to the dashboard"; task 7.4).
+     * Reuses the cancel-linking touchpoint: its `bank_selection` stage write
+     * is a dead letter in add-mode (the resolver never routes on it), and it
+     * clears any stale one-shot authError server-side. The one-shot signals
+     * are cleared locally too so the dashboard notice cannot linger past a
+     * deliberate exit. Pure client-side: a reload would land here anyway.
+     */
+    fun exitAddMode() {
+        addModeActive = false
+        stopLinkingSessionPoll()
+        authError = null
+        authFailed = false
+        authErrorKind = null
+        authorizationId = null
+        currentScreen = Screen.Dashboard
+        refreshAccounts()
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+        }
+    }
+
+    /**
+     * Dismiss the dashboard auth-failure notice (task 7.5): consumes and
+     * clears the one-shot `authError`/`authErrorKind` signals locally and
+     * via the cancel-linking touchpoint (the server-side clear), so the
+     * notice does not recur on subsequent cold boots. Stays on the dashboard.
+     */
+    fun dismissAuthFailureNotice() {
+        authError = null
+        authFailed = false
+        authErrorKind = null
+        authorizationId = null
+        // The staged bank was captured only for the retry derivation — with
+        // the signals consumed it must not leak into later flow entries.
+        stageBankFromState = null
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+        }
+    }
+
+    /**
+     * Retry affordance of the dashboard auth-failure notice (task 7.5):
+     * RE-ENTERS the add-flow at bank selection with a fresh selection — it
+     * never re-initiates POST /api/auth directly with stale state. Consumes
+     * and clears the one-shot signals (locally + via cancel-linking) exactly
+     * like [dismissAuthFailureNotice], so a later cold boot cannot re-show
+     * the notice.
+     */
+    fun retryAddBankFlow() {
+        dismissAuthFailureNotice()
+        startAddBankFlow()
+    }
+
+    // ---------------------------------------------------------------
+    // Re-authorization mode (spec: account-overview consent health —
+    // tasks 9.3/9.5; onboarding 10.1/10.2)
+    // ---------------------------------------------------------------
+
+    /**
+     * Enter the wizard DIRECTLY at the AuthProgress step with the bank
+     * pre-selected (spec: consent health — reason-agnostic re-authorization
+     * entry for the consent-dead, expired, and expiring notices). The
+     * bank identity and psu_type come from the session data in
+     * GET /api/accounts ([BankData]); the wizard's bank selection is
+     * skipped entirely, and POST /api/auth fires immediately with the
+     * pre-selected triple.
+     *
+     * When the bank carries stored accounts the AuthProgress step shows the
+     * replacement explainer — the new account selection replaces the
+     * previous one for this bank.
+     */
+    fun startReauthorizationFlow(bank: BankData) {
+        startReauthorizationFlowWith(
+            ReAuthBank(
+                name = bank.bankName,
+                country = bank.bankCountry,
+                // The accounts payload's psu_type feeds the auth POST; a
+                // server predating the field falls back to the wizard's
+                // default account type (the same default every fresh
+                // selection starts from).
+                psuType = bank.psuType?.takeIf { it.isNotBlank() } ?: "personal",
+                logo = bank.logo,
+                hasStoredAccounts = bank.accounts.isNotEmpty(),
+            ),
+        )
+    }
+
+    /**
+     * Abandon the re-authorization flow and return to the dashboard (task
+     * 10.2 — "Back to dashboard"): mirrors [exitAddMode] — the
+     * cancel-linking touchpoint clears any stale one-shot authError
+     * server-side, the signals are cleared locally too, and the accounts
+     * reload refreshes consent state. Pure client-side: a reload would
+     * land on the dashboard anyway.
+     */
+    fun exitReAuthMode() {
+        reAuthActive = false
+        reAuthBank = null
+        stopLinkingSessionPoll()
+        authError = null
+        authFailed = false
+        authErrorKind = null
+        authorizationId = null
+        currentScreen = Screen.Dashboard
+        refreshAccounts()
+        viewModelScope.launch {
+            apiClient.cancelLinking()
+        }
+    }
+
+    /**
+     * Retry affordance of the dashboard auth-failure notice (task 9.5):
+     * RE-ENTERS the flow the user was in — never a mode-blind bank list.
+     * Derivation (cold boot after the EB callback, client state gone): the
+     * server's GET /api/onboarding/state still reports the staged bank
+     * (stage_bank — the attempted triple incl. psu_type, only cleared on
+     * auth SUCCESS). Staged bank connected (matched against the loaded
+     * /api/accounts banks) → a re-authorization failure → retry re-enters
+     * the DIRECT re-authorization path at AuthProgress with the same bank
+     * pre-selected (bank selection would block the connected bank).
+     * Otherwise → an add-flow failure → retry re-enters at bank selection
+     * ([retryAddBankFlow]).
+     *
+     * An in-session re-auth bank (re-auth flow whose failure surfaced on
+     * the dashboard) always retries the direct re-authorization path.
+     */
+    fun retryAuthFailureNotice() {
+        val reAuth = deriveRetryReAuthBank()
+        dismissAuthFailureNotice()
+        if (reAuth != null) {
+            startReauthorizationFlowWith(reAuth)
+        } else {
+            startAddBankFlow()
+        }
+    }
+
+    /**
+     * Derives the re-authorization retry target, or null when the failure
+     * belongs to an add-flow (retry re-enters at bank selection). The
+     * staged bank's psu_type must be known — a direct re-auth POST
+     * /api/auth cannot guess between personal/business.
+     */
+    private fun deriveRetryReAuthBank(): ReAuthBank? {
+        reAuthBank?.let { return it }
+        val stage = stageBankFromState ?: return null
+        if (stage.psuType.isNullOrBlank()) return null
+        val connected = accountsData?.banks
+            ?.firstOrNull { it.bankName == stage.aspspName && it.bankCountry == stage.aspspCountry }
+            ?: return null
+        return ReAuthBank(
+            name = connected.bankName,
+            country = connected.bankCountry,
+            psuType = stage.psuType!!,
+            logo = connected.logo,
+            hasStoredAccounts = connected.accounts.isNotEmpty(),
+        )
+    }
+
+    /** Shared re-authorization entry: primes the mode, routes, and fires POST /api/auth. */
+    private fun startReauthorizationFlowWith(bank: ReAuthBank) {
+        stopLinkingSessionPoll()
+        selectedAspsp = null
+        selectedPsuType = bank.psuType
+        psuIdHash = null
+        linkAuthorizationUrl = null
+        linkError = null
+        linkStatusChecking = false
+        authRedirectUrl = null
+        addModeActive = false
+        reAuthActive = true
+        reAuthBank = bank
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.AuthProgress
+        // POST /api/auth with the pre-selected bank identity + psu_type —
+        // the same call the selection-derived paths make, fed from the
+        // re-auth state instead of a bank-list selection.
+        startAuth(bank.name, bank.country, bank.psuType)
     }
 
     fun loadAspsps() {
@@ -1011,10 +1635,28 @@ class AppViewModel(
         // Already-linked bank selected from the plain bank list → skip the
         // LinkingProgress step and continue directly to authorization via the
         // existing resume-card path (PSU type confirmed on the selected-bank
-        // card as usual). Not-linked / unknown (empty linked_banks) keeps the
+        // card as usual). NOT-linked / unknown (empty linked_banks) keeps the
         // link-first path below.
-        if (isBankLinked(aspsp)) {
+        // Task 9.2: the skip applies ONLY to banks that are linked but NOT
+        // yet connected (no eb_sessions row). A CONNECTED bank holds exactly
+        // one live authorization and is never routed directly to auth
+        // progress from bank selection — its entry is blocked in the UI,
+        // and this routing guard keeps the same-bank re-authorization path
+        // unreachable even if a stale selection slips through.
+        if (isBankLinked(aspsp) && !aspsp.connected) {
             continueResumeWithBank()
+            return
+        }
+        // Sandbox environment branch (spec: SPA BankSelection step, design
+        // D16): registration environment KNOWN to be SANDBOX → selecting a
+        // bank advances directly to AuthProgress — sandbox has no linking
+        // step (linked_banks is empty and the link-first path never applies).
+        // The branch is environment-dependent only; the linked_banks
+        // selection-routing above stays active and environment-independent.
+        // Unknown/null environment keeps the link-first path (the SPA never
+        // guesses sandbox).
+        if (registrationEnvironment == "SANDBOX") {
+            startAuth(aspsp.name, aspsp.country, selectedPsuType)
             return
         }
         isLoading = true
@@ -1274,9 +1916,13 @@ class AppViewModel(
      * re-selection, no new link attempt.
      */
     fun retryAuth() {
-        // Prefer the stored stage bank triple (attempted at POST /api/auth);
-        // fall back to the in-session selection from the bank list.
-        val bank = stageBankFromState
+        // Prefer the re-authorization bank (direct re-auth flow — task
+        // 9.3), then the stored stage bank triple (attempted at POST
+        // /api/auth); fall back to the in-session selection from the bank
+        // list.
+        val bank = reAuthBank?.let {
+            SelectedBank(aspspName = it.name, aspspCountry = it.country, psuType = it.psuType)
+        } ?: stageBankFromState
             ?: selectedAspsp?.let {
                 SelectedBank(aspspName = it.name, aspspCountry = it.country, psuType = selectedPsuType)
             } ?: run {
@@ -1333,6 +1979,10 @@ class AppViewModel(
         stageBankFromState = null
         linkedBanks = emptyList()
         authRedirectUrl = null
+        registrationEnvironment = null
+        addModeActive = false
+        reAuthActive = false
+        reAuthBank = null
     }
 
     /**
@@ -1349,6 +1999,18 @@ class AppViewModel(
         registrationProgressPollJob?.cancel()
         registrationProgressPollJob = null
         stopLinkingSessionPoll()
+        stopAccountsPoll()
+        stopCooldownTimer()
         viewModelScope.cancel()
+    }
+
+    companion object {
+        /**
+         * Local mirror of the server's manual-sync debounce window
+         * (BalanceSyncEngine.manualCooldownMillis = 60s, anchored at the
+         * run's start). Drives the visibly-disabled cooldown presentation
+         * of the refresh control (spec: refresh affordance).
+         */
+        const val MANUAL_REFRESH_COOLDOWN_SECONDS = 60L
     }
 }

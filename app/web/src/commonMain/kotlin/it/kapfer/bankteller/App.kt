@@ -24,6 +24,10 @@ import it.kapfer.bankteller.ui.theme.BankTellerTheme
  * - `/privacy`, `/terms`, and `/enable-banking-callback` are rendered directly
  *   by the SPA, bypassing the auth gate entirely.
  * - Early-return when `getCurrentPathname()` matches one of these routes.
+ * - `/sandbox-credentials` (task 8.6, design D18): the sandbox-credentials
+ *   popup — the only public route making an API call (session-cookie
+ *   GET /api/aspsps); a 401 renders the popup's in-window error, never a
+ *   login redirect.
  */
 @Composable
 fun App() {
@@ -34,6 +38,7 @@ fun App() {
         "/privacy" -> { BankTellerTheme { PrivacyScreen() }; return }
         "/terms" -> { BankTellerTheme { TermsScreen() }; return }
         "/enable-banking-callback" -> { BankTellerTheme { CallbackScreen() }; return }
+        "/sandbox-credentials" -> { BankTellerTheme { SandboxCredentialsScreen() }; return }
     }
 
     // Auth-gated flow (existing)

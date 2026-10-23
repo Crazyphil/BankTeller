@@ -109,6 +109,85 @@ actual fun localStorageGet(key: String): String? = localStorageGetJs(key)
 actual fun localStorageSet(key: String, value: String) { localStorageSetJs(key, value) }
 actual fun localStorageRemove(key: String) { localStorageRemoveJs(key) }
 
+@JsFun("() => Date.now()")
+private external fun dateNowJs(): Double
+
+actual fun getCurrentEpochMillis(): Long = dateNowJs().toLong()
+
+@JsFun("(value) => { const t = Date.parse(value); return isNaN(t) ? null : t; }")
+private external fun parseRfc3339Js(value: String): Double?
+
+actual fun parseRfc3339ToEpochMillis(value: String?): Long? {
+    if (value == null) return null
+    return parseRfc3339Js(value)?.toLong()
+}
+
+@JsFun("(text) => navigator.clipboard.writeText(text)")
+private external fun copyToClipboardJs(text: String)
+
+actual fun copyToClipboard(text: String) {
+    copyToClipboardJs(text)
+}
+
+@JsFun("(url) => window.open(url, 'bankteller_sandbox_credentials', 'width=460,height=580,resizable=yes')")
+private external fun openSandboxCredentialsPopupJs(url: String)
+
+actual fun openSandboxCredentialsPopup(url: String) {
+    openSandboxCredentialsPopupJs(url)
+}
+
+@JsFun(
+    "() => { try { window.localStorage.setItem('bankteller_sandbox_popup_open', '1'); " +
+            "window.addEventListener('unload', () => window.localStorage.removeItem('bankteller_sandbox_popup_open')); " +
+            "window.addEventListener('storage', (e) => { " +
+            "if (e.key === 'bankteller_sandbox_popup_open' && e.newValue === null) { window.close(); } }); " +
+            "} catch (e) {} }"
+)
+private external fun setSandboxPopupOpenMarkerJs()
+
+actual fun setSandboxPopupOpenMarker() {
+    setSandboxPopupOpenMarkerJs()
+}
+
+@JsFun(
+    "() => { try { const w = window.open('', 'bankteller_sandbox_credentials'); " +
+            "if (w) { w.close(); return true; } return false; } catch (e) { return false; } }"
+)
+private external fun closeNamedSandboxCredentialsPopupJs(): Boolean
+
+actual fun closeNamedSandboxCredentialsPopup(): Boolean = closeNamedSandboxCredentialsPopupJs()
+
+@JsFun("(title) => { document.title = title; }")
+private external fun setDocumentTitleJs(title: String)
+
+actual fun setDocumentTitle(title: String) {
+    setDocumentTitleJs(title)
+}
+
+@JsFun("(value) => { try { return decodeURIComponent(value); } catch (e) { return null; } }")
+private external fun decodeUriComponentJs(value: String): String?
+
+actual fun decodeUriComponent(value: String): String? {
+    return decodeUriComponentJs(value)
+}
+
+@JsFun("() => navigator.language")
+private external fun browserLocaleTagJs(): String
+
+actual fun browserLocaleTag(): String = browserLocaleTagJs()
+
+@JsFun("(value, localeTag, fractionDigits) => new Intl.NumberFormat(localeTag, { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }).format(value)")
+private external fun numberFormatJs(value: Double, localeTag: String, fractionDigits: Int): String
+
+actual fun formatAmountForLocale(amount: String, currency: String, localeTag: String): String {
+    val value = amount.toDoubleOrNull()
+        // Unparseable input (defensive — the API contract is decimal strings):
+        // render verbatim rather than masking the data with a wrong number.
+        ?: return "$amount $currency"
+    val formatted = numberFormatJs(value, localeTag, currencyFractionDigits(currency))
+    return "$formatted $currency"
+}
+
 /**
  * JS interop: takes a Uint8Array of PNG bytes, pre-scales the image using
  * browser canvas with smoothing, and returns a Uint8Array of scaled PNG bytes.

@@ -202,9 +202,10 @@ class RegistrationInProgressTest {
         withTimeout(10_000) { complete.join() }
 
         // Marker cleared: the state endpoint resolves per the remaining rungs
-        // (SANDBOX app registered + auto-activated, no eb_sessions → dashboard
-        // via the D9 rung).
-        assertEquals(OnboardingRoute.DASHBOARD, client.stateJson().str("route"))
+        // (SANDBOX app registered, no eb_sessions → bank_selection — the
+        // sandbox auto-activation rung was removed; the sandbox flow authorizes
+        // directly from the bank list).
+        assertEquals(OnboardingRoute.BANK_SELECTION, client.stateJson().str("route"))
         } finally {
             scope.cancel()
         }

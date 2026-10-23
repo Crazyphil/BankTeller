@@ -608,12 +608,13 @@ class EnableBankingControlPlaneClient(
             } else {
                 AspsspListResult.Error(
                     statusCode = response.status.value,
+                    errorCode = null,
                     message = tryParseEbErrorMessage(body) ?: "Enable Banking bank list failed (HTTP ${response.status.value})",
                 )
             }
         } catch (e: Exception) {
             logger.warn("getAspsps (control-plane) failed", e)
-            AspsspListResult.Error(statusCode = null, message = e.message ?: "Unknown error")
+            AspsspListResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
         }
     }
 

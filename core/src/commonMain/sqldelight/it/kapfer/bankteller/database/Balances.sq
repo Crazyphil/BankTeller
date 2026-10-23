@@ -1,0 +1,90 @@
+-- Balance snapshots + sync history (account overview feature).
+--
+-- `balances` holds the LATEST balance snapshot per account — one row per
+-- account, upserted on each successful fetch (no history). `sync_log` holds
+-- one row per sync run per session (history kept for freshness/error
+-- derivation on the dashboard).
+
+CREATE TABLE balances (
+    account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+    balance_amount TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    balance_type TEXT NOT NULL,
+    reference_date TEXT,
+    fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE sync_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+    sync_type TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    status TEXT NOT NULL,
+    error_code TEXT,
+    error_message TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- balances queries
+-- ---------------------------------------------------------------------------
+
+upsertBalance:
+INSERT INTO balances(account_id, balance_amount, currency, balance_type, reference_date, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+    balance_amount = excluded.balance_amount,
+    currency = excluded.currency,
+    balance_type = excluded.balance_type,
+    reference_date = excluded.reference_date,
+    fetched_at = excluded.fetched_at;
+
+selectBalanceByAccountId:
+SELECT * FROM balances WHERE account_id = ?;
+
+selectBalancesByAccountIds:
+SELECT * FROM balances WHERE account_id IN ?;
+
+deleteBalancesByAccountIds:
+DELETE FROM balances WHERE account_id IN ?;
+
+deleteAllBalances:
+DELETE FROM balances;
+
+-- ---------------------------------------------------------------------------
+-- sync_log queries
+-- ---------------------------------------------------------------------------
+-- NOTE: rows are inserted only at COMPLETION (status is final at insert time).
+-- While a run is in flight no row exists for it — this is what makes the
+-- `never_synced` state observable during e.g. a reload mid-initial-import
+-- (spec: never_synced = no sync_log rows exist for the session).
+
+insertSyncLog:
+INSERT INTO sync_log(session_id, sync_type, started_at, completed_at, status, error_code, error_message)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+selectLastSuccessAtBySessionId:
+SELECT completed_at FROM sync_log
+WHERE session_id = ? AND status = 'success' AND completed_at IS NOT NULL
+ORDER BY started_at DESC, id DESC LIMIT 1;
+
+selectLatestSyncLogBySessionId:
+SELECT * FROM sync_log WHERE session_id = ? ORDER BY started_at DESC, id DESC LIMIT 1;
+
+-- The most recent run for a session that recorded an error_code (i.e. a run whose
+-- failure carried a parsed Enable Banking error code, e.g. EXPIRED_SESSION). Used
+-- to derive consent-dead presentation: the most recent erroring run's code is the
+-- authoritative signal, regardless of any later non-erroring runs.
+selectLatestErrorCodeBySessionId:
+SELECT error_code FROM sync_log
+WHERE session_id = ? AND error_code IS NOT NULL
+ORDER BY started_at DESC, id DESC LIMIT 1;
+
+countSyncLogsBySessionId:
+SELECT COUNT(*) FROM sync_log WHERE session_id = ?;
+
+deleteSyncLogsBySessionIds:
+DELETE FROM sync_log WHERE session_id IN ?;
+
+deleteAllSyncLogs:
+DELETE FROM sync_log;

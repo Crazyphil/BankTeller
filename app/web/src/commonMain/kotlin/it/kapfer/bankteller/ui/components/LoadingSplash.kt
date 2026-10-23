@@ -36,6 +36,9 @@ fun LoadingSplash() {
         ScreenShell(
             maxWidth = Dimens.formMaxWidth,
             verticalArrangement = Arrangement.Center,
+            // Explicit (task 8.21): bespoke centered presentation — a scroll
+            // zone would break bounded-height centering.
+            scrollable = false,
         ) {
             Column(
                 modifier = Modifier.fillMaxWidth(),

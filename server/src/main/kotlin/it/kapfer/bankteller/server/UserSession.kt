@@ -75,6 +75,10 @@ data class UserSession(
     val stagePsuType: String? = null,
     val sessionid: String? = null,
     val stageSessionBaseUrl: String? = null,
+    /** ASPSP logo URL staged at POST /api/auth (from the already-fetched list — no extra EB call). */
+    val stageAspspLogo: String? = null,
+    /** One-shot signal: a freshly authorized session's initial balance import is pending (wizard import step). */
+    val pendingInitialImport: Boolean? = null,
 )
 
 @Serializable

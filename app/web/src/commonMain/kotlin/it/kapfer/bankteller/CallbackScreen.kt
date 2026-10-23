@@ -61,10 +61,24 @@ fun CallbackScreen() {
     val params = remember(search) { parseQueryParams(search) }
     val isSuccess = search.contains("state=") && (search.contains("oobCode=") || isAuthFlow)
 
+    // Popup auto-close (task 8.25): the sandbox-credentials popup's
+    // lifetime ends when the authorization flow returns to the main tab.
+    // The attempt is guarded by the popup's localStorage open-state marker
+    // (no blank-window flash when no popup exists), null-safe, silently
+    // non-fatal, and outcome-independent — it runs on success, error, and
+    // out-of-band code entry alike, because the popup's job ended when the
+    // user left the bank's login page.
+    LaunchedEffect(Unit) {
+        closeSandboxCredentialsPopupIfOpen()
+    }
+
     ThemeToggleOverlay {
         ScreenShell(
             maxWidth = Dimens.formMaxWidth,
             verticalArrangement = Arrangement.Center,
+            // Explicit (task 8.21): bespoke centered presentation — a scroll
+            // zone would break bounded-height centering.
+            scrollable = false,
         ) {
             // Brand lockup — renders on BOTH states (task 10.7, D13)
             Column(

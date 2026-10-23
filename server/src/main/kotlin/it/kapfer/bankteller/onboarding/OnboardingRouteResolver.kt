@@ -53,8 +53,11 @@ object OnboardingRoute {
  * @property linkingCompleted Server-derived: application active AND whitelist
  *   non-empty.
  * @property authCompleted True when at least one `eb_sessions` row exists.
- * @property authFailed Routing flag: auth error recorded AND linking
- *   completed AND not yet authorized.
+ * @property authFailed Routing flag: auth error recorded AND not yet
+ *   authorized AND (linking completed OR sandbox environment). The
+ *   linking-precedes-authorization consistency rule is production-only —
+ *   sandbox applications skip linking, so a sandbox auth error is meaningful
+ *   without a completed linking step.
  * @property onboardingStage The stored session view-position stage, or null.
  * @property stageBankKnown True when the stored stage carries a non-blank
  *   bank triple (`stageAspspName`/`stageAspspCountry` non-blank; psu_type is
@@ -111,7 +114,10 @@ data class OnboardingRouteInput(
  *    application works, even for a previously-authorized user).
  * 4. Stored stage honored (only when `auth_completed == false` — a stale stage
  *    never beats real authorization): `auth_progress` iff
- *    `linking_completed == true`; `linking_progress` iff
+ *    `linking_completed == true` OR `sandbox_environment == true` (the
+ *    linking-precedes-authorization consistency rule is production-only —
+ *    sandbox applications skip linking and authorize directly);
+ *    `linking_progress` iff
  *    `linking_completed == false` — the session state ENHANCES the server
  *    state, it never replaces it: once the server side can tell that linking
  *    has completed, the user routes to the auth step no matter that the
@@ -131,18 +137,7 @@ data class OnboardingRouteInput(
  *    non-blocking status note is surfaced from `app_state` — presentation,
  *    not routing).
  * 7. `auth_failed` → [OnboardingRoute.AUTH_PROGRESS] (failure display).
- * 8. Sandbox auto-activation (design D9): application `active` AND stored
- *    registration environment `SANDBOX` AND no `eb_sessions` row →
- *    [OnboardingRoute.DASHBOARD]. A sandbox app auto-activates on registration
- *    and account linking is not part of its onboarding — the in-session flow
- *    already closes the gate on `active == true`, and the resolver agrees on a
- *    cold boot. Sits BELOW the stage branch (a sandbox user with a stored
- *    `bank_selection` stage still lands on the bank list), BELOW `eb_sessions`
- *    (an authorized sandbox user routes via the existing rung), and BELOW
- *    `auth_failed` (a sandbox user who deliberately linked a bank and failed
- *    an authorization still gets the failure display). A missing/unrecognized
- *    environment falls through — never guessed.
- * 9. Whitelist non-empty → [OnboardingRoute.BANK_SELECTION] (resume card);
+ * 8. Whitelist non-empty → [OnboardingRoute.BANK_SELECTION] (resume card);
  *    else → [OnboardingRoute.BANK_SELECTION] (fresh start).
  *
  * Unknown application state (lookup failed) never claims deletion — the
@@ -198,16 +193,7 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
         return OnboardingRoute.AUTH_PROGRESS
     }
 
-    // 8. Sandbox auto-activation (design D9): a sandbox app is active straight
-    //    from registration and account linking is not part of its onboarding —
-    //    the in-session flow closes the gate on `active == true`, and the
-    //    resolver agrees on a cold boot. Below stage/eb_sessions/auth_failed
-    //    (see kdoc ladder); a missing environment never fires this rung.
-    if (input.appState == EbApplicationState.ACTIVE && input.sandboxEnvironment && !input.authCompleted) {
-        return OnboardingRoute.DASHBOARD
-    }
-
-    // 9. Linked-but-never-authorized (resume card) or nothing linked yet.
+    // 8. Linked-but-never-authorized (resume card) or nothing linked yet.
     return OnboardingRoute.BANK_SELECTION
 }
 
@@ -218,8 +204,10 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
  * it can never fabricate progress).
  *
  * Stage consistency rules (spec): `auth_progress` requires
- * `linking_completed == true` (authorization cannot start before linking
- * completes); `linking_progress` requires `linking_completed == false` —
+ * `linking_completed == true` OR `sandbox_environment == true` (authorization
+ * cannot start before linking completes — except in sandbox, where account
+ * linking is not part of onboarding and the user authorizes directly);
+ * `linking_progress` requires `linking_completed == false` —
  * once linking has completed, the server state outranks the stage: the stage
  * promotes to `auth_progress` when its bank is the linked one (the session
  * state enhances — same coarse level, finer presentation), and is ignored
@@ -236,7 +224,14 @@ private fun honoredStageRoute(input: OnboardingRouteInput): String? {
 
     return when (input.onboardingStage) {
         OnboardingStage.AUTH_PROGRESS ->
-            if (input.linkingCompleted && input.stageBankKnown) OnboardingRoute.AUTH_PROGRESS else null
+            // The linking-precedes-authorization consistency rule is
+            // production-only: sandbox applications skip linking, so a stored
+            // auth_progress stage is honored there without linking_completed.
+            if ((input.linkingCompleted || input.sandboxEnvironment) && input.stageBankKnown) {
+                OnboardingRoute.AUTH_PROGRESS
+            } else {
+                null
+            }
         OnboardingStage.LINKING_PROGRESS -> when {
             // Linking completed and the stage's bank is the linked one → the
             // session state enhances the server state: promote to the auth

@@ -9,6 +9,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 /**
@@ -63,6 +64,11 @@ fun ActionButton(
         Text(
             text = label,
             style = MaterialTheme.typography.labelLarge,
+            // Buttons never wrap (task 8.26 follow-up): a long dynamic
+            // label (e.g. "Connect <very long bank name>") ellipsizes at
+            // the available width instead of breaking into multiple lines.
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

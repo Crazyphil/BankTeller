@@ -13,8 +13,16 @@ import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonTransformingSerializer
 
 sealed class ApplicationVerificationResult {
     data class Success(val active: Boolean) : ApplicationVerificationResult()
@@ -35,11 +43,29 @@ data class Aspssp(
     val psuTypes: List<String> = emptyList(),
     @SerialName("maximum_consent_validity")
     val maximumConsentValidity: Long = 0L,
+    /** Sandbox-only test credentials. Null when absent — absence is ambiguous (some
+     *  credential-less sandbox banks lack it), so consumers must NOT treat null as
+     *  "not sandbox-capable". */
+    val sandbox: SandboxInfo? = null,
+)
+
+/** Sandbox test credentials for an ASPSP (present only in the sandbox environment). */
+@Serializable
+data class SandboxInfo(
+    val users: List<SandboxUser> = emptyList(),
+)
+
+/** A single sandbox test user credential. */
+@Serializable
+data class SandboxUser(
+    val username: String = "",
+    val password: String = "",
+    val otp: String? = null,
 )
 
 sealed class AspsspListResult {
     data class Ok(val aspsps: List<Aspssp>) : AspsspListResult()
-    data class Error(val statusCode: Int?, val message: String) : AspsspListResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : AspsspListResult()
 }
 
 /** Wrapper for the data-plane `GET /aspsps` response: `{"aspsps": [...]}`. */
@@ -57,7 +83,7 @@ data class Access(
 
 sealed class StartAuthResult {
     data class Ok(val url: String, val authorizationId: String, val psuIdHash: String) : StartAuthResult()
-    data class Error(val statusCode: Int?, val message: String) : StartAuthResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : StartAuthResult()
 }
 
 /** An account resource as returned in the `POST /sessions` response's `accounts[]`. */
@@ -77,7 +103,119 @@ sealed class AuthorizeSessionResult {
         val psuType: String?,
         val access: Access?,
     ) : AuthorizeSessionResult()
-    data class Error(val statusCode: Int?, val message: String) : AuthorizeSessionResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : AuthorizeSessionResult()
+}
+
+// --- Account-overview public types (spec: enable-banking-client) ---
+
+/** PSU context headers for user-triggered data-plane calls. Null members are omitted. */
+data class PsuHeaders(
+    val ipAddress: String? = null,
+    val userAgent: String? = null,
+) {
+    companion object {
+        private val ipv4Regex = Regex("""^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$""")
+        private val ipv6Regex = Regex("""^[0-9a-fA-F:]+$""")
+
+        /**
+         * EB rejects the `Psu-Ip-Address` header with 422 unless it is a valid
+         * IPv4 or IPv6 literal. Behind container port mappings the engine's
+         * remote host can surface as a non-literal (host header, zone-scoped
+         * or mapped form) — sanitize strictly and return null (header omitted)
+         * for anything that is not a plain IP literal.
+         */
+        fun sanitizeIpAddress(ip: String?): String? {
+            if (ip.isNullOrBlank()) return null
+            val trimmed = ip.trim().removePrefix("[").removeSuffix("]")
+            val v4 = ipv4Regex.matchEntire(trimmed)
+            if (v4 != null && v4.groupValues.drop(1).all { it.toInt() in 0..255 }) return trimmed
+            // Pragmatic IPv6 literal check: only hex digits and colons, at
+            // least two colon groups, at most one "::" run.
+            if (trimmed.contains(':') && ipv6Regex.matchEntire(trimmed) != null) {
+                val doubleColon = trimmed.split("::").size - 1
+                if (trimmed.count { it == ':' } >= 2 && doubleColon <= 1) return trimmed
+            }
+            return null
+        }
+    }
+}
+
+/**
+ * A single balance entry from `GET /accounts/{uid}/balances` (Berlin Group
+ * semantics). Wire format is SNAKE_CASE per EB's OpenAPI `BalanceResource`
+ * (`balance_amount`, `balance_type`, `reference_date`) — verified against
+ * https://enablebanking.com/docs/api/reference/enablebanking-api.yaml.
+ */
+@Serializable
+data class BalanceEntry(
+    @SerialName("balance_type")
+    val balanceType: String? = null,
+    @SerialName("balance_amount")
+    val balanceAmount: BalanceAmount? = null,
+    @SerialName("reference_date")
+    val referenceDate: String? = null,
+    @SerialName("last_change_date_time")
+    val lastChangeDateTime: String? = null,
+)
+
+@Serializable
+data class BalanceAmount(
+    val currency: String? = null,
+    val amount: String? = null,
+)
+
+sealed class BalancesResult {
+    data class Ok(val balances: List<BalanceEntry>) : BalancesResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : BalancesResult()
+}
+
+/** Wrapper for the `GET /accounts/{uid}/balances` response: `{"balances": [...]}`. */
+@Serializable
+private data class BalancesResponse(val balances: List<BalanceEntry> = emptyList())
+
+/**
+ * Session status from `GET /sessions/{id}` — only the fields the sync engine needs.
+ *
+ * `accounts` is a list of account UIDs as PLAIN STRINGS in this endpoint (unlike
+ * `POST /sessions`' `authorize` response, where entries are account objects) —
+ * EB's own OpenAPI declares `accounts: [string]` here. A polymorphic adapter
+ * accepts both shapes defensively: strings pass through, objects yield their
+ * `uid` member.
+ */
+@Serializable
+private data class SessionResponse(
+    val status: String? = null,
+    val access: Access? = null,
+    @Serializable(with = SessionAccountsAdapter::class)
+    val accounts: List<String> = emptyList(),
+)
+
+/**
+ * Accepts `accounts` entries that are either JSON strings (UID passthrough,
+ * the documented `GET /sessions/{id}` shape) or objects with a `uid` member
+ * (defensive, mirrors the authorize response's account resources).
+ */
+private object SessionAccountsAdapter :
+    JsonTransformingSerializer<List<String>>(ListSerializer(String.serializer())) {
+    override fun transformDeserialize(element: JsonElement): JsonElement = when (element) {
+        is JsonArray -> JsonArray(element.map { entry ->
+            when (entry) {
+                is JsonPrimitive -> entry
+                is JsonObject -> JsonPrimitive((entry["uid"] as? JsonPrimitive)?.content)
+                else -> JsonNull
+            }
+        })
+        else -> element
+    }
+}
+
+sealed class SessionResult {
+    data class Ok(
+        val status: String?,
+        val validUntil: String?,
+        val accountUids: List<String>,
+    ) : SessionResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : SessionResult()
 }
 
 @Serializable
@@ -101,6 +239,19 @@ private data class AuthorizeSessionResponse(
     @SerialName("psu_type")
     val psuType: String? = null,
     val access: Access? = null,
+)
+
+/**
+ * Enable Banking error response body — `{"code": <int>, "error": <ErrorCode>, "detail": <string>}`.
+ * `code` mirrors the HTTP status; `error` is a documented enum value (e.g. EXPIRED_SESSION,
+ * ASPSP_ERROR, ASPSP_RATE_LIMIT_EXCEEDED); `detail` is human-readable. Parsed best-effort from
+ * non-200 responses; a parse failure must never mask the original error.
+ */
+@Serializable
+private data class EbErrorBody(
+    val code: Int? = null,
+    val error: String? = null,
+    val detail: String? = null,
 )
 
 /**
@@ -143,6 +294,33 @@ open class EnableBankingClient(
      */
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Best-effort parse of a non-200 Enable Banking error body into `(errorCode, message)`.
+     * On success: `errorCode` = the `error` field, `message` = the `detail` field (falling
+     * back to the raw body, then the status text). On parse failure: `errorCode` = null and
+     * `message` = the raw body (truncated if huge) or the status text — the parse failure
+     * NEVER masks the original error.
+     */
+    private fun parseErrorBody(body: String, statusText: String): Pair<String?, String> {
+        val parsed = try {
+            json.decodeFromString<EbErrorBody>(body)
+        } catch (_: Exception) {
+            null
+        }
+        if (parsed != null) {
+            val message = parsed.detail?.takeIf { it.isNotBlank() }
+                ?: body.takeIf { it.isNotBlank() }
+                ?: statusText
+            return parsed.error to message
+        }
+        val fallback = body.takeIf { it.isNotBlank() } ?: statusText
+        return null to fallback.truncateForError()
+    }
+
+    /** Truncates a raw error body to a sane length so huge payloads don't bloat logs/DB. */
+    private fun String.truncateForError(maxLength: Int = 2_000): String =
+        if (length <= maxLength) this else take(maxLength) + "… (truncated)"
+
     open suspend fun verifyApplication(): ApplicationVerificationResult {
         return try {
             val response = client.get("https://api.enablebanking.com/application")
@@ -183,10 +361,11 @@ open class EnableBankingClient(
                 val wrapper = json.decodeFromString<AspspsResponse>(body)
                 AspsspListResult.Ok(wrapper.aspsps)
             } else {
-                AspsspListResult.Error(response.status.value, body)
+                val (errorCode, message) = parseErrorBody(body, response.status.description)
+                AspsspListResult.Error(response.status.value, errorCode, message)
             }
         } catch (e: Exception) {
-            AspsspListResult.Error(statusCode = null, message = e.message ?: "Unknown error")
+            AspsspListResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
         }
     }
 
@@ -219,14 +398,16 @@ open class EnableBankingClient(
                 } else {
                     StartAuthResult.Error(
                         statusCode = response.status.value,
+                        errorCode = null,
                         message = "Response missing url, authorization_id or psu_id_hash",
                     )
                 }
             } else {
-                StartAuthResult.Error(response.status.value, body)
+                val (errorCode, message) = parseErrorBody(body, response.status.description)
+                StartAuthResult.Error(response.status.value, errorCode, message)
             }
         } catch (e: Exception) {
-            StartAuthResult.Error(statusCode = null, message = e.message ?: "Unknown error")
+            StartAuthResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
         }
     }
 
@@ -255,14 +436,74 @@ open class EnableBankingClient(
                 } else {
                     AuthorizeSessionResult.Error(
                         statusCode = response.status.value,
+                        errorCode = null,
                         message = "Response missing session_id",
                     )
                 }
             } else {
-                AuthorizeSessionResult.Error(response.status.value, body)
+                val (errorCode, message) = parseErrorBody(body, response.status.description)
+                AuthorizeSessionResult.Error(response.status.value, errorCode, message)
             }
         } catch (e: Exception) {
-            AuthorizeSessionResult.Error(statusCode = null, message = e.message ?: "Unknown error")
+            AuthorizeSessionResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * Fetches the balances for one account — `GET /accounts/{accountUid}/balances`.
+     * RS256 JWT auth via the installed plugin. When [psuHeaders] is provided
+     * (user-triggered sync), the request carries `Psu-Ip-Address` and/or
+     * `Psu-User-Agent` headers derived from a real user HTTP request; when
+     * absent (background sync), no PSU headers are sent. The full balance
+     * list is returned — booked-balance preference selection lives in the
+     * sync engine, not here.
+     */
+    open suspend fun getBalances(
+        accountUid: String,
+        psuHeaders: PsuHeaders? = null,
+    ): BalancesResult {
+        return try {
+            val response = client.get("https://api.enablebanking.com/accounts/$accountUid/balances") {
+                psuHeaders?.ipAddress?.let { headers.append("Psu-Ip-Address", it) }
+                psuHeaders?.userAgent?.let { headers.append("Psu-User-Agent", it) }
+            }
+            val body = response.bodyAsText()
+            if (response.status.isSuccess()) {
+                val parsed = json.decodeFromString<BalancesResponse>(body)
+                BalancesResult.Ok(parsed.balances)
+            } else {
+                val (errorCode, message) = parseErrorBody(body, response.status.description)
+                BalancesResult.Error(response.status.value, errorCode, message)
+            }
+        } catch (e: Exception) {
+            BalancesResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * Fetches the current session status — `GET /sessions/{sessionId}`. RS256
+     * JWT auth. Returns the session `status`, the consent expiry
+     * (`access.valid_until`, authoritative — never recomputed locally), and
+     * the session's account uids. Called once per session at the start of
+     * each sync run; errors are non-fatal for the run.
+     */
+    open suspend fun getSession(sessionId: String): SessionResult {
+        return try {
+            val response = client.get("https://api.enablebanking.com/sessions/$sessionId")
+            val body = response.bodyAsText()
+            if (response.status.isSuccess()) {
+                val parsed = json.decodeFromString<SessionResponse>(body)
+                SessionResult.Ok(
+                    status = parsed.status,
+                    validUntil = parsed.access?.validUntil,
+                    accountUids = parsed.accounts,
+                )
+            } else {
+                val (errorCode, message) = parseErrorBody(body, response.status.description)
+                SessionResult.Error(response.status.value, errorCode, message)
+            }
+        } catch (e: Exception) {
+            SessionResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
         }
     }
 

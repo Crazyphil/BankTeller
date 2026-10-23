@@ -10,6 +10,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import it.kapfer.bankteller.onboarding.WizardFlowIdentity
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -321,7 +322,11 @@ class AppViewModelTest {
         assertTrue(vm.isLoading)
         advanceUntilIdle()
         assertFalse(vm.isLoading)
-        assertEquals(Screen.Dashboard, vm.currentScreen)
+        // task 7.2 SPA: sandbox registration (auto-activated) continues at
+        // BankSelection — the onboarding gate stays open until the first
+        // session is authorized.
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
     }
 
     @Test
@@ -783,11 +788,596 @@ class AppViewModelTest {
             productionOverrides = null, // null is valid for SANDBOX
         )
         advanceUntilIdle()
-        assertEquals(Screen.Dashboard, vm.currentScreen)
+        // task 7.2 SPA: a sandbox registration (auto-activated) does NOT close
+        // the onboarding gate — the SPA continues at BankSelection directly
+        // (the ActivationGuide's two-step linking copy is production-only).
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertEquals("SANDBOX", vm.registrationEnvironment)
         val call = fakeApi.completeCalls?.last()
         assertNotNull(call)
         assertEquals("SANDBOX", call.environment)
         assertNull(call.overrides)
+    }
+
+    // ---------------------------------------------------------------
+    // Sandbox environment branch (task 7.2 SPA): BankSelection advance
+    // ---------------------------------------------------------------
+
+    @Test
+    fun linkAccounts_sandboxEnvironment_skipsLinkingAdvancesToAuthProgress() = runTest(testDispatcher) {
+        // Scenario: registration environment known SANDBOX (in-session from
+        // registration selection) → selecting a bank advances DIRECTLY to
+        // AuthProgress — no linking step, no linking API call.
+        fakeApi.nextStartResult = StartResult.Success(state = "state-abc", redirectUrl = "https://example.com/cb")
+        fakeApi.waitStatusSequence = listOf(WaitStatus.Complete)
+        vm.startOnboarding("admin@example.com")
+        advanceUntilIdle()
+
+        fakeApi.nextCompleteResult = CompleteResult(success = true, active = true, error = null)
+        vm.submitRegistration(
+            environment = "SANDBOX",
+            redirectUrl = "https://example.com/cb",
+            productionOverrides = null,
+        )
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+
+        // selectAspsp triggers a catalog fetch via LaunchedEffect-free path? —
+        // the ViewModel test drives loadAspsps directly; provide the catalog
+        // and select the bank, then confirm the link first.
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("SandboxBank", "DE", "BIC1", null, listOf("personal"), 86400L))
+        )
+        vm.loadAspsps()
+        advanceUntilIdle()
+        assertFalse(vm.isBankLinked(Aspssp("SandboxBank", "DE", "BIC1", null, listOf("personal"), 86400L)))
+
+        // Selecting advances directly to authorization via startAuth.
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://sandbox/sca")
+        vm.selectAspsp(Aspssp("SandboxBank", "DE", "BIC1", null, listOf("personal"), 86400L))
+        vm.linkAccounts()
+        advanceUntilIdle()
+
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("https://sandbox/sca", vm.authRedirectUrl)
+        assertNull(vm.linkAuthorizationUrl)
+        assertEquals(0, fakeApi.linkAccountsCallCount)
+        assertEquals(1, fakeApi.startAuthCalls.size)
+    }
+
+    @Test
+    fun linkAccounts_unknownEnvironment_keepsLinkFirstPath() = runTest(testDispatcher) {
+        // Scenario: environment unknown (null) + bank not in linked_banks →
+        // link-first path kept.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null,
+            environment = null, // unknown — SPA must NOT guess sandbox
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertNull(vm.registrationEnvironment)
+
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("SomeBank", "DE", "BIC1", null, listOf("personal"), 86400L))
+        )
+        vm.loadAspsps()
+        advanceUntilIdle()
+
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth", "hash123")
+        vm.selectAspsp(Aspssp("SomeBank", "DE", "BIC1", null, listOf("personal"), 86400L))
+        vm.linkAccounts()
+        advanceUntilIdle()
+
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        assertEquals("https://enablebanking.com/auth", vm.linkAuthorizationUrl)
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun checkAuth_stateEnvironmentSandbox_knownOnColdBoot() = runTest(testDispatcher) {
+        // Task 7.2 SPA: the state endpoint's `environment` re-export populates
+        // the VM on cold boot, so the BankSelection branch applies even when
+        // the user did not pick the environment in-session.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null,
+            route = "bank_selection",
+            environment = "SANDBOX",
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertEquals("SANDBOX", vm.registrationEnvironment)
+    }
+
+    // ---------------------------------------------------------------
+    // Add-mode (tasks 7.3 – 7.5): entry, exit, structural step set,
+    // auth-failure notice clearing
+    // ---------------------------------------------------------------
+
+    @Test
+    fun startAddBankFlow_entersWizardAtBankSelectionInAddMode() = runTest(testDispatcher) {
+        vm.startAddBankFlow()
+        assertTrue(vm.addModeActive)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+    }
+
+    @Test
+    fun addModeSteps_setStructurallyExcludesOnboardingOnlySteps() = runTest(testDispatcher) {
+        // Structural mode separation (task 7.4): the add-mode step set covers
+        // exactly the connect steps — the onboarding-only steps (email entry,
+        // waiting for authentication, registration review, verifying,
+        // activation guide) are not members, so mode-aware step resolution
+        // can never render them while add-mode is active.
+        assertEquals(
+            setOf(
+                OnboardingStep.BankSelection,
+                OnboardingStep.LinkingProgress,
+                OnboardingStep.AuthProgress,
+            ),
+            AddModeSteps,
+        )
+        // The five onboarding-only steps are excluded.
+        val onboardingOnly = OnboardingStep.entries.filter { it !in AddModeSteps }
+        assertEquals(5, onboardingOnly.size)
+        assertEquals(OnboardingStep.EmailEntry, onboardingOnly[0])
+        assertEquals(OnboardingStep.WaitingForAuthentication, onboardingOnly[1])
+        assertEquals(OnboardingStep.RegistrationReview, onboardingOnly[2])
+        assertEquals(OnboardingStep.Verifying, onboardingOnly[3])
+        assertEquals(OnboardingStep.ActivationGuide, onboardingOnly[4])
+
+        // Resolution stays mode-aware: without a reachable onboarding-only
+        // step in add-mode there is nothing to coerce, but the resolver never
+        // fabricates one either (connect steps pass through unchanged).
+        vm.startAddBankFlow()
+        assertEquals(OnboardingStep.BankSelection, vm.resolvedWizardStep)
+    }
+
+    @Test
+    fun exitAddMode_abandonsToDashboardAndClearsSignals() = runTest(testDispatcher) {
+        // Wizard exit in add-mode abandons to the dashboard (task 7.4): the
+        // cancel-linking stage write is a dead letter; stale one-shot
+        // authError is cleared.
+        // Seed the one-shot signals through the public gate (authCompleted +
+        // authFailed routes to Dashboard with the signals set).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = true,
+            authErrorKind = "technical",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertEquals("server_error", vm.authError)
+        assertTrue(vm.authFailed)
+        assertEquals("technical", vm.authErrorKind)
+
+        vm.startAddBankFlow()
+        assertTrue(vm.isAddMode)
+        vm.exitAddMode()
+        assertFalse(vm.addModeActive)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertNull(vm.authError)
+        assertFalse(vm.authFailed)
+        assertNull(vm.authErrorKind)
+        advanceUntilIdle()
+        assertTrue(fakeApi.cancelLinkingCallCount >= 1)
+    }
+
+    @Test
+    fun dismissAuthFailureNotice_clearsSignalsAndFiresCancelLinking() = runTest(testDispatcher) {
+        // Task 7.5: dismissal consumes and clears the one-shot signals
+        // (locally + server-side via cancel-linking) so the notice cannot
+        // recur on subsequent cold boots.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = true,
+            authErrorKind = "technical",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.authFailed)
+
+        vm.dismissAuthFailureNotice()
+        assertNull(vm.authError)
+        assertFalse(vm.authFailed)
+        assertNull(vm.authErrorKind)
+        // Dismissal stays on the dashboard.
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        advanceUntilIdle()
+        assertTrue(fakeApi.cancelLinkingCallCount >= 1)
+    }
+
+    @Test
+    fun retryAddBankFlow_clearsSignalsAndFreshSelectionAtBankSelection() = runTest(testDispatcher) {
+        // Task 7.5: retry re-enters the add-flow at bank selection (fresh
+        // selection) — never a direct re-POST /api/auth with stale state.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = true,
+            authErrorKind = "technical",
+            selectedBank = SelectedBank("TestBank", "FI", "personal"),
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertTrue(vm.authFailed)
+
+        vm.retryAddBankFlow()
+        assertTrue(vm.addModeActive)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertNull(vm.authError)
+        assertFalse(vm.authFailed)
+        assertNull(vm.authErrorKind)
+        advanceUntilIdle()
+        assertTrue(fakeApi.cancelLinkingCallCount >= 1)
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    // ---------------------------------------------------------------
+    // Re-authorization mode (tasks 9.3/9.5, 10.1/10.2)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun startReauthorizationFlow_entersWizardAtAuthProgressWithPreselectedBank() = runTest(testDispatcher) {
+        // Task 9.3: the consent notices' action enters the wizard DIRECTLY at
+        // AuthProgress with the bank pre-selected — bank selection is
+        // skipped entirely, POST /api/auth fires with the session triple.
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        val bank = BankData(
+            bankName = "Nordea",
+            bankCountry = "FI",
+            logo = null,
+            validUntil = null,
+            syncState = "fresh",
+            lastSyncAt = null,
+            lastSuccessAt = null,
+            accounts = listOf(
+                AccountData(1L, "Checking", null, "EUR", "100.00", "EUR", null, null, null),
+            ),
+            consentBroken = false,
+            psuType = "personal",
+        )
+        vm.startReauthorizationFlow(bank)
+        assertTrue(vm.isReAuthMode)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("Nordea", vm.reAuthBank?.name)
+        assertEquals("FI", vm.reAuthBank?.country)
+        assertEquals("personal", vm.reAuthBank?.psuType)
+        // Stored accounts present → the replacement explainer renders.
+        assertTrue(vm.reAuthBank?.hasStoredAccounts == true)
+        // Flow context (task 10.1): single-step re-auth — identity eyebrow
+        // alone, indicator omitted.
+        val flow = vm.wizardFlowContext()
+        assertEquals(WizardFlowIdentity.RE_AUTHORIZATION, flow.identity)
+        assertEquals("RE-AUTHORIZATION", flow.eyebrow)
+        assertFalse(flow.showProgress)
+        advanceUntilIdle()
+        assertEquals(listOf(FakeApiClient.StartAuthCall("Nordea", "FI", "personal")), fakeApi.startAuthCalls)
+        assertEquals("https://bank.com/sca", vm.authRedirectUrl)
+    }
+
+    @Test
+    fun startReauthorizationFlow_psuTypeFallsBackToPersonal() = runTest(testDispatcher) {
+        // A server predating psu_type: the re-auth POST falls back to the
+        // wizard default account type, never a guess of "business".
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.startReauthorizationFlow(
+            BankData(
+                bankName = "Demo Bank",
+                bankCountry = "DE",
+                logo = null,
+                validUntil = null,
+                syncState = "fresh",
+                lastSyncAt = null,
+                lastSuccessAt = null,
+                accounts = emptyList(),
+                consentBroken = false,
+                psuType = null,
+            ),
+        )
+        assertFalse(vm.reAuthBank?.hasStoredAccounts == true)
+        advanceUntilIdle()
+        assertEquals(listOf(FakeApiClient.StartAuthCall("Demo Bank", "DE", "personal")), fakeApi.startAuthCalls)
+    }
+
+    @Test
+    fun exitReAuthMode_abandonsToDashboardAndClearsSignals() = runTest(testDispatcher) {
+        // Task 10.2: "Back to dashboard" in re-auth mode mirrors the add-mode
+        // exit — cancel-linking clears the server-side one-shot signals.
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.startReauthorizationFlow(
+            BankData(
+                bankName = "Nordea",
+                bankCountry = "FI",
+                logo = null,
+                validUntil = null,
+                syncState = "fresh",
+                lastSyncAt = null,
+                lastSuccessAt = null,
+                accounts = emptyList(),
+                consentBroken = false,
+                psuType = "personal",
+            ),
+        )
+        assertTrue(vm.isReAuthMode)
+        vm.exitReAuthMode()
+        assertFalse(vm.isReAuthMode)
+        assertNull(vm.reAuthBank)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        advanceUntilIdle()
+        assertTrue(fakeApi.cancelLinkingCallCount >= 1)
+    }
+
+    @Test
+    fun retryAuthFailureNotice_reAuthorizationFailure_reentersDirectReAuthWithStagedBank() = runTest(testDispatcher) {
+        // Task 9.5 COLD BOOT: the client state is gone after the EB callback.
+        // The server keeps authCompleted outranking every stored stage, so a
+        // FAILED re-authorization lands on the DASHBOARD with auth_error set
+        // and the staged bank still reported (stage_bank is only cleared on
+        // auth SUCCESS). The staged bank matches a CONNECTED /api/accounts
+        // bank → re-auth failure → retry re-enters the DIRECT re-authorization
+        // path at AuthProgress with the SAME bank pre-selected (bank
+        // selection would block the connected bank).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = false,
+            authErrorKind = "technical",
+            selectedBank = null,
+            route = "dashboard",
+            stageBank = SelectedBank("Nordea", "FI", "personal"),
+        )
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(
+                    BankData(
+                        bankName = "Nordea",
+                        bankCountry = "FI",
+                        logo = null,
+                        validUntil = null,
+                        syncState = "fresh",
+                        lastSyncAt = null,
+                        lastSuccessAt = null,
+                        accounts = listOf(
+                            AccountData(1L, "Checking", null, "EUR", "100.00", "EUR", null, null, null),
+                        ),
+                        consentBroken = false,
+                        psuType = "personal",
+                    ),
+                ),
+                syncInProgress = false,
+            ),
+        )
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertEquals("server_error", vm.authError)
+        assertTrue(vm.accountsData?.banks?.any { it.bankName == "Nordea" } == true)
+
+        vm.retryAuthFailureNotice()
+        assertTrue(vm.isReAuthMode)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.AuthProgress, vm.onboardingStep)
+        assertEquals("Nordea", vm.reAuthBank?.name)
+        assertEquals("personal", vm.reAuthBank?.psuType)
+        // The one-shot failure signals are consumed by the retry.
+        assertNull(vm.authError)
+        advanceUntilIdle()
+        assertEquals(listOf(FakeApiClient.StartAuthCall("Nordea", "FI", "personal")), fakeApi.startAuthCalls)
+    }
+
+    @Test
+    fun retryAuthFailureNotice_addFlowFailure_reentersBankSelection() = runTest(testDispatcher) {
+        // Task 9.5 COLD BOOT: the staged bank is NOT among the connected
+        // /api/accounts banks (a failed ADD-bank authorization) → retry
+        // re-enters the add-flow at bank selection, never a direct POST.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = false,
+            authErrorKind = "technical",
+            selectedBank = null,
+            route = "dashboard",
+            stageBank = SelectedBank("FreshBank", "FI", "personal"),
+        )
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(
+                    BankData(
+                        bankName = "Nordea",
+                        bankCountry = "FI",
+                        logo = null,
+                        validUntil = null,
+                        syncState = "fresh",
+                        lastSyncAt = null,
+                        lastSuccessAt = null,
+                        accounts = emptyList(),
+                        consentBroken = false,
+                        psuType = "personal",
+                    ),
+                ),
+                syncInProgress = false,
+            ),
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertEquals("server_error", vm.authError)
+
+        vm.retryAuthFailureNotice()
+        assertFalse(vm.isReAuthMode)
+        assertTrue(vm.isAddMode)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        assertNull(vm.authError)
+        advanceUntilIdle()
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun retryAuthFailureNotice_withoutStagedBank_addFlowFallback() = runTest(testDispatcher) {
+        // No staged bank exposed after the failure → the safest retry is the
+        // add-flow at bank selection (fresh selection, no stale POST).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = true,
+            authError = "server_error",
+            authFailed = false,
+            authErrorKind = "technical",
+            selectedBank = null,
+            route = "dashboard",
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals("server_error", vm.authError)
+
+        vm.retryAuthFailureNotice()
+        assertFalse(vm.isReAuthMode)
+        assertTrue(vm.isAddMode)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+        advanceUntilIdle()
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun wizardFlowContext_reflectsTheActiveFlow() = runTest(testDispatcher) {
+        // Task 10.1: one derivation consumed by the wizard scaffold — the
+        // identity/set/eyebrow follow the active flow with precedence
+        // re-authorization > add-bank > initial setup.
+        // Initial setup, environment unknown → production 8-step set.
+        val initial = vm.wizardFlowContext()
+        assertEquals(WizardFlowIdentity.INITIAL_SETUP, initial.identity)
+        assertEquals(8, initial.totalSteps)
+        assertEquals("INITIAL SETUP · STEP 1 OF 8", initial.eyebrow)
+
+        // Add-bank (production): 3-step set at bank selection.
+        vm.startAddBankFlow()
+        val addMode = vm.wizardFlowContext()
+        assertEquals(WizardFlowIdentity.ADD_A_BANK, addMode.identity)
+        assertEquals(3, addMode.totalSteps)
+        assertEquals("ADD A BANK · STEP 1 OF 3", addMode.eyebrow)
+
+        // Re-authorization outranks add-mode: single-step set, eyebrow alone.
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.startReauthorizationFlow(
+            BankData(
+                bankName = "Nordea",
+                bankCountry = "FI",
+                logo = null,
+                validUntil = null,
+                syncState = "fresh",
+                lastSyncAt = null,
+                lastSuccessAt = null,
+                accounts = emptyList(),
+                consentBroken = false,
+                psuType = "personal",
+            ),
+        )
+        val reAuth = vm.wizardFlowContext()
+        assertEquals(WizardFlowIdentity.RE_AUTHORIZATION, reAuth.identity)
+        assertEquals(1, reAuth.totalSteps)
+        assertEquals("RE-AUTHORIZATION", reAuth.eyebrow)
+    }
+
+    @Test
+    fun linkAccounts_connectedBank_neverSkipsLinking() = runTest(testDispatcher) {
+        // Task 9.2: the skip-linking selection routing applies ONLY to banks
+        // that are linked but NOT yet connected — a CONNECTED bank keeps the
+        // link-first path (the UI blocks its selection outright; the routing
+        // exclusion removes the add-flow's same-bank re-authorization path).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null,
+            route = "bank_selection",
+            linkedBanks = listOf(LinkedBank("LinkedBank", "FI")),
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+
+        val bank = Aspssp("LinkedBank", "FI", "BIC1", null, listOf("personal"), 86400L, connected = true)
+        vm.selectAspsp(bank)
+        vm.selectPsuType("personal")
+        fakeApi.nextLinkAccountsResult = LinkAccountsResult.Ok("https://enablebanking.com/auth", "hash123")
+        vm.linkAccounts()
+        advanceUntilIdle()
+        // Link-first — NO direct jump to AuthProgress.
+        assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
+        assertTrue(fakeApi.startAuthCalls.isEmpty())
+    }
+
+    @Test
+    fun resumeMode_neverActivatesInAddMode() = runTest(testDispatcher) {
+        // Task 7.4: resume-mode machinery (resume card / stage-bank
+        // restoration) can never activate while add-mode is active.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = true, appState = "active")
+        val bank = SelectedBank("TestBank", "FI", "personal")
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = true,
+            authCompleted = false,
+            authError = null,
+            selectedBank = bank,
+        )
+        fakeApi.nextAspspsResult = AspspsResult.Ok(
+            listOf(Aspssp("TestBank", "FI", "BIC1", null, listOf("personal", "business"), 86400L))
+        )
+        vm.checkAuth()
+        advanceUntilIdle()
+        // Without add-mode the resume card would be offered…
+        assertTrue(vm.isResumeMode)
+
+        // …but add-mode structurally excludes the resume machinery.
+        vm.startAddBankFlow()
+        assertFalse(vm.isResumeMode)
     }
 
     // ---------------------------------------------------------------
@@ -2361,6 +2951,66 @@ class AppViewModelTest {
         assertEquals(OnboardingStep.LinkingProgress, vm.onboardingStep)
         assertTrue(fakeApi.startAuthCalls.isEmpty())
     }
+
+    // ---------------------------------------------------------------
+    // Manual refresh cooldown (refresh affordance spec)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun triggerRefresh_accepted_armsCooldownImmediately() = runTest(testDispatcher) {
+        // The server anchors its debounce at the run's START — the local
+        // cooldown window must be armed at trigger time, not when the run
+        // completes, so the control never returns to clickable inside the
+        // debounce window.
+        fakeApi.nextSyncTriggerResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        // The sync-in-flight poll reports completion on its first tick so the
+        // poll loop exits — runTest's post-body drain would otherwise spin
+        // forever on the infinite-by-design poll loop.
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.triggerRefresh()
+        advanceTimeBy(100L) // let the trigger call itself complete
+        assertTrue(vm.refreshRequested)
+        assertEquals(AppViewModel.MANUAL_REFRESH_COOLDOWN_SECONDS, vm.refreshCooldownSeconds)
+        // Flush the poll tick so the loop exits inside the test body; the
+        // cooldown timer then drains (bounded 60 ticks) in the post-body idle.
+        advanceTimeBy(3000L)
+        assertFalse(vm.refreshRequested)
+    }
+
+    @Test
+    fun triggerRefresh_cooldownTicksToZeroAndClears() = runTest(testDispatcher) {
+        fakeApi.nextSyncTriggerResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        // The sync-in-flight poll reports completion (sync_in_progress=false)
+        // on its first tick — the poll loop then exits by itself.
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.triggerRefresh()
+        advanceTimeBy(100L) // let the trigger call itself complete
+        // First poll tick: the run reports complete → refreshRequested
+        // clears, but the cooldown window (armed at trigger time) keeps the
+        // control visibly disabled.
+        advanceTimeBy(3000L)
+        assertFalse(vm.refreshRequested)
+        val remaining = vm.refreshCooldownSeconds
+        assertTrue(remaining != null && remaining > 0)
+        // Tick the window down to zero — the cooldown clears and the control
+        // returns to idle/clickable. (advanceTimeBy only: the accounts poll
+        // loop is infinite-by-design and advanceUntilIdle would never settle.)
+        advanceTimeBy(AppViewModel.MANUAL_REFRESH_COOLDOWN_SECONDS * 1000L + 2000L)
+        assertNull(vm.refreshCooldownSeconds)
+    }
+
+    @Test
+    fun triggerRefresh_serverCooldownResponse_armsServerWindow() = runTest(testDispatcher) {
+        // Click inside a window the SPA didn't arm (e.g. login-triggered
+        // sync): the server responds with its remaining window — the control
+        // renders the cooldown presentation for exactly that long.
+        fakeApi.nextSyncTriggerResult = SyncTriggerResult(started = false, coalesced = false, cooldownRemainingSeconds = 42L)
+        vm.triggerRefresh()
+        // No poll is armed (started=false), so idling is safe; the 42-tick
+        // cooldown timer runs to its end under virtual time.
+        advanceUntilIdle()
+        assertFalse(vm.refreshRequested)
+    }
 }
 
 /**
@@ -2459,12 +3109,43 @@ private class FakeApiClient : ApiClient() {
     }
     override suspend fun linkAccounts(country: String, psuType: String, aspspName: String): LinkAccountsResult {
         if (linkAccountsCallDelayMs > 0) delay(linkAccountsCallDelayMs)
+        linkAccountsCallCount++
         return nextLinkAccountsResult
     }
+
+    var linkAccountsCallCount = 0
     override suspend fun startAuth(aspspName: String, aspspCountry: String, psuType: String): StartAuthResult {
         startAuthCalls.add(StartAuthCall(aspspName, aspspCountry, psuType))
         return nextStartAuthResult
     }
+
+    // --- Manual refresh (POST /api/sync) fakes ---
+    var nextSyncTriggerResult: SyncTriggerResult? = null
+        set(value) {
+            field = value
+            triggerSyncCallCount = 0
+        }
+    var triggerSyncCallCount = 0
+        private set
+    override suspend fun triggerSync(): SyncTriggerResult? {
+        triggerSyncCallCount++
+        return nextSyncTriggerResult
+    }
+
+    /** Sequential /api/accounts responses for the sync-in-flight poll. */
+    var accountsDataSequence: List<AccountsData?> = emptyList()
+        set(value) {
+            field = value
+            accountsDataCallCount = 0
+        }
+    var accountsDataCallCount = 0
+        private set
+    override suspend fun getAccounts(): AccountsData? {
+        accountsDataCallCount++
+        val index = accountsDataCallCount - 1
+        return if (index < accountsDataSequence.size) accountsDataSequence[index] else null
+    }
+
     override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {
         linkStatusCalls.add(aspspName to aspspCountry)
         return nextLinkStatus

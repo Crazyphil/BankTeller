@@ -79,6 +79,72 @@ class EnableBankingClientTest {
         client.close()
     }
 
+    @Test
+    fun `getAspsps parses sandbox users with otp optional`() = runBlocking {
+        val engine = MockEngine {
+            respond(
+                content = """
+                    {
+                        "aspsps": [
+                            {
+                                "name": "Sandbox Bank",
+                                "country": "DE",
+                                "sandbox": {
+                                    "users": [
+                                        {"username": "demo-user", "password": "demo-pass", "otp": "123456"},
+                                        {"username": "no-otp-user", "password": "no-otp-pass"}
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                """.trimIndent(),
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.getAspsps()
+        assertTrue(result is AspsspListResult.Ok, "Expected Ok but got: $result")
+        val sandbox = result.aspsps.first().sandbox
+        assertNotNull(sandbox, "sandbox must be parsed when present")
+        assertEquals(2, sandbox.users.size)
+        assertEquals("demo-user", sandbox.users[0].username)
+        assertEquals("demo-pass", sandbox.users[0].password)
+        assertEquals("123456", sandbox.users[0].otp)
+        assertEquals("no-otp-user", sandbox.users[1].username)
+        assertEquals("no-otp-pass", sandbox.users[1].password)
+        assertEquals(null, sandbox.users[1].otp, "otp must be null when absent")
+        client.close()
+    }
+
+    @Test
+    fun `getAspsps leaves sandbox null when absent`() = runBlocking {
+        val engine = MockEngine {
+            respond(
+                content = """
+                    {
+                        "aspsps": [
+                            {
+                                "name": "Plain Bank",
+                                "country": "DE",
+                                "bic": "PLAIDEYY",
+                                "psu_types": ["business"]
+                            }
+                        ]
+                    }
+                """.trimIndent(),
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.getAspsps()
+        assertTrue(result is AspsspListResult.Ok, "Expected Ok but got: $result")
+        assertEquals(null, result.aspsps.first().sandbox, "sandbox must be null when field is absent")
+        client.close()
+    }
+
     // -----------------------------------------------------------------------
     // Task 4.5 — startAuth
     // -----------------------------------------------------------------------

@@ -2,7 +2,6 @@ package it.kapfer.bankteller.onboarding
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,7 +14,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContentPadding
 import androidx.compose.foundation.layout.size
@@ -23,13 +21,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -59,6 +54,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -83,20 +79,25 @@ import it.kapfer.bankteller.AspspsState
 import it.kapfer.bankteller.LinkingSessionPollState
 import it.kapfer.bankteller.OnboardingStep
 import it.kapfer.bankteller.ProductionFieldOverrides
+import it.kapfer.bankteller.authFailureCopy
+import it.kapfer.bankteller.closeSandboxCredentialsPopupIfOpen
 import it.kapfer.bankteller.createHttpClient
 
 import it.kapfer.bankteller.openUrlInNewTab
+import it.kapfer.bankteller.openSandboxCredentialsPopup
 import it.kapfer.bankteller.redirectTo
 import it.kapfer.bankteller.jetBrainsMonoFamily
 import it.kapfer.bankteller.ui.components.ActionButton
+import it.kapfer.bankteller.ui.components.BankAvatar
+import it.kapfer.bankteller.ui.components.BankLogo
 import it.kapfer.bankteller.ui.components.QuietActionButton
 import it.kapfer.bankteller.ui.components.WaitingIndicator
 import it.kapfer.bankteller.ui.components.BrandedTopBar
 import it.kapfer.bankteller.ui.components.DecisionBox
+import it.kapfer.bankteller.ui.components.LedgerScrollbar
 import it.kapfer.bankteller.ui.components.QuietButton
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggle
-import it.kapfer.bankteller.ui.components.WizardProgressIndicator
 import it.kapfer.bankteller.ui.components.WizardScaffold
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
@@ -105,6 +106,8 @@ import io.ktor.client.statement.readRawBytes
 import io.ktor.http.encodeURLParameter
 import org.jetbrains.skia.Image as SkiaImage
 import androidx.compose.ui.graphics.toComposeImageBitmap
+
+// Same-package panel + URL builder (task 8.5/8.7).
 
 /**
  * Root composable for the Enable Banking onboarding flow.
@@ -118,7 +121,10 @@ import androidx.compose.ui.graphics.toComposeImageBitmap
 fun OnboardingScreen(viewModel: AppViewModel) {
     ScreenShell(
         maxWidth = Dimens.contentMaxWidth,
-        scrollable = true,
+        // des-3 / §6.1.5: the wizard manages its own scroll — the
+        // WizardScaffold fills the shell's content zone as the layout
+        // authority; a scrolling shell would double-wrap it.
+        scrollable = false,
         topBar = {
             BrandedTopBar(
                 actions = {
@@ -144,15 +150,37 @@ fun OnboardingScreen(viewModel: AppViewModel) {
             Spacer(modifier = Modifier.height(Dimens.sm))
         }
 
-        when (viewModel.onboardingStep) {
-            OnboardingStep.EmailEntry -> EmailEntryStep(viewModel)
-            OnboardingStep.WaitingForAuthentication -> WaitingStep(viewModel)
-            OnboardingStep.RegistrationReview -> RegistrationReviewStep(viewModel)
-            OnboardingStep.Verifying -> VerifyingStep(viewModel)
-            OnboardingStep.ActivationGuide -> ActivationGuideStep(viewModel)
-            OnboardingStep.BankSelection -> BankSelectionStep(viewModel)
-            OnboardingStep.LinkingProgress -> LinkingProgressStep(viewModel)
-            OnboardingStep.AuthProgress -> AuthProgressStep(viewModel)
+        // Mode-aware step resolution (task 7.4 — structural mode separation):
+        // in add-mode an onboarding-only step (email entry, waiting for
+        // authentication, registration review, verifying, activation guide)
+        // can never render — [viewModel.resolvedWizardStep] coerces it to
+        // BankSelection, and the guard below abandons to the dashboard rather
+        // than ever composing an onboarding-only step.
+        val step = viewModel.resolvedWizardStep
+        LaunchedEffect(step) {
+            // Coercion backstop: if add-mode state ever resolved a coerced
+            // step (onboardingStep outside the connect set while add-mode is
+            // active), leave the wizard entirely — no onboarding-only step
+            // renders in add-mode, ever.
+            if (viewModel.addModeActive && step != viewModel.onboardingStep) {
+                viewModel.exitAddMode()
+            }
+        }
+
+        // The step fills the remaining content-zone height (des-3): the
+        // wizard scaffold is the layout authority below the (optional)
+        // status note.
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            when (step) {
+                OnboardingStep.EmailEntry -> EmailEntryStep(viewModel)
+                OnboardingStep.WaitingForAuthentication -> WaitingStep(viewModel)
+                OnboardingStep.RegistrationReview -> RegistrationReviewStep(viewModel)
+                OnboardingStep.Verifying -> VerifyingStep(viewModel)
+                OnboardingStep.ActivationGuide -> ActivationGuideStep(viewModel)
+                OnboardingStep.BankSelection -> BankSelectionStep(viewModel)
+                OnboardingStep.LinkingProgress -> LinkingProgressStep(viewModel)
+                OnboardingStep.AuthProgress -> AuthProgressStep(viewModel)
+            }
         }
     }
 }
@@ -233,10 +261,10 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
     }
 
     WizardScaffold(
-        eyebrow = "STEP 1 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Enable Banking setup",
         oneLiner = "Enter your Enable Banking email to begin. BankTeller will send a login link to that address.",
-        progress = { WizardProgressIndicator(currentStep = 0, totalSteps = 8) },
+        progress = viewModel.wizardFlowContext().progress(),
         onBack = null,
         forward = {
             ActionButton(onClick = submit, label = "Send login email")
@@ -303,10 +331,10 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
 @Composable
 private fun WaitingStep(viewModel: AppViewModel) {
     WizardScaffold(
-        eyebrow = "STEP 2 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Check your email",
         oneLiner = "We sent a login email to ${viewModel.onboardingEmail}. Click the link in that email to continue. You can click the link on another device — this tab will auto-advance.",
-        progress = { WizardProgressIndicator(currentStep = 1, totalSteps = 8) },
+        progress = viewModel.wizardFlowContext().progress(),
         onBack = { viewModel.resetOnboarding() },
         backLabel = "Start over",
         backServerAction = true, // POST reset credentials — disable while in flight
@@ -412,10 +440,10 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
     }
 
     WizardScaffold(
-        eyebrow = "STEP 3 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Review registration",
         oneLiner = "Review the registration details before submitting.",
-        progress = { WizardProgressIndicator(currentStep = 2, totalSteps = 8) },
+        progress = viewModel.wizardFlowContext().progress(),
         onBack = { viewModel.resetOnboarding() },
         backLabel = "Back to email",
         backServerAction = true, // POST reset credentials — disable while in flight
@@ -555,10 +583,10 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
 @Composable
 private fun VerifyingStep(viewModel: AppViewModel) {
     WizardScaffold(
-        eyebrow = "STEP 4 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Verifying…",
         oneLiner = null,
-        progress = { WizardProgressIndicator(currentStep = 3, totalSteps = 8) },
+        progress = viewModel.wizardFlowContext().progress(),
         onBack = null,
         forward = null,
     ) {
@@ -592,10 +620,10 @@ private fun VerifyingStep(viewModel: AppViewModel) {
 @Composable
 private fun ActivationGuideStep(viewModel: AppViewModel) {
     WizardScaffold(
-        eyebrow = "STEP 5 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Complete bank setup",
         oneLiner = "Bank setup requires a two-step authorization process with your bank.",
-        progress = { WizardProgressIndicator(currentStep = 4, totalSteps = 8) },
+        progress = viewModel.wizardFlowContext().progress(),
         onBack = null,
         extraActions = {
             QuietActionButton(
@@ -673,114 +701,17 @@ private val countryCodeToNameMap = mapOf(
     "GB" to "United Kingdom",
 )
 
-@Composable
-private fun themedAvatarBackgroundColors(): List<Color> {
-    val primary = MaterialTheme.colorScheme.primary
-    val brass = LocalBankTellerColors.current.brass
-    val emerald = LocalBankTellerColors.current.emerald
-    val error = MaterialTheme.colorScheme.error
-    val onSurface = MaterialTheme.colorScheme.onSurface
-    return listOf(
-        primary, brass, emerald, error,
-        lerp(primary, brass, 0.5f), lerp(primary, emerald, 0.5f),
-        lerp(brass, emerald, 0.5f), lerp(primary, error, 0.5f),
-        lerp(primary, onSurface, 0.4f), lerp(brass, onSurface, 0.4f),
-        lerp(emerald, onSurface, 0.4f), lerp(error, onSurface, 0.4f),
-    )
-}
-
-/**
- * Deterministic background color from BIC hash or bank name.
- */
-private fun getAvatarBackgroundColor(key: String, palette: List<Color>): Color {
-    val hash = key.hashCode()
-    val index = (hash and 0x7FFFFFFF) % palette.size
-    return palette[index]
-}
-
 /**
  * Fallback Provider Avatar rendering a 2-letter badge with a deterministic color.
+ * Shared component (ui/components/BankAvatar.kt) — see DESIGN-LANGUAGE §6.2.
  */
-@Composable
-private fun BankAvatar(bankName: String, bic: String?, modifier: Modifier = Modifier) {
-    val initials = bankName.trim().take(2).uppercase()
-    val bgKey = bic ?: bankName
-    val bgColor = getAvatarBackgroundColor(bgKey, themedAvatarBackgroundColors())
-    // Relative luminance (Rec. 601) for contrast-safe initials.
-    val bgLum = 0.299f * bgColor.red + 0.587f * bgColor.green + 0.114f * bgColor.blue
-    val textColor = if (bgLum > 0.5f) Color.Black else Color.White
 
-    Box(
-        modifier = modifier
-            .size(64.dp)
-            .clip(CircleShape)
-            .background(bgColor),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = initials,
-            color = textColor,
-            style = MaterialTheme.typography.titleMedium.copy(
-                fontWeight = FontWeight.Bold,
-                fontSize = 20.sp,
-            ),
-            textAlign = TextAlign.Center,
-        )
-    }
-}
 
 /**
- * Module-level cache for loaded bank logo ImageBitmaps, keyed by logo URL.
- * Survives recomposition; cleared on page reload.
+ * BankLogo: shared component (ui/components/BankLogo.kt) — loads the remote
+ * logo PNG via ktor + Skia, falls back to BankAvatar (two-letter initials
+ * avatar) on null logo, load failure, or while loading.
  */
-private val bankLogoCache = mutableMapOf<String, ImageBitmap>()
-private val bankLogoHttpClient by lazy { createHttpClient() }
-
-/**
- * BankLogo: loads the remote logo PNG via ktor + Skia, falls back to BankAvatar
- * (two-letter initials avatar) on null logo, load failure, or while loading.
- */
-@Composable
-private fun BankLogo(bank: Aspssp, modifier: Modifier = Modifier) {
-    val logoUrl = bank.logo
-    var bitmap by remember(logoUrl) {
-        mutableStateOf(bankLogoCache[logoUrl])
-    }
-    var loadFailed by remember(logoUrl) { mutableStateOf(logoUrl == null) }
-
-    // Kick off async load if not yet cached and not previously failed.
-    // Fetches the logo through the server-side /api/logo endpoint which scales
-    // the image with high-quality bilinear resampling, avoiding Skia's
-    // nearest-neighbor downscaling on wasmJs (FilterQuality is ignored —
-    // SamplingMode.DEFAULT = NEAREST is always used).
-    LaunchedEffect(logoUrl) {
-        if (logoUrl != null && bitmap == null && !loadFailed) {
-            try {
-                val scaledUrl = "/api/logo?url=" + logoUrl.encodeURLParameter() + "&size=64"
-                val bytes = bankLogoHttpClient.get(scaledUrl).readRawBytes()
-                val loaded = SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap()
-                bankLogoCache[logoUrl] = loaded
-                bitmap = loaded
-            } catch (e: Throwable) {
-                loadFailed = true
-            }
-        }
-    }
-
-    if (bitmap != null) {
-        Image(
-            bitmap = bitmap!!,
-            contentDescription = "${bank.name} logo",
-            modifier = modifier
-                .size(64.dp)
-                .clip(RoundedCornerShape(Dimens.sm)),
-            contentScale = ContentScale.Fit,
-            filterQuality = FilterQuality.None,
-        )
-    } else {
-        BankAvatar(bankName = bank.name, bic = bank.bic, modifier = modifier)
-    }
-}
 
 // ---------------------------------------------------------------
 // BankSelectionStep (task 8.1 - 8.5)
@@ -809,10 +740,10 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
         when (viewModel.aspspsState) {
             is AspspsState.Loading -> {
                 WizardScaffold(
-                    eyebrow = "STEP 6 OF 8",
+                    eyebrow = viewModel.wizardFlowContext().eyebrow,
                     title = "Choose your bank",
                     oneLiner = "Confirm your account type to continue.",
-                    progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+                    progress = viewModel.wizardFlowContext().progress(),
                     onBack = null,
                     forward = {},
                 ) {
@@ -821,10 +752,10 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
             }
             is AspspsState.Error -> {
                 WizardScaffold(
-                    eyebrow = "STEP 6 OF 8",
+                    eyebrow = viewModel.wizardFlowContext().eyebrow,
                     title = "Choose your bank",
                     oneLiner = "Confirm your account type to continue.",
-                    progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+                    progress = viewModel.wizardFlowContext().progress(),
                     onBack = null,
                     forward = {},
                 ) {
@@ -848,10 +779,10 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
         val psuTypes = aspsp?.psuTypes?.ifEmpty { listOf("personal", "business") } ?: listOf("personal", "business")
 
         WizardScaffold(
-            eyebrow = "STEP 6 OF 8",
+            eyebrow = viewModel.wizardFlowContext().eyebrow,
             title = "Choose your bank",
             oneLiner = "Confirm your account type to continue.",
-            progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
+            progress = viewModel.wizardFlowContext().progress(),
             onBack = null,
             forward = {
                 ActionButton(
@@ -879,7 +810,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (aspsp != null) {
-                            BankLogo(bank = aspsp)
+                            BankLogo(bankName = aspsp.name, logoUrl = aspsp.logo, bic = aspsp.bic, contentDescription = "${aspsp.name} logo")
                         } else {
                             BankAvatar(bankName = bankName, bic = null)
                         }
@@ -1029,13 +960,25 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
         }
     } else {
         var searchQuery by remember { mutableStateOf("") }
+        // The bank list is this step's single scrollable (§6.1.5) — its
+        // state drives the scaffold's dividers and the LedgerScrollbar.
+        val bankListState = rememberLazyListState()
 
         WizardScaffold(
-            eyebrow = "STEP 6 OF 8",
+            eyebrow = viewModel.wizardFlowContext().eyebrow,
             title = "Choose your bank",
             oneLiner = "Search and select your bank.",
-            progress = { WizardProgressIndicator(currentStep = 5, totalSteps = 8) },
-            onBack = null,
+            progress = viewModel.wizardFlowContext().progress(),
+            // Add-mode exit affordance (task 7.4): abandoning the wizard
+            // returns to the dashboard, never to onboarding-abort/reroute.
+            onBack = if (viewModel.isAddMode) {
+                { viewModel.exitAddMode() }
+            } else null,
+            backLabel = if (viewModel.isAddMode) "Back to dashboard" else "Back",
+            // Shape B (§6.1.5): the LazyColumn below is the step's primary
+            // scrollable — the scaffold's zone stays non-scrolling and the
+            // dividers key on this list state.
+            listScrollState = bankListState,
             forward = {
                 val selected = viewModel.selectedAspsp
                 if (selected != null) {
@@ -1086,22 +1029,42 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     } else {
+                        // Orientation line (task 8.5): in the SANDBOX
+                        // environment the list is server-filtered to
+                        // sandbox-connectable banks — a live count sets that
+                        // expectation. While searching, the count reflects
+                        // the matches. Structurally identical to the
+                        // production list (no grouping) — only the count copy
+                        // differs.
+                        val isSandboxEnv = viewModel.registrationEnvironment == "SANDBOX"
                         Text(
-                            text = "${filtered.size} banks",
+                            text = when {
+                                !isSandboxEnv -> "${filtered.size} banks"
+                                query.isEmpty() -> "Showing ${filtered.size} banks available for sandbox testing."
+                                else -> "Found ${filtered.size} matching sandbox banks."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        val listState = rememberLazyListState()
-                        Box(
+                        // LedgerScrollbar wrap (task 8.22): hairline overlay
+                        // thumb per §6.1.4 — replaces the platform
+                        // VerticalScrollbar, which renders unstyled on
+                        // wasmJs. des-3: no height cap — the weighted list
+                        // takes the remaining content-zone height and the
+                        // thumb spans its full height. The LazyColumn keeps
+                        // its 12dp trailing padding so cards never slide
+                        // under the thumb.
+                        LedgerScrollbar(
+                            listState = bankListState,
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 400.dp)
+                                .weight(1f)
+                                .fillMaxWidth(),
                         ) {
                             LazyColumn(
-                                state = listState,
+                                state = bankListState,
                                 modifier = Modifier
-                                    .fillMaxWidth()
+                                    .fillMaxSize()
                                     .padding(end = 12.dp),
                                 verticalArrangement = Arrangement.spacedBy(Dimens.sm),
                             ) {
@@ -1111,17 +1074,32 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                 ) { bank ->
                                     val isSelected = viewModel.selectedAspsp?.name == bank.name &&
                                             viewModel.selectedAspsp?.country == bank.country
+                                    // Task 9.2 — connected banks are BLOCKED: one
+                                    // bank holds exactly one authorization, so a
+                                    // connected entry is disabled (no click, dimmed
+                                    // identity) with a supporting explanation. Its
+                                    // account set can be extended by re-authorizing
+                                    // the bank once its consent expires or is
+                                    // revoked — no in-product affordance to
+                                    // refresh a live bank's authorization exists.
+                                    val connected = bank.connected
                                     OutlinedCard(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .clickable {
-                                                val defaultPsu = if (bank.psuTypes.contains("personal")) "personal"
-                                                else bank.psuTypes.firstOrNull()
-                                                viewModel.selectAspsp(bank)
-                                                if (defaultPsu != null) {
-                                                    viewModel.selectPsuType(defaultPsu)
+                                            .then(
+                                                if (connected) {
+                                                    Modifier
+                                                } else {
+                                                    Modifier.clickable {
+                                                        val defaultPsu = if (bank.psuTypes.contains("personal")) "personal"
+                                                        else bank.psuTypes.firstOrNull()
+                                                        viewModel.selectAspsp(bank)
+                                                        if (defaultPsu != null) {
+                                                            viewModel.selectPsuType(defaultPsu)
+                                                        }
+                                                    }
                                                 }
-                                            },
+                                            ),
                                         shape = MaterialTheme.shapes.medium,
                                         border = BorderStroke(
                                             width = if (isSelected) 2.dp else 1.dp,
@@ -1138,10 +1116,11 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
-                                                .padding(Dimens.md),
+                                                .padding(Dimens.md)
+                                                .alpha(if (connected) 0.38f else 1f),
                                             verticalAlignment = Alignment.CenterVertically,
                                         ) {
-                                            BankLogo(bank = bank)
+                                            BankLogo(bankName = bank.name, logoUrl = bank.logo, bic = bank.bic, contentDescription = "${bank.name} logo")
 
                                             Spacer(modifier = Modifier.width(Dimens.md))
 
@@ -1190,7 +1169,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                     )
                                                 }
 
-                                                if (bank.psuTypes.isNotEmpty()) {
+                                                if (!connected && bank.psuTypes.isNotEmpty()) {
                                                     Spacer(modifier = Modifier.height(Dimens.sm))
                                                     Row(
                                                         horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
@@ -1246,19 +1225,38 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                                 }
                                             }
                                         }
+                                        if (connected) {
+                                            // Supporting explanation (task 9.2) — full
+                                            // quiet contrast beside the dimmed identity:
+                                            // honest about WHEN the refresh becomes
+                                            // available (no in-product affordance to
+                                            // refresh a live bank's authorization
+                                            // exists yet).
+                                            Text(
+                                                text = "Already connected — you can extend its account set by " +
+                                                        "re-authorizing this bank once its consent expires or is revoked.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(
+                                                    start = Dimens.md,
+                                                    end = Dimens.md,
+                                                    bottom = Dimens.md,
+                                                ),
+                                            )
+                                        }
                                     }
                                 }
                             }
-                            VerticalScrollbar(
-                                adapter = rememberScrollbarAdapter(listState),
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .align(Alignment.TopEnd),
-                            )
                         }
                     }
-                }
-            }
+
+                    // Sandbox credentials panel: AuthProgress placement
+                    // ONLY (spec) — the single point where credentials are
+                    // consumed. The BankSelection placement was removed: an
+                    // earlier placement would only shuffle layout while the
+                    // user browses banks.
+                 }
+             }
 
             viewModel.linkError?.let { err ->
                 Text(
@@ -1405,12 +1403,19 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
     }
 
     WizardScaffold(
-        eyebrow = "STEP 7 OF 8",
+        eyebrow = viewModel.wizardFlowContext().eyebrow,
         title = "Linking your account",
         oneLiner = oneLiner,
-        progress = { WizardProgressIndicator(currentStep = 6, totalSteps = 8) },
-        onBack = { viewModel.cancelLinking() },
-        backLabel = "Back to bank list",
+        progress = viewModel.wizardFlowContext().progress(),
+        // Add-mode (task 7.4): the back affordance abandons to the dashboard
+        // (the cancel-linking touchpoint's stage write is a dead letter in
+        // add-mode). Onboarding-mode keeps the existing back-to-bank-list.
+        onBack = if (viewModel.isAddMode) {
+            { viewModel.exitAddMode() }
+        } else {
+            { viewModel.cancelLinking() }
+        },
+        backLabel = if (viewModel.isAddMode) "Back to dashboard" else "Back to bank list",
         backServerAction = true, // POST cancel-linking — disable while in flight
         forward = forward,
     ) {
@@ -1672,24 +1677,110 @@ private fun LinkingFailurePanel(kind: String) {
 // AuthProgressStep (task 10.1 - 10.4)
 // ---------------------------------------------------------------
 
+/**
+ * Account-selection consequence instruction (spec: onboarding — SPA
+ * AuthProgress step, account-selection consequence): trailing copy inside
+ * the consent guidance card for the INITIAL-SETUP and ADD-BANK flows.
+ * Integrated into the guidance card, NOT a standalone DecisionBox —
+ * nothing is at stake in these flows, and a warning-tier box would create
+ * unearned alarm and banner fatigue (a Tier 3 DecisionBox is reserved
+ * for consequential choices where stored data is at risk — the
+ * re-authorization flow's [accountSelectionNoticeBody]).
+ */
+internal val selectionConsequenceInstruction =
+    "Then select every account you want to track in BankTeller and click \"Grant authorization\". " +
+            "To add more accounts later, you will need to authorize this bank again."
+
+/**
+ * Re-authorization replacement-notice body (spec: onboarding — SPA
+ * AuthProgress step): the elevated brass `ACCOUNT SELECTION NOTICE`
+ * DecisionBox copy for re-authorization with stored accounts — the
+ * selection at the bank REPLACES the connected accounts, so every account
+ * the user still wants must stay checked.
+ */
+internal val accountSelectionNoticeBody =
+    "Your selection at the bank will replace your connected accounts for this bank. " +
+            "Keep all accounts checked that you still want to see in BankTeller."
+
+/**
+ * Back-affordance wrapper for the auth-progress step (task 8.25 amendment,
+ * spec scenario "Canceling from the wizard closes the popup"): every back
+ * path at this step — within-flow back ("Choose a different bank") and
+ * abandon-to-dashboard (add-mode, re-auth) — first performs the
+ * marker-guarded popup close, because canceling in-app ends the popup's
+ * job. The attempt consumes the open-state marker, so a later Continue
+ * opens a FRESH popup instead of re-focusing a dead one.
+ */
+internal fun authProgressBackAction(
+    closePopup: () -> Boolean = ::closeSandboxCredentialsPopupIfOpen,
+    action: () -> Unit,
+): () -> Unit = {
+    closePopup()
+    action()
+}
+
 @Composable
 private fun AuthProgressStep(viewModel: AppViewModel) {
     val authRedirectUrl = viewModel.authRedirectUrl
     val authFailed = viewModel.authFailed
 
+    // Retry follow-through (spec: sandbox credentials popup route —
+    // auto-open): a retry Continue (failure state or cold-boot restore)
+    // fires POST /api/auth and — on success — redirects WITHOUT requiring a
+    // second click. The retry click handlers below arm this effect; the
+    // first-time flow (URL arrives from BankSelection/LinkingProgress while
+    // AuthProgress is not yet composed) never arms it, so the consent
+    // explainer stays visible until the user's explicit Continue.
+    var redirectArmed by remember { mutableStateOf(false) }
+    LaunchedEffect(authRedirectUrl) {
+        if (redirectArmed && authRedirectUrl != null) {
+            redirectArmed = false
+            redirectTo(authRedirectUrl)
+            viewModel.consumeAuthRedirectUrl()
+        }
+    }
+
+    // Re-authorization presentation (task 10.2): title, one-liner, and back
+    // action are flow-dependent. The back action in re-auth mode is a
+    // "Back to dashboard" abandon — NEVER "Choose a different bank" (bank
+    // selection blocks the bank being re-authorized). Non-re-auth flows keep
+    // the existing wording/behavior unchanged.
+    val flow = viewModel.wizardFlowContext()
+    val isReAuth = viewModel.isReAuthMode
+    val reAuthBankName = viewModel.reAuthBank?.name?.takeIf { it.isNotBlank() }
+
     WizardScaffold(
-        eyebrow = "STEP 8 OF 8",
-        title = "Authorizing session",
-        oneLiner = "You'll be redirected to your bank's secure page to grant account access. " +
-                "Here's what to expect:",
-        progress = { WizardProgressIndicator(currentStep = 7, totalSteps = 8) },
+        eyebrow = flow.eyebrow,
+        title = when {
+            isReAuth && reAuthBankName != null -> "Re-authorize $reAuthBankName"
+            isReAuth -> "Re-authorize your bank"
+            else -> "Authorizing session"
+        },
+        oneLiner = if (isReAuth) {
+            "You'll be redirected to your bank's secure page to renew account access. " +
+                    "Here's what to expect:"
+        } else {
+            "You'll be redirected to your bank's secure page to grant account access. " +
+                    "Here's what to expect:"
+        },
+        progress = flow.progress(),
         // D7: back affordance once authorization has started — "Choose a
         // different bank" aborts via the cancel-linking flow (clears the
         // one-shot authError and returns to the bank list). In the
         // transitional no-stage-bank failure state it is the ONLY path
         // forward (see forward slot below).
-        onBack = { viewModel.cancelLinking() },
-        backLabel = "Choose a different bank",
+        // Add-mode (task 7.4): the back affordance abandons to the dashboard.
+        // Re-auth mode (task 10.2): same dashboard abandon — bank selection
+        // would block the bank being re-authorized.
+        // Task 8.25 amendment: every back path first closes an open
+        // credentials popup (marker-guarded attempt) — canceling in-app
+        // ends the popup's job.
+        onBack = when {
+            isReAuth -> authProgressBackAction { viewModel.exitReAuthMode() }
+            viewModel.isAddMode -> authProgressBackAction { viewModel.exitAddMode() }
+            else -> authProgressBackAction { viewModel.cancelLinking() }
+        },
+        backLabel = if (isReAuth || viewModel.isAddMode) "Back to dashboard" else "Choose a different bank",
         backServerAction = true, // POST cancel-linking — disable while in flight
         forward = {
             // D6 footprint rule: the button stays mounted at all times.
@@ -1704,18 +1795,35 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
             // fallback (no stage bank stored — pre-change cookie): the forward
             // slot renders nothing; "Choose a different bank" (back slot) is the
             // path forward, and the resume card re-confirms the account type.
-            val retryBank = viewModel.stageBankFromState
+            // Re-auth mode (task 9.3): the pre-selected re-authorization bank
+            // is the retry source (authRetryBank prefers it over the stage
+            // bank) — the step works with the pre-selected bank without any
+            // bank-list selection.
+            //
+            // Task 8.7 (auto-open): in the SANDBOX environment the click
+            // opens the sandbox-credentials popup FIRST — synchronously, in
+            // the click handler, before any async work — so the user
+            // activation is spent on window.open (awaiting POST /api/auth
+            // first would consume the gesture and popup blockers would
+            // suppress the window). The deterministic window name
+            // re-focuses an already-open popup instead of duplicating it.
+            val retryBank = viewModel.authRetryBank
             val retryPsuType = retryBank?.psuType
             if (authFailed) {
                 if (retryBank != null && !retryPsuType.isNullOrBlank()) {
                     ActionButton(
-                        onClick = { viewModel.retryAuth() },
+                        onClick = {
+                            maybeOpenSandboxCredentialsPopup(viewModel)
+                            redirectArmed = true
+                            viewModel.retryAuth()
+                        },
                         label = "Continue to your bank",
                     )
                 }
             } else if (authRedirectUrl != null) {
                 ActionButton(
                     onClick = {
+                        maybeOpenSandboxCredentialsPopup(viewModel)
                         authRedirectUrl?.let {
                             redirectTo(it)
                             viewModel.consumeAuthRedirectUrl()
@@ -1727,9 +1835,14 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
                 // Non-failure stage restore (route auth_progress, no in-memory
                 // authRedirectUrl on cold boot): the click initiates a fresh
                 // POST /api/auth with the stored bank triple (user-initiated —
-                // the no-auto-start rule is not violated).
+                // the no-auto-start rule is not violated) and follows through
+                // to the redirect on success.
                 ActionButton(
-                    onClick = { viewModel.retryAuth() },
+                    onClick = {
+                        maybeOpenSandboxCredentialsPopup(viewModel)
+                        redirectArmed = true
+                        viewModel.retryAuth()
+                    },
                     label = "Continue to your bank",
                 )
             }
@@ -1742,9 +1855,24 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
             AuthFailurePanel(viewModel)
         }
 
+        // Sandbox credentials panel (task 8.5/8.7): above the consent
+        // explainer, PERSISTING across auth retries (alongside the failure
+        // panel above). The footer carries the auto-open note — the Continue
+        // button opens this content in a popup on click. Sandbox environment
+        // only; a bank is always resolvable (stage bank or selection).
+        if (viewModel.registrationEnvironment == "SANDBOX") {
+            authProgressSandboxBank(viewModel)?.let { bank ->
+                SandboxCredentialsPanel(
+                    bank = bank,
+                    showAutoOpenNote = true,
+                )
+            }
+        }
+
         // Commitment warning (advisory, D6 touchpoint 2): above the consent box
-        // when the selected psu_type's status is non-green.
-        val aspsp = viewModel.selectedAspsp
+        // when the selected psu_type's status is non-green. In re-auth mode the
+        // pre-selected bank's catalog entry resolves the status.
+        val aspsp = viewModel.reAuthBankAspsp ?: viewModel.selectedAspsp
         val selectedPsu = viewModel.selectedPsuType
         val perTypeStatus = if (selectedPsu.isNotEmpty()) {
             aspsp?.statusByPsuType?.get(selectedPsu.lowercase())
@@ -1758,6 +1886,33 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
                 status = psuStatus,
                 psuType = if (perTypeStatus != null) selectedPsu.ifEmpty { null } else null,
             )
+        }
+
+        // Replacement explainer (task 9.3): re-authorization of a bank with
+        // stored accounts REPLACES its account selection — a brass Tier-3
+        // DecisionBox (12% brass wash + 3dp brass left border) directly
+        // above the consent guidance card. Rendered only when the
+        // re-authorized bank carries stored accounts (a bank without stored
+        // accounts has no previous selection to replace).
+        if (isReAuth && viewModel.reAuthBank?.hasStoredAccounts == true) {
+            Spacer(modifier = Modifier.height(Dimens.sm))
+            val brass = LocalBankTellerColors.current.brass
+            DecisionBox(
+                tint = brass,
+                borderColor = brass,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "ACCOUNT SELECTION NOTICE",
+                    style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.15.sp),
+                    color = brass,
+                )
+                Spacer(modifier = Modifier.height(Dimens.xs))
+                Text(
+                    text = accountSelectionNoticeBody,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
         }
 
         OutlinedCard(
@@ -1792,8 +1947,20 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
 
                 Spacer(modifier = Modifier.height(Dimens.xs))
 
+                // Account-selection guidance (spec: onboarding — SPA
+                // AuthProgress step): the selection instruction and its
+                // consequence form ONE paragraph at the card's text tier
+                // (labelSmall/onSurfaceVariant — typographic consistency
+                // within the card). Re-authorization keeps the plain
+                // selection sentence here and carries the consequence in
+                // the elevated brass ACCOUNT SELECTION NOTICE above
+                // instead (stored data is at risk there; here nothing is).
                 Text(
-                    text = "Then select the accounts you want to connect and click \"Grant authorization\".",
+                    text = if (isReAuth) {
+                        "Then select the accounts you want to connect and click \"Grant authorization\"."
+                    } else {
+                        selectionConsequenceInstruction
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1823,6 +1990,46 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
 }
 
 /**
+ * Opens the sandbox-credentials popup (task 8.7) when the wizard runs in the
+ * SANDBOX environment and the auth target bank is known. Called synchronously
+ * inside the "Continue to your bank" click handler — FIRST, before any async
+ * work (retryAuth / redirect) — so the user-activation gesture is spent on
+ * window.open; awaiting the auth call first would let popup blockers suppress
+ * the window. The deterministic window name ("bankteller_sandbox_credentials",
+ * see the Platform seam) re-focuses an already-open popup instead of
+ * duplicating it.
+ */
+private fun maybeOpenSandboxCredentialsPopup(viewModel: AppViewModel) {
+    if (viewModel.registrationEnvironment != "SANDBOX") return
+    val bank = authProgressSandboxBank(viewModel) ?: return
+    // Credential-less banks skip the auto-open entirely (spec): the SPA
+    // already knows from the bank-list data that the bank carries no sandbox
+    // users — its authorization page needs nothing typed, so there are no
+    // credentials to keep visible across the redirect. The handler proceeds
+    // directly to the auth request and redirect.
+    if (sandboxCredentialsVariant(bank) != SandboxCredentialsVariant.CREDENTIALS) return
+    openSandboxCredentialsPopup(buildSandboxCredentialsPopupUrl(bank.name, bank.country))
+}
+
+/**
+ * Resolves the bank whose sandbox credentials the AuthProgress step is
+ * authorizing: the re-authorization bank (looked up in the loaded bank list
+ * — task 9.3) when a re-auth flow is active, otherwise the current selection
+ * when present, otherwise the stage bank (cold boot after an auth failure —
+ * the selection may not be re-populated) looked up in the loaded bank list
+ * by exact {name, country} match.
+ */
+private fun authProgressSandboxBank(viewModel: AppViewModel): Aspssp? {
+    viewModel.reAuthBankAspsp?.let { return it }
+    viewModel.selectedAspsp?.let { return it }
+    val stageBank = viewModel.stageBankFromState ?: return null
+    val loaded = viewModel.aspspsState as? AspspsState.Loaded ?: return null
+    return loaded.aspsps.firstOrNull {
+        it.name == stageBank.aspspName && it.country == stageBank.aspspCountry
+    }
+}
+
+/**
  * Failure display for the AuthProgress step (cold entry after an auth-callback
  * failure). Renders the designer-specified variant copy keyed on auth_error_kind,
  * the optional status-enrichment line (technical variant, non-green selected type),
@@ -1832,33 +2039,9 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
 private fun AuthFailurePanel(viewModel: AppViewModel) {
     val kind = viewModel.authErrorKind
     val error = MaterialTheme.colorScheme.error
-
-    val title: String
-    val body: String
-    val guidance: String
-    when (kind) {
-        "cancelled" -> {
-            title = "Authorization cancelled"
-            body = "The authorization request was cancelled at your bank. No accounts were connected and no data was shared."
-            guidance = "If this was unintended, you can try connecting again. You can also pick a different bank."
-        }
-        "technical" -> {
-            title = "Bank connection unavailable"
-            body = "Your bank could not complete the connection request. You did nothing wrong — this is usually a temporary disruption on the bank's side."
-            guidance = "You can try again in a few moments, or return to the bank list to connect another institution."
-        }
-        "configuration" -> {
-            title = "Bank connection not supported"
-            body = "This bank rejected the connection request due to an integration setup issue. You did nothing wrong — BankTeller cannot complete the connection with this institution at this time."
-            guidance = "Retrying is unlikely to resolve this. We recommend returning to the bank list to connect a different bank."
-        }
-        else -> {
-            // null kind (pre-deployment cookie) and unknown kinds → unexpected
-            title = "Connection incomplete"
-            body = "BankTeller could not verify the connection with your bank. Your credentials and accounts remain secure."
-            guidance = "Please try starting the authorization again. If the issue persists, try connecting a different bank or check back later."
-        }
-    }
+    // Shared kind-based copy selection (see AuthFailureCopy.kt) — kept in
+    // sync with the dashboard add-flow failure notice (task 7.5).
+    val copy = authFailureCopy(kind)
 
     DecisionBox(
         tint = error,
@@ -1876,14 +2059,14 @@ private fun AuthFailurePanel(viewModel: AppViewModel) {
                 modifier = Modifier.size(18.dp),
             )
             Text(
-                text = title,
+                text = copy.title,
                 style = MaterialTheme.typography.titleMedium,
                 color = error,
             )
         }
         Spacer(modifier = Modifier.height(Dimens.xs))
         Text(
-            text = body,
+            text = copy.body,
             style = MaterialTheme.typography.bodyMedium,
         )
         if (kind == "technical") {
@@ -1899,7 +2082,7 @@ private fun AuthFailurePanel(viewModel: AppViewModel) {
         }
         Spacer(modifier = Modifier.height(Dimens.xs))
         Text(
-            text = guidance,
+            text = copy.guidance,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

@@ -82,13 +82,19 @@ class AccountLinkingRoutesTest {
      */
     private class FakeEnableBankingClient(
         var aspspsResult: AspsspListResult = AspsspListResult.Ok(emptyList()),
-        var startAuthResult: StartAuthResult = StartAuthResult.Error(null, "not configured"),
-        var authorizeSessionResult: AuthorizeSessionResult = AuthorizeSessionResult.Error(null, "not configured"),
+        var startAuthResult: StartAuthResult = StartAuthResult.Error(null, null, "not configured"),
+        var authorizeSessionResult: AuthorizeSessionResult = AuthorizeSessionResult.Error(null, null, "not configured"),
     ) : EnableBankingClient(testCredentialProvider) {
         var lastStartAuth: StartAuthCall? = null
         val authorizeSessionCodes = mutableListOf<String>()
 
-        override suspend fun getAspsps(): AspsspListResult = aspspsResult
+        /** Counts data-plane getAspsps calls (source-selection assertions). */
+        var aspspsCalls = 0
+
+        override suspend fun getAspsps(): AspsspListResult {
+            aspspsCalls++
+            return aspspsResult
+        }
 
         override suspend fun startAuth(
             aspspName: String,
@@ -133,6 +139,12 @@ class AccountLinkingRoutesTest {
      *   (HTTP 200); when null, the AIS lookup throws (network failure).
      * @param aisStatusRequests When non-null, incremented on every AIS
      *   session-status request (call-count assertions).
+     * @param applicationJson When non-null, overrides the GET /api/applications
+     *   response body entirely (single state object or `[]` for a deleted app).
+     * @param aspspListRequests When non-null, incremented on every control-plane
+     *   GET /api/aspsps request (source-selection assertions).
+     * @param todayStatsRequests When non-null, incremented on every
+     *   get_today_stats request (status-suppression assertions).
      */
     private fun controlPlaneEngine(
         appActive: Boolean = true,
@@ -142,6 +154,10 @@ class AccountLinkingRoutesTest {
         linkAuthorizationUrl: String = "https://eb.example/auth",
         aisStatusJson: String? = null,
         aisStatusRequests: IntArray? = null,
+        applicationJson: String? = null,
+        aspspListRequests: IntArray? = null,
+        todayStatsRequests: IntArray? = null,
+        aspspListJson: String? = null,
     ): MockEngine = MockEngine { request ->
         val url = request.url.toString()
         when {
@@ -171,7 +187,7 @@ class AccountLinkingRoutesTest {
             }
             url.contains("enablebanking.com/api/applications") ->
                 respond(
-                    content = if (whitelistAccountsJson != null) {
+                    content = applicationJson ?: if (whitelistAccountsJson != null) {
                         """[{"kid":"test-app-id","active":true,"whitelisted_accounts":$whitelistAccountsJson}]"""
                     } else if (appActive && whitelisted) {
                         """[{"kid":"test-app-id","active":true,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]"""
@@ -183,7 +199,8 @@ class AccountLinkingRoutesTest {
                     status = HttpStatusCode.OK,
                     headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
                 )
-            url.contains("enablebanking.com/api/get_today_stats") ->
+            url.contains("enablebanking.com/api/get_today_stats") -> {
+                todayStatsRequests?.let { it[0]++ }
                 if (todayStatsJson != null) {
                     respond(
                         content = todayStatsJson,
@@ -197,12 +214,16 @@ class AccountLinkingRoutesTest {
                         headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
                     )
                 }
-            url.contains("enablebanking.com/api/aspsps") ->
+            }
+            url.contains("enablebanking.com/api/aspsps") -> {
+                aspspListRequests?.let { it[0]++ }
                 respond(
-                    content = """{"aspsps":[{"name":"Test Bank","country":"DE","bic":"TESTDEFF","logo":"","psu_types":["personal"],"maximum_consent_validity":7776000}]}""",
+                    content = aspspListJson
+                        ?: """{"aspsps":[{"name":"Test Bank","country":"DE","bic":"TESTDEFF","logo":"","psu_types":["personal"],"maximum_consent_validity":7776000}]}""",
                     status = HttpStatusCode.OK,
                     headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
                 )
+            }
             else -> error("Unexpected control-plane request: $url")
         }
     }
@@ -215,6 +236,10 @@ class AccountLinkingRoutesTest {
         linkAuthorizationUrl: String = "https://eb.example/auth",
         aisStatusJson: String? = null,
         aisStatusRequests: IntArray? = null,
+        applicationJson: String? = null,
+        aspspListRequests: IntArray? = null,
+        todayStatsRequests: IntArray? = null,
+        aspspListJson: String? = null,
     ): EnableBankingControlPlaneClient =
         EnableBankingControlPlaneClient(
             client = HttpClient(
@@ -226,6 +251,10 @@ class AccountLinkingRoutesTest {
                     linkAuthorizationUrl,
                     aisStatusJson,
                     aisStatusRequests,
+                    applicationJson,
+                    aspspListRequests,
+                    todayStatsRequests,
+                    aspspListJson,
                 ),
             ),
             database = DatabaseFactory.init(),
@@ -236,11 +265,20 @@ class AccountLinkingRoutesTest {
         applicationId: String = "test-app-id",
         refreshToken: String = "rt-1",
         redirectUrl: String = "https://app.example.com/enable-banking-callback",
+        privateKey: String? = null,
     ) {
         val db = DatabaseFactory.init()
         db.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
         db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
         db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
+        // Without a private key row, OnboardingService.getStatus() treats the
+        // app as not-configured (appState unknown) → /api/aspsps takes the
+        // data-plane source. Passing a non-null key makes getStatus() do the
+        // REAL control-plane lookup (via the MockEngine) — for appState-based
+        // source-selection tests.
+        if (privateKey != null) {
+            db.systemConfigQueries.insertOrReplace("enable_banking_private_key", privateKey)
+        }
     }
 
     /** Logs in with the default admin/changeme credentials and returns a cookie jar client. */
@@ -310,9 +348,21 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_6 aspsps with session returns full bank list including maximum_consent_validity`() = testApplication {
         seedDb()
-        // The route now uses the control-plane client (controlPlaneEngine serves
-        // GET enablebanking.com/api/aspsps), so the data-plane fake is unused here.
-        val fake = FakeEnableBankingClient()
+        // No private key seeded → appState unknown → the route takes the
+        // data-plane source; the bank list comes from the fake client.
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    Aspssp(
+                        name = "Test Bank",
+                        country = "DE",
+                        bic = "TESTDEFF",
+                        psuTypes = listOf("personal"),
+                        maximumConsentValidity = 7776000L,
+                    ),
+                ),
+            ),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(),
@@ -339,7 +389,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 aspsps attaches status and status_by_psu_type when CP data exists`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(
@@ -369,7 +421,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 aspsps omits status fields when no CP data for the bank`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(
@@ -393,7 +447,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 aspsps status fetch failure does not fail the bank list`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(todayStatsJson = null), // get_today_stats → 500
@@ -413,7 +469,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 aspsps normalizes unknown status values to green`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(
@@ -443,7 +501,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 aspsps aggregates duplicate status records worst-of`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(
@@ -590,7 +650,7 @@ class AccountLinkingRoutesTest {
                 authorizationId = "auth-1",
                 psuIdHash = "hash-1",
             ),
-            authorizeSessionResult = AuthorizeSessionResult.Error(400, "Invalid or expired code"),
+            authorizeSessionResult = AuthorizeSessionResult.Error(400, null, "Invalid or expired code"),
         )
         application {
             module(
@@ -721,7 +781,7 @@ class AccountLinkingRoutesTest {
                 authorizationId = "auth-1",
                 psuIdHash = "hash-1",
             ),
-            authorizeSessionResult = AuthorizeSessionResult.Error(400, "Invalid or expired code"),
+            authorizeSessionResult = AuthorizeSessionResult.Error(400, null, "Invalid or expired code"),
         )
         application {
             module(
@@ -1342,7 +1402,7 @@ class AccountLinkingRoutesTest {
                 authorizationId = "auth-1",
                 psuIdHash = "hash-1",
             ),
-            authorizeSessionResult = AuthorizeSessionResult.Error(400, "Invalid or expired code"),
+            authorizeSessionResult = AuthorizeSessionResult.Error(400, null, "Invalid or expired code"),
         )
         application {
             module(
@@ -1915,7 +1975,9 @@ class AccountLinkingRoutesTest {
     @Test
     fun `3_4 200 with missing status field maps to unavailable`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(listOf(Aspssp(name = "Test Bank", country = "DE"))),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(
@@ -2446,5 +2508,533 @@ class AccountLinkingRoutesTest {
         val sessionClient = loggedInClient()
         sessionClient.linkAccounts()
         assertEquals("unavailable", sessionClient.linkingSessionState())
+    }
+
+    // =====================================================================
+    // Task 8.1 — GET /api/aspsps source selection (application-status
+    // cache: ACTIVE → data-plane, definitively-inactive states →
+    // control-plane, unknown/lookup-failure → data-plane with 403
+    // self-healing fallback).
+    //
+    // appState-based tests seed a private key (see seedDb) so
+    // OnboardingService.getStatus() performs the real control-plane lookup
+    // against the MockEngine; without it, the app counts as not-configured
+    // (unknown) and the route takes the data-plane source.
+    // =====================================================================
+
+    /** Fetches /api/aspsps with a logged-in session and parses the bank array. */
+    private suspend fun HttpClient.aspspsJson(): JsonArray {
+        val response = get("/api/aspsps")
+        assertEquals(HttpStatusCode.OK, response.status)
+        return Json.parseToJsonElement(response.bodyAsText()).jsonArray
+    }
+
+    @Test
+    fun `8_1 active application serves the bank list from the data plane`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Data Plane Bank", country = "DE", psuTypes = listOf("personal"))),
+            ),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    // PRODUCTION so the sandbox list filter does not hide the
+                    // data-plane bank (source selection is env-independent).
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                    aspspListRequests = aspspListRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Data Plane Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(1, fake.aspspsCalls, "the bank list must come from the data plane")
+        assertEquals(0, aspspListRequests[0], "the control-plane bank list must not be fetched")
+    }
+
+    @Test
+    fun `8_1 data-plane 403 self-heals to the control-plane bank list`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Error(403, null, "Forbidden"),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                    aspspListRequests = aspspListRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Test Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(1, aspspListRequests[0], "the 403 must fall back to the control plane")
+    }
+
+    @Test
+    fun `8_1 inactive never linked application serves the bank list from the control plane`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Data Plane Bank", country = "DE")),
+            ),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":false,"whitelisted_accounts":[]}]
+                    """.trimIndent(),
+                    aspspListRequests = aspspListRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Test Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(0, fake.aspspsCalls, "the data plane must not be queried")
+        assertEquals(1, aspspListRequests[0])
+    }
+
+    @Test
+    fun `8_1 inactive but linked application serves the bank list from the control plane`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Data Plane Bank", country = "DE")),
+            ),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":false,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]
+                    """.trimIndent(),
+                    aspspListRequests = aspspListRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Test Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(0, fake.aspspsCalls, "the data plane must not be queried")
+        assertEquals(1, aspspListRequests[0])
+    }
+
+    @Test
+    fun `8_1 deleted application serves the bank list from the control plane`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Data Plane Bank", country = "DE")),
+            ),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = "[]", // kid absent → deleted application
+                    aspspListRequests = aspspListRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Test Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(0, fake.aspspsCalls, "the data plane must not be queried")
+        assertEquals(1, aspspListRequests[0])
+    }
+
+    @Test
+    fun `8_1 unknown application state serves the bank list from the data plane`() = testApplication {
+        // No private key seeded → OnboardingService.getStatus() reports the
+        // app as not-configured (appState unknown) → data-plane source.
+        seedDb()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Data Plane Bank", country = "DE")),
+            ),
+        )
+        val aspspListRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(aspspListRequests = aspspListRequests),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        assertEquals(listOf("Data Plane Bank"), body.map { it.jsonObject["name"]!!.jsonPrimitive.content })
+        assertEquals(1, fake.aspspsCalls)
+        assertEquals(0, aspspListRequests[0])
+    }
+
+    // =====================================================================
+    // Task 8.1 — sandbox test-credentials pass-through (data-plane only)
+    // =====================================================================
+
+    @Test
+    fun `8_1 sandbox users pass through with otp omitted when absent`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    Aspssp(
+                        name = "Sandbox Bank",
+                        country = "FI",
+                        psuTypes = listOf("personal"),
+                        maximumConsentValidity = 7776000L,
+                        sandbox = SandboxInfo(
+                            users = listOf(
+                                SandboxUser(username = "user1", password = "pass1", otp = "123456"),
+                                SandboxUser(username = "user2", password = "pass2", otp = null),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"SANDBOX"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val bank = body.single().jsonObject
+        assertEquals("Sandbox Bank", bank["name"]?.jsonPrimitive?.content)
+        val sandbox = bank["sandbox"]?.jsonObject
+        assertNotNull(sandbox, "sandbox credentials must pass through")
+        val users = sandbox["users"]?.jsonArray
+        assertNotNull(users)
+        assertEquals(2, users.size)
+
+        val user1 = users[0].jsonObject
+        assertEquals("user1", user1["username"]?.jsonPrimitive?.content)
+        assertEquals("pass1", user1["password"]?.jsonPrimitive?.content)
+        assertEquals("123456", user1["otp"]?.jsonPrimitive?.content)
+
+        val user2 = users[1].jsonObject
+        assertEquals("user2", user2["username"]?.jsonPrimitive?.content)
+        assertEquals("pass2", user2["password"]?.jsonPrimitive?.content)
+        assertNull(user2["otp"], "otp must be omitted when absent")
+    }
+
+    @Test
+    fun `sandbox users duplicated per PSU type are deduplicated preserving first-seen order`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    // EB repeats sandbox users per PSU type (personal +
+                    // business) with no distinguishing data.
+                    Aspssp(
+                        name = "Bank im Bistum Essen",
+                        country = "DE",
+                        psuTypes = listOf("personal", "business"),
+                        maximumConsentValidity = 15552000L,
+                        sandbox = SandboxInfo(
+                            users = listOf(
+                                SandboxUser(username = "VRK1234567890SECGO", password = "password", otp = "123456"),
+                                SandboxUser(username = "VRK1234567890PHOTO", password = "password", otp = "123456"),
+                                SandboxUser(username = "VRK1234567890SECGO", password = "password", otp = "123456"),
+                                SandboxUser(username = "VRK1234567890PHOTO", password = "password", otp = "123456"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"SANDBOX"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val users = body.single().jsonObject["sandbox"]!!.jsonObject["users"]!!.jsonArray
+        assertEquals(2, users.size, "duplicated users must be deduplicated")
+        assertEquals("VRK1234567890SECGO", users[0].jsonObject["username"]?.jsonPrimitive?.content)
+        assertEquals("VRK1234567890PHOTO", users[1].jsonObject["username"]?.jsonPrimitive?.content)
+    }
+
+    // =====================================================================
+    // Task 8.2 — sandbox filtering + status suppression
+    // =====================================================================
+
+    /** Four banks covering the sandbox filter rules (sandbox field / whitelist / neither). */
+    private val sandboxFilterAspsps = listOf(
+        Aspssp(name = "Sandbox Bank", country = "FI", sandbox = SandboxInfo(users = listOf(SandboxUser("u", "p")))),
+        Aspssp(name = "Nordea", country = "FI"), // credential-less whitelist, NO sandbox field
+        Aspssp(name = "Mock ASPSP", country = "SE"), // credential-less whitelist, NO sandbox field
+        Aspssp(name = "Production Bank", country = "DE"), // neither → sandbox-filtered out
+    )
+
+    @Test
+    fun `8_2 sandbox environment filters data-plane list to sandbox and credential-less banks`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(sandboxFilterAspsps),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"SANDBOX"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val names = body.map { it.jsonObject["name"]!!.jsonPrimitive.content }
+        assertEquals(listOf("Mock ASPSP", "Nordea", "Sandbox Bank"), names)
+        // The credential-less whitelist entries carry NO sandbox field.
+        val nordea = body.single { it.jsonObject["name"]!!.jsonPrimitive.content == "Nordea" }.jsonObject
+        assertNull(nordea["sandbox"], "credential-less banks have no sandbox credentials object")
+    }
+
+    @Test
+    fun `8_2 production environment serves the data-plane list unfiltered`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(sandboxFilterAspsps),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val names = body.map { it.jsonObject["name"]!!.jsonPrimitive.content }
+        assertEquals(listOf("Mock ASPSP", "Nordea", "Production Bank", "Sandbox Bank"), names)
+    }
+
+    @Test
+    fun `8_2 production environment attaches status fields to the bank list`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Production Bank", country = "DE", psuTypes = listOf("personal"))),
+            ),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                    todayStatsJson = """[
+                        {"connector_name":"c1","brand":"Production Bank","country":"DE","psu_type":"personal","service":"AIS","status":"red"}
+                    ]""",
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val bank = body.single().jsonObject
+        assertEquals("red", bank["status"]?.jsonPrimitive?.content)
+        val byType = bank["status_by_psu_type"]?.jsonObject
+        assertNotNull(byType)
+        assertEquals("red", byType["personal"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `8_2 sandbox environment suppresses status fields without fetching them`() = testApplication {
+        seedDb(privateKey = "test-key")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    Aspssp(
+                        name = "Sandbox Bank",
+                        country = "FI",
+                        psuTypes = listOf("personal"),
+                        // Sandbox credentials so the bank survives the SANDBOX
+                        // environment's list filter — the test is about status
+                        // suppression, not filtering.
+                        sandbox = SandboxInfo(users = listOf(SandboxUser("u", "p"))),
+                    ),
+                ),
+            ),
+        )
+        val todayStatsRequests = intArrayOf(0)
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"SANDBOX"}]
+                    """.trimIndent(),
+                    todayStatsJson = """[
+                        {"connector_name":"c1","brand":"Sandbox Bank","country":"FI","psu_type":"personal","service":"AIS","status":"red"}
+                    ]""",
+                    todayStatsRequests = todayStatsRequests,
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val bank = body.single().jsonObject
+        assertEquals("Sandbox Bank", bank["name"]?.jsonPrimitive?.content)
+        assertNull(bank["status"], "status must be suppressed in the sandbox environment")
+        assertNull(bank["status_by_psu_type"], "status_by_psu_type must be suppressed in the sandbox environment")
+        assertEquals(0, todayStatsRequests[0], "the sandbox must not even fetch the status data")
+    }
+
+    // =====================================================================
+    // Task 8.10 — deterministic list ordering (both sources go through
+    // buildBankListPayload, which sorts; the data-plane list arrives in
+    // arbitrary order, so the fixture proves the sort).
+    // =====================================================================
+
+    @Test
+    fun `8_10 aspsps response is sorted by name then country regardless of source order`() = testApplication {
+        seedDb(privateKey = "test-key")
+        // Deliberately unsorted data-plane fixture: descending names, a
+        // same-name/different-country pair (country tiebreak: SE before FI
+        // by case-insensitive compare), and mixed countries.
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    Aspssp(name = "Zeta Bank", country = "DE"),
+                    Aspssp(name = "Midland Bank", country = "NL"),
+                    Aspssp(name = "Alpha Bank", country = "PL"),
+                    Aspssp(name = "Alpha Bank", country = "FI"),
+                    Aspssp(name = "Alpha Bank", country = "SE"),
+                ),
+            ),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val body = sessionClient.aspspsJson()
+        val keys = body.map { bank ->
+            bank.jsonObject["name"]!!.jsonPrimitive.content to bank.jsonObject["country"]!!.jsonPrimitive.content
+        }
+        assertEquals(
+            listOf(
+                "Alpha Bank" to "FI",
+                "Alpha Bank" to "PL",
+                "Alpha Bank" to "SE",
+                "Midland Bank" to "NL",
+                "Zeta Bank" to "DE",
+            ),
+            keys,
+            "list must be sorted by name then country (case-insensitive), whatever the source order",
+        )
+    }
+
+    // =====================================================================
+    // Task 9.1 — `connected` flag on GET /api/aspsps (spec: account-overview
+    // onboarding): a bank entry is connected when a LOCAL eb_sessions row
+    // exists for its {name, country} — never from Enable Banking, attached
+    // in both environments and from both sources.
+    // =====================================================================
+
+    /** Seeds one eb_sessions row so the given bank counts as connected. */
+    private fun seedConnectedSession(name: String, country: String) {
+        DatabaseFactory.init().ebSessionsQueries
+            .insertSession("sess-$name-$country", name, country, "personal", 1_000L, null, null)
+    }
+
+    @Test
+    fun `9_1 data-plane bank list flags connected banks from local eb_sessions`() = testApplication {
+        seedDb()
+        seedConnectedSession("Test Bank", "DE")
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(
+                    Aspssp(name = "Test Bank", country = "DE", psuTypes = listOf("personal")),
+                    Aspssp(name = "Other Bank", country = "FR", psuTypes = listOf("personal")),
+                ),
+            ),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    // PRODUCTION so the sandbox list filter does not hide the
+                    // data-plane banks (the flag itself is env-independent).
+                    applicationJson = """
+                        [{"kid":"test-app-id","active":true,"whitelisted_accounts":[],"environment":"PRODUCTION"}]
+                    """.trimIndent(),
+                ),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val byName = sessionClient.aspspsJson()
+            .associateBy { it.jsonObject["name"]!!.jsonPrimitive.content }
+        assertEquals(true, byName["Test Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
+        assertEquals(false, byName["Other Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
+    }
+
+    @Test
+    fun `9_1 control-plane bank list flags connected banks from local eb_sessions`() = testApplication {
+        seedDb(privateKey = "test-key")
+        seedConnectedSession("Test Bank", "DE")
+        // Definitively-inactive application → the list comes from the
+        // control plane; give it two banks so the flag varies per entry.
+        val aspspListJson = """
+            {"aspsps":[
+                {"name":"Test Bank","country":"DE","bic":"TESTDEFF","logo":"","psu_types":["personal"],"maximum_consent_validity":7776000},
+                {"name":"Other Bank","country":"FR","bic":"OTHERFRFF","logo":"","psu_types":["personal"],"maximum_consent_validity":7776000}
+            ]}
+        """.trimIndent()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(
+                    applicationJson = """[{"kid":"test-app-id","active":false}]""",
+                    aspspListJson = aspspListJson,
+                ),
+                enableBankingClientFactory = { FakeEnableBankingClient() },
+            )
+        }
+        val sessionClient = loggedInClient()
+        val byName = sessionClient.aspspsJson()
+            .associateBy { it.jsonObject["name"]!!.jsonPrimitive.content }
+        assertEquals(true, byName["Test Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
+        assertEquals(false, byName["Other Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
     }
 }

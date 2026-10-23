@@ -452,16 +452,20 @@ class OnboardingRouteResolverTest {
     }
 
     // =====================================================================
-    // Rung 8 — sandbox auto-activation → dashboard (design D9)
+    // Sandbox environment (design D9) — no auto-activation rung: a session-less
+    // sandbox user falls through to bank_selection; the sandbox flag only
+    // relaxes the linking-precedes-authorization rule for stored stages and
+    // auth_failed.
     // =====================================================================
 
     @Test
-    fun `sandbox rung fires (active sandbox app, no eb_sessions row, routes to dashboard)`() {
-        // The reported bug: sandbox registration completes with active == true
-        // and the in-session flow closes the gate; the cold-boot resolver must
-        // agree instead of bouncing to the bank list.
+    fun `session-less sandbox user routes to bank_selection (no auto-activation rung)`() {
+        // Sandbox registration completes with active == true, but account
+        // linking is not part of its onboarding — the cold-boot resolver must
+        // land the user on the bank list (where the sandbox flow authorizes
+        // directly), not bounce to the dashboard.
         assertEquals(
-            OnboardingRoute.DASHBOARD,
+            OnboardingRoute.BANK_SELECTION,
             resolveOnboardingRoute(
                 input(
                     appState = EbApplicationState.ACTIVE,
@@ -553,7 +557,89 @@ class OnboardingRouteResolverTest {
     }
 
     // =====================================================================
-    // Rung 9 — whitelist → bank_selection; else → bank_selection
+    // Sandbox stage honoring — the sandbox flag relaxes the
+    // linking-precedes-authorization rule for stored stages and auth_failed.
+    // =====================================================================
+
+    @Test
+    fun `sandbox mid-authorization reload honors auth_progress stage without linking`() {
+        // A sandbox user who started authorization (stage auth_progress) but
+        // never linked a bank reloads — the stage is honored because sandbox
+        // skips linking.
+        assertEquals(
+            OnboardingRoute.AUTH_PROGRESS,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    authCompleted = false,
+                    onboardingStage = OnboardingStage.AUTH_PROGRESS,
+                    stageBankKnown = true,
+                    sandboxEnvironment = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `sandbox auth failure routes to auth_progress without linking`() {
+        // A sandbox user who failed an authorization (auth_failed) reloads —
+        // the failure display is shown even though linking never completed.
+        assertEquals(
+            OnboardingRoute.AUTH_PROGRESS,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    authCompleted = false,
+                    authFailed = true,
+                    sandboxEnvironment = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `production auth_progress stage with linking not completed is ignored`() {
+        // The linking-precedes-authorization consistency rule is production-only:
+        // a production user cannot be mid-authorization before linking completes.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    authCompleted = false,
+                    onboardingStage = OnboardingStage.AUTH_PROGRESS,
+                    stageBankKnown = true,
+                    sandboxEnvironment = false,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `unknown environment falls through conservatively (auth_progress stage not honored)`() {
+        // A failed/incomplete control-plane lookup resolves sandboxEnvironment
+        // = false — the environment is never guessed, so a sandbox-looking
+        // stage is not honored without the sandbox signal.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    authCompleted = false,
+                    onboardingStage = OnboardingStage.AUTH_PROGRESS,
+                    stageBankKnown = true,
+                    sandboxEnvironment = false,
+                ),
+            ),
+        )
+    }
+
+    // =====================================================================
+    // Rung 8 — whitelist → bank_selection; else → bank_selection
     // =====================================================================
 
     @Test

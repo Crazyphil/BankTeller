@@ -72,7 +72,7 @@ class OnboardingViewPositionTest {
             authorizationId = "auth-1",
             psuIdHash = "hash-1",
         ),
-        var authorizeSessionResult: AuthorizeSessionResult = AuthorizeSessionResult.Error(400, "not configured"),
+        var authorizeSessionResult: AuthorizeSessionResult = AuthorizeSessionResult.Error(400, null, "not configured"),
     ) : EnableBankingClient(testCredentialProvider) {
         /** The signed state JWT from the most recent startAuth call. */
         var lastState: String? = null
@@ -334,7 +334,7 @@ class OnboardingViewPositionTest {
     fun `4_3 auth failure leaves a pre-existing stage untouched`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient(
-            startAuthResult = StartAuthResult.Error(502, "bank down"),
+            startAuthResult = StartAuthResult.Error(502, null, "bank down"),
         )
         application {
             module(

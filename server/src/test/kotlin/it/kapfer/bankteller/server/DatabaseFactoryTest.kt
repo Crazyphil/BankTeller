@@ -3,6 +3,7 @@ package it.kapfer.bankteller.server
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import it.kapfer.bankteller.database.BankTellerDatabase
 import java.nio.file.Files
@@ -121,5 +122,70 @@ class DatabaseFactoryTest {
         db.ebSessionsQueries.countSessions().executeAsOne()
         db.ebSessionsQueries.countAccounts().executeAsOne()
         assertEquals("v", db.systemConfigQueries.selectValue("k").executeAsOneOrNull())
+    }
+
+    @Test
+    fun `init migrates user_version 0 database with eb_sessions and accounts but no balances`() {
+        val path = newTempDbPath()
+        // A pre-migration-3 database: eb_sessions + accounts exist (and
+        // system_config), but balances/sync_log do not, and user_version was
+        // never written. The inference ladder must resolve the PRIOR schema
+        // version (not "assume latest") so migration 3 applies — adding the
+        // balances/sync_log tables and the valid_until/logo columns — without
+        // failing and without touching existing rows.
+        val driver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        driver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE eb_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                aspsp_name TEXT,
+                aspsp_country TEXT,
+                psu_type TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                iban TEXT,
+                uid TEXT,
+                currency TEXT,
+                name TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(null, "INSERT INTO system_config (key, value) VALUES ('k', 'v')", 0)
+        driver.execute(null, "INSERT INTO eb_sessions (session_id, created_at) VALUES ('sess-1', 1)", 0)
+        driver.execute(null, "INSERT INTO accounts (session_id, iban) VALUES (1, 'DE1')", 0)
+        driver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        // New tables exist and are usable.
+        db.balancesQueries.selectBalanceByAccountId(1).executeAsOneOrNull()
+        db.balancesQueries.countSyncLogsBySessionId(1).executeAsOne()
+        // New columns exist on eb_sessions (readable via the generated model).
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOneOrNull()
+        assertNotNull(session)
+        assertEquals(null, session.valid_until)
+        assertEquals(null, session.logo)
+        // Existing data survived the migration.
+        assertEquals("v", db.systemConfigQueries.selectValue("k").executeAsOneOrNull())
+        assertEquals(1L, db.ebSessionsQueries.countAccounts().executeAsOne())
+        // user_version now tracked, so a restart is a clean no-op.
+        DatabaseFactory.init()
     }
 }

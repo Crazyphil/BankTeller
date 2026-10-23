@@ -50,10 +50,17 @@ object DatabaseFactory {
             // Schema.version = (number of .sqm files) + 1.
             val hasEbSessions = tableExists("eb_sessions")
             val hasAccounts = tableExists("accounts")
+            val hasBalances = tableExists("balances")
+            val hasSyncLog = tableExists("sync_log")
             val hasSystemConfig = tableExists("system_config")
             currentVersion = when {
-                hasEbSessions && hasAccounts -> BankTellerDatabase.Schema.version
-                hasSystemConfig -> BankTellerDatabase.Schema.version - 1
+                hasEbSessions && hasAccounts && hasBalances && hasSyncLog ->
+                    BankTellerDatabase.Schema.version
+                // eb_sessions + accounts but no balances/sync_log: the database
+                // predates migration 3 — infer the PRIOR version so the pending
+                // migration applies (not "assume latest").
+                hasEbSessions && hasAccounts -> BankTellerDatabase.Schema.version - 1
+                hasSystemConfig -> BankTellerDatabase.Schema.version - 2
                 else -> 0
             }
         }

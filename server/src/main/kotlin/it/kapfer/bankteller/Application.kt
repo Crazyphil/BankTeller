@@ -26,6 +26,13 @@ import it.kapfer.bankteller.onboarding.StateJwt
 import it.kapfer.bankteller.onboarding.accountLinkingRoutes
 import it.kapfer.bankteller.onboarding.onboardingRoutes
 import it.kapfer.bankteller.server.*
+import it.kapfer.bankteller.sync.BalanceSyncEngine
+import it.kapfer.bankteller.sync.syncRoutes
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import org.slf4j.Logger
@@ -121,6 +128,20 @@ fun Application.module(
     // State-JWT codec for the EB auth flow (state param sign/verify), signed
     // with the same HMAC key as session cookies.
     val stateJwt = StateJwt(signingKey)
+
+    // Balance sync engine: single runner, three triggers (login, manual,
+    // background) plus the wizard's initial import. Engine-scoped runs
+    // complete server-side regardless of client disconnects.
+    val syncEngine = BalanceSyncEngine(database, ebClientFactory)
+
+    // Background scheduler: ~6h interval, no PSU headers, first run one full
+    // interval after restart (no immediate run on startup).
+    CoroutineScope(Dispatchers.Default).launch {
+        while (isActive) {
+            delay(syncEngine.backgroundIntervalMillis)
+            syncEngine.triggerBackgroundRun()
+        }
+    }
     // TODO: Close controlPlaneClient and any pooled EnableBankingClient instances
     //       on server shutdown via a proper Closeable management hook. Ktor's
     //       embeddedServer does not provide a built-in graceful shutdown hook,
@@ -159,7 +180,14 @@ fun Application.module(
             // ebSessionId, accountsJson) still decode into the slim UserSession.
             serializer = KotlinxSessionSerializer(legacyJson)
             cookie.httpOnly = true
-            cookie.sameSite = SameSite.Strict
+            // Lax, not Strict: the Enable Banking auth flow redirects back to
+            // /enable-banking-callback as a cross-site top-level GET (bank →
+            // BankTeller). Strict drops the session cookie on that navigation,
+            // the callback discards the single-use code, and the user loops
+            // back to the auth step. Lax attaches the cookie on top-level GET
+            // navigations (the callback) while still blocking cross-site
+            // POSTs (the CSRF property that matters).
+            cookie.sameSite = SameSite.Lax
             cookie.secure = cookieSecure
             cookie.path = "/"
             transform(sessionValueTransformer)
@@ -185,6 +213,7 @@ fun Application.module(
         // Onboarding routes (registered first so they are matched before the catch-all)
         onboardingRoutes(database, onboardingService, cpClient, ebClientFactory, stateJwt)
         accountLinkingRoutes(database, cpClient, ebClientFactory, stateJwt, onboardingService)
+        syncRoutes(syncEngine)
 
         // API routes
         post("/api/login") {
@@ -211,6 +240,15 @@ fun Application.module(
                 // gated on eb_sessions emptiness, would re-import dead-application
                 // rows after the stale-session purge.)
                 call.sessions.set(UserSession(request.username))
+                // Login-triggered balance sync: async, with the login request's
+                // PSU context. The response does NOT wait for the run.
+                syncEngine.triggerUserRun(
+                    it.kapfer.bankteller.enablebanking.PsuHeaders(
+                        ipAddress = it.kapfer.bankteller.enablebanking.PsuHeaders.sanitizeIpAddress(ip),
+                        userAgent = call.request.headers["User-Agent"],
+                    ),
+                    "login",
+                )
                 call.respond(HttpStatusCode.OK, mapOf("message" to "Login successful"))
             } else {
                 LoginRateLimiter.recordFailedAttempt(ip)

@@ -46,7 +46,14 @@ class EbSessionStore(private val database: BankTellerDatabase) {
      *   inserted as new rows (may duplicate; orphans are cleaned by deletion below).
      * - Delete all OTHER eb_sessions rows with the same (aspsp_name, aspsp_country)
      *   (old sessions of the same bank; other banks untouched) AND delete any
-     *   accounts rows still pointing at those deleted session rows.
+     *   accounts rows still pointing at those deleted session rows, plus their
+     *   dependent `balances` rows and the deleted sessions' `sync_log` rows
+     *   (same transaction — re-authorization must not accumulate orphans).
+     *
+     * `validUntil` (consent expiry, exactly as returned by Enable Banking —
+     * authoritative, never recomputed) and `logo` (ASPSP logo URL) are
+     * persisted on the eb_sessions row; both nullable, consumers degrade
+     * gracefully when NULL.
      */
     fun mergeSession(
         sessionId: String,
@@ -54,6 +61,8 @@ class EbSessionStore(private val database: BankTellerDatabase) {
         aspspCountry: String?,
         psuType: String?,
         accounts: List<MergedAccount>,
+        validUntil: String? = null,
+        logo: String? = null,
     ) {
         database.transaction {
             // Idempotency guard: a session_id that already exists (re-delivery
@@ -72,6 +81,8 @@ class EbSessionStore(private val database: BankTellerDatabase) {
                 aspsp_country = aspspCountry,
                 psu_type = psuType,
                 created_at = System.currentTimeMillis(),
+                valid_until = validUntil,
+                logo = logo,
             )
             // insertSession returns the affected-row count, not the rowid — look
             // up the autoincrement id via the UNIQUE session_id.
@@ -118,13 +129,15 @@ class EbSessionStore(private val database: BankTellerDatabase) {
                     .filter { it.session_id != sessionId }
                 if (oldSessions.isNotEmpty()) {
                     val oldSessionIds = oldSessions.map { it.id }
-                    val orphanedAccountIds = database.ebSessionsQueries
+                    val orphanedAccounts = database.ebSessionsQueries
                         .selectAccountsBySessionIds(oldSessionIds)
                         .executeAsList()
-                        .map { it.id }
-                    if (orphanedAccountIds.isNotEmpty()) {
+                    if (orphanedAccounts.isNotEmpty()) {
+                        val orphanedAccountIds = orphanedAccounts.map { it.id }
+                        database.balancesQueries.deleteBalancesByAccountIds(orphanedAccountIds)
                         database.ebSessionsQueries.deleteAccountsByIds(orphanedAccountIds)
                     }
+                    database.balancesQueries.deleteSyncLogsBySessionIds(oldSessionIds)
                     database.ebSessionsQueries.deleteSessionByIds(oldSessionIds)
                 }
             }

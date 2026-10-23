@@ -208,7 +208,7 @@ One scaffold for all multi-step flows (onboarding, bank linking, rule creation).
 
 ```
 ┌─────────────────────────────────────┐
-│ Eyebrow (displaySmall, brass, caps) │  ← "STEP 2 OF 5"
+│ Eyebrow (displaySmall, brass, caps) │  ← "ADD A BANK · STEP 2 OF 3"
 │ Title (headlineMedium, primary)     │  ← "Connect your bank"
 │ One-liner (bodyMedium, 70% opacity) │  ← "Select your bank from the list"
 ├─────────────────────────────────────┤
@@ -221,6 +221,13 @@ One scaffold for all multi-step flows (onboarding, bank linking, rule creation).
   ●──●──○──○──○                        ← Progress indicator (SVG)
 ```
 
+### Eyebrow
+
+The brass uppercase eyebrow is the flow's ledger stamp. It carries the flow identity and, for multi-step flows, the step position in the compound format `[FLOW IDENTITY] · STEP N OF M` (e.g. `INITIAL SETUP · STEP 2 OF 8`, `ADD A BANK · STEP 1 OF 3`).
+
+- **Single-step actions**: the action stamp alone (`RE-AUTHORIZATION`). Never render `STEP 1 OF 1` — a single-step action is a discrete confirmation, not a sequence; a "1 of 1" label induces hesitation about what comes after.
+- The step count always refers to the **active flow's step set**, never a hard-coded maximum. The same wizard steps serve flows of different lengths; the chrome tells the user both what they are doing and how long it takes.
+
 ### Progress Indicator
 
 An SVG component showing numbered step circles connected by a line:
@@ -229,7 +236,9 @@ An SVG component showing numbered step circles connected by a line:
 - **Current step**: outlined circle with number, `brass` stroke (2.5px), `brass` text
 - **Future steps**: outlined circle with number, `outline` stroke (1.5px), `onSurface` 50% opacity text
 - **Connecting line**: `brass` for completed segments, `outline` for future segments
-- Label beside indicator: "Step N of M" in mono, `brass`
+- Label beside indicator: "Step N of M" in mono, `brass` — **optional**: callers whose chrome already carries the step count (the wizard scaffold's compound eyebrow) SHALL omit the label so the count is never rendered twice within the same header block
+- The indicator reflects the **active flow's step count** — never a hard-coded maximum. A 2-step flow renders 2 nodes, an 8-step flow 8.
+- **Single-step flows**: omit the indicator entirely (`progress = null`). A single node communicates zero progression and adds false visual weight.
 
 ### Footer
 
@@ -264,12 +273,68 @@ Only components that exist in the current codebase or are required by the design
 | `Checkbox` | Consent item selection | For acknowledging individual consent points |
 | `Switch` | Notification/preference toggles | For binary on/off settings |
 
+### 6.1.1 Dense Container Control Tiers
+
+Buttons and utility controls within compact containers (cards, info boxes, table rows, headers adjacent to eyebrows) adhere to strict sizing tiers:
+
+| Tier | Height / Footprint | Content Padding | Typography | Icon | Min Interactive Size | Use Context |
+|---|---|---|---|---|---|---|
+| **Standard Text** | 40dp | 12dp horizontal, 8dp vertical | `labelLarge` / `labelMedium` | 18dp | 48×48dp | Standalone action bars, wizard footers, dialog actions, banner dismiss |
+| **Inline Text (XS)** | 28dp | 8dp horizontal (`0dp` start when edge-aligned), 2dp vertical | `labelSmall` | 14dp | `Dp.Unspecified` (visual bounds) | Dense containers: info-box headers/footers, table cell actions, metadata rows |
+| **Inline Icon Action** | 24×24dp footprint | 0dp (centered icon) | — | 14dp | `Dp.Unspecified` (visual bounds) | Per-field copy buttons, table-row actions, dense ledger rows |
+
+**Rule for dense containers:** When a text action or outbound link sits inside a compact container (cards, info boxes, table rows, headers adjacent to eyebrows), never use the standard 40dp `TextButton`. Standard buttons create disproportionate vertical bulk, misalign text edges with surrounding content, and introduce 48dp invisible hit-box traps. Compose Material 3 has no extra-small text button out of the box — build it explicitly: wrap in `CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified)`, constrain height to 28dp, set `shape = shapes.small`, use `labelSmall` typography with a 14dp icon, and trim horizontal content padding so the control aligns flush with adjacent content (0dp start padding when the button must align with the container's content grid). Inline reference links in this tier are exempt from the 44×44dp mobile touch-target rule (WCAG 2.5.8 inline-link exemption); inline icon actions in dense ledger rows share the exemption — their trailing placement and row spacing separate the targets (WCAG 2.5.8 spacing exception), and an enforced 44dp box beside a single-line mono value would destroy the ledger density.
+
+**Row-Height Invariant for Dense Containers**: An inline action or utility control must never inflate the row's height beyond the natural line-height of its text content. The height of a dense row is strictly bounded by its typography and internal vertical spacing; all inline controls opt out of the 48dp minimum interactive component size via `CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified)`.
+
+### 6.1.2 Utility Controls in Metadata Strips
+
+Metadata strips (such as the account overview status line beneath hero totals) are calm, data-dense reading surfaces. Controls placed within these strips adhere to the following rules:
+
+1. **Fixed footprint (zero layout shift)**: Utility controls never change their bounding box between states. When a control enters an in-flight, cooldown, or disabled state, it retains its exact dimensions — status messages belong in tooltips or adjacent status text, never replace a button with dynamic text.
+2. **Asymmetric weight**: Pair ambient maintenance actions (data refresh) with icon-only buttons (28×28dp). Reserve text buttons for structural or high-consequence actions (adding an institution, re-authenticating).
+3. **Uniform height**: All controls in the strip share the Inline / Extra-Small 28dp height tier, ensuring a clean horizontal baseline.
+4. **Tooltips on icon buttons**: Every icon-only button is wrapped in a `TooltipBox` that explains its purpose in the idle state and its restriction in disabled states.
+5. **Global sync line**: the strip's left zone carries a single global sync line — the most recent sync run's time ("Last updated 5 min ago", `labelMedium`, `onSurfaceVariant`) with an inline degraded summary appended after a middle dot ("· 1 bank needs attention" in danger / "· 1 bank outdated" in brass) — never one badge row per bank; per-bank detail lives in the consent notices and the per-card freshness sublabels (§6.2.2).
+
+### 6.1.3 Hero Balance Freshness Indicator
+
+The hero balance total is the primary trust figure of the dashboard. When contributing accounts cannot be verified as fresh, an indicator discloses that the displayed figures may not reflect the bank's current balances — without alarmist decoration.
+
+1. **Trigger conditions**: **`brass` (attention)** — one or more contributing banks are `stale`, `rate_limited`, or `never_synced` with displayed figures (unconfirmed cached data). **`danger` (broken)** — one or more contributing banks are in the `error` state or their consent is dead/expired (the connection is severed; balances cannot update). `danger` outranks `brass` when both are present. **No indicator**: fresh banks, active in-flight syncs (ambient transient activity), and accounts reporting no balance data (the em-dash case — a successful sync and a permanent normal condition; dash accounts are healthy and do not compromise freshness).
+
+2. **Visual treatment**: outlined icons only — `Icons.Outlined.WarningAmber` in `brass`, `Icons.Outlined.ErrorOutline` in `danger`. Never solid/filled warning signs (a filled hazard sign beside a financial total is alarmist). 18dp, trailing the currency code by 8dp (`Dimens.sm`), vertically centered in the figure row. In mixed-currency views, the indicator attaches to the specific affected currency subtotal — never to fresh subtotals.
+
+3. **Interaction and copy**: wrapped in a `TooltipBox`, non-clickable (the global sync line, refresh control, and notices directly below carry the actions). Stale tooltip: "Some balances may be outdated. Check the bank status below." Broken tooltip: "A bank connection requires attention. Balances cannot update."
+
+### 6.1.4 Scroll Architecture & Hairline Overlay Scrollbars
+
+Compose Web (wasmJs) renders inside an HTML canvas and has no native scrollbar for internal scrollable containers. BankTeller implements an explicit scroll architecture and a custom hairline overlay scrollbar to guarantee navigation without visual clutter.
+
+1. **App shell architecture (`ScreenShell`)**: three vertical zones — the `topBar` slot is fixed outside the scrolling viewport and never scrolls off-screen; the content zone occupies the flexible middle region (`weight(1f)`) and scrolls independently; an optional fixed `bottomBar` slot is reserved at the bottom for future navigation bars; screens hosting autonomous three-zone workflows (such as `WizardScaffold`) configure `ScreenShell(scrollable = false)` and manage their own internal pinned header/footer structures (§6.1.5). When content scrolls beneath the top bar (scroll offset > 0), a 1dp hairline divider (`outline` at 8% opacity) renders beneath the top bar to delineate moving data from fixed chrome — at offset 0 the boundary is seamless (no elevation shadows; the paper aesthetic stays flat).
+
+2. **The `LedgerScrollbar`**: a trackless floating overlay thumb — 4dp wide at rest, expanding to 6dp on hover/drag; 2dp rounded caps; minimum thumb length 36dp; `onSurfaceVariant` at 30% alpha at rest and 60% when hovered or dragged (never brass or semantic color — scrollbars are plumbing, not accents); inset 2dp from the trailing edge of the scrollable container.
+
+3. **Behavior**: desktop — fades in on scroll or cursor movement over the scrollable zone, fades out after 1.2s of inactivity, and the thumb is draggable (proportional scroll updates). Touch — appears at 30% alpha only during momentum scrolling, fades out after 400ms, non-interactive (touch uses direct drag).
+
+4. **Scope**: applied to the dashboard content zone, the wizard's bank-selection `LazyColumn`, and the long legal letterhead pages.
+
+### 6.1.5 Wizard Three-Zone Layout Architecture
+
+All guided multi-step flows (`WizardScaffold`) occupy the full viewport height using a three-zone structure, running inside a non-scrolling `ScreenShell` (`scrollable = false` — the scaffold manages its own scroll):
+
+1. **Fixed header zone**: the compound eyebrow stamp, the flow progress indicator, the title, and the optional one-liner — fixed at the top, never scrolling with step content.
+2. **Flexible content zone (`weight(1f)`)**: the step's content — always the primary scrolling container, with the `LedgerScrollbar` overlay when it overflows. Content is top-aligned; on steps whose content is shorter than the zone, the remaining whitespace is intentional (the pinned footer defines the ledger sheet's bottom edge — no stretching, no centering).
+3. **Fixed footer zone**: quiet navigation and extra actions on the left, the primary progression on the right — pinned to the bottom of the wizard container, at the identical position across every step and flow (strict pinning, no hybrid hug-content mode: a footer that moves between steps breaks the spatial predictability of the primary advancement action).
+
+**Symmetric hairline dividers**: at rest (or when content fits) no borders appear between zones. When content scrolls beneath the header, a 1dp hairline divider (`outline` at 8% alpha) appears beneath it. When content extends below the fold, a divider appears above the footer, dissolving once the user reaches the end. The layout is uniform at every height; below ~600dp the fixed chrome and footer leave a minimal but usable content area — the same scroll behavior applies.
+
 ### 6.2 Custom Components
 
 | Component | Purpose | Notes |
 |---|---|---|
-| `ScreenShell` | Shared layout wrapper | Replaces duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate. Centers content within `contentMaxWidth`, applies screen padding and theme background. |
-| `WizardScaffold` | Multi-step flow scaffold | Implements §5 structure: eyebrow, title, one-liner, content, footer, progress indicator. |
+| `ScreenShell` | Shared layout wrapper | Replaces duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate. Centers content within `contentMaxWidth`, applies screen padding and theme background. Three-zone scroll architecture: fixed `topBar`, scrollable content zone, optional fixed `bottomBar` slot (§6.1.4). |
+| `WizardScaffold` | Multi-step flow scaffold | Implements §5 structure in a three-zone full-height layout (§6.1.5): fixed header (eyebrow, progress, title, one-liner), flexible scrolling content zone, pinned footer. |
 | `WizardProgressIndicator` | SVG/Canvas step progress | Numbered circles + connecting line. See §5. |
 | `DecisionBox` | Tinted consequential choice surface | See §4, Tier 3. |
 | `BrandedTopBar` | Lightweight app chrome (authenticated shell) | Logo icon (24dp) + "BankTeller" wordmark left, `actions` slot right (theme toggle first, then logout). Transparent, no elevation. NOT an M3 `TopAppBar` — plain Row; migration to `Scaffold` later is trivial. Used on dashboard and onboarding. Never on the public family (login, legal, callback). |
@@ -279,10 +344,29 @@ Only components that exist in the current codebase or are required by the design
 | `BankTellerMark` | Primary brand mark | Canvas-rendered brass coin with engraved ledger-book glyph. Supports Compact (24dp), Standard (48dp), Hero (72dp), or custom Dp. |
 | `BankAvatar` | 2-letter initials in colored circle | Hash-picked background color, 64dp, `RoundedCornerShape(8dp)`. Colors derive from theme tokens. |
 | `BankLogo` | Async-loaded bank PNG via ktor+Skia | 64dp, falls back to `BankAvatar`. Cached in module-level `bankLogoCache`. |
+| `LedgerScrollbar` | Hairline overlay scrollbar for internal scrollables (wasm has no native scrollbar) | Trackless floating thumb, 4dp at rest / 6dp on hover-drag, `onSurfaceVariant` 30%/60% alpha, 36dp minimum thumb. See §6.1.4. |
 | `ConsentItem` | Bullet row: title + description | "-" bullet, `bodyMedium` title, `bodySmall` description. |
 | `EnvironmentOption` | Radio + label + description, full-row clickable | Entire `Row` is clickable, not just the radio. |
 | `TransferArrow` *(to create)* | SVG arrow for payment route | Brass stroke, thin, matches ledger aesthetic. Rotates 90° on mobile. |
 | `GuillochePattern` *(to create)* | SVG engraving pattern for ceremony screens | See §7. |
+
+### 6.2.1 Missing Data in Cards: Primary Figures vs. Secondary Metadata
+
+When data is absent from a card or list item, BankTeller distinguishes between secondary metadata and primary figures:
+
+1. **Secondary metadata — omit cleanly.** IBANs, sub-captions, and consent countdowns are omitted entirely when absent. Never render empty placeholders, "N/A", or blank frames for missing secondary attributes.
+
+2. **Primary ledger figures — em-dash placeholder.** The primary datum of a card (e.g. the account balance) is structural and must never be omitted: omission leaves a hollow void that reads as a rendering failure. When an institution reports no balance for an account, render an em-dash (`—`) in the balance position using the balance figures' exact typographic metrics (`titleMedium`, JetBrains Mono, trailing-aligned) in `onSurfaceVariant` — identical height and baseline alignment with figure-carrying cards, zero layout shift. Wrap the dash in a tooltip with plain explanatory copy ("This account did not report a balance."); never add permanent help icons, and never place prose in the numeric column.
+
+### 6.2.2 Degradation Signals in Account Cards
+
+When a bank connection experiences sync or consent issues, the account card communicates data freshness quietly and accessibly directly beneath the balance figure.
+
+1. **Balance figure color discipline**: primary balance amounts are never tinted with semantic colors (`danger` or `brass`). In financial UI, red figures universally denote negative balances (overdrafts) — a stored figure is a valid frozen record, not an error. Balance figures always render in the default text color (`onSurface`); missing balance figures render as the em-dash (`—`) in `onSurfaceVariant`.
+
+2. **Freshness sublabels**: when a balance cannot be verified as fresh, an explicit text sublabel renders right-aligned directly beneath the balance figure in `labelSmall` (standard font, not mono). Attention tier (`brass`): `stale` → "Stale balance", `rate_limited` → "Rate limited", never-synced with surviving balances → "Unconfirmed". Broken tier (`danger`): `error` → "Sync error", consent-dead/expired → "Sync paused" (accompanying the left column's "Consent ended" notice). Healthy accounts (`fresh`) and accounts reporting no balance data (em-dash) omit the sublabel entirely.
+
+The three-tier hierarchy: the hero indicator answers "can I trust the total?", the per-bank badges answer "which bank failed and why?", and the card sublabel answers "is THIS figure current?" — the sublabel is the text alternative that keeps every status readable without relying on color (WCAG 1.4.1).
 
 ### 6.3 Error Presentation
 

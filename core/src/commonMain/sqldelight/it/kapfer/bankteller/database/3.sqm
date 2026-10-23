@@ -1,0 +1,34 @@
+-- Idempotent where possible: CREATE TABLE IF NOT EXISTS makes re-running the
+-- table-creation part of this migration safe on databases where the tables
+-- already exist (same rationale as 2.sqm — DatabaseFactory.init() may re-run
+-- migrations on user_version = 0 databases with partially present schemas).
+-- SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS; this migration only
+-- runs when user_version < Schema.version, and the DatabaseFactory inference
+-- ladder only classifies a database as being at this version or later when
+-- the balances/sync_log tables are present (see DatabaseFactory.kt) — so the
+-- ALTERs never re-run on an already-migrated database.
+CREATE TABLE IF NOT EXISTS balances (
+    account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+    balance_amount TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    balance_type TEXT NOT NULL,
+    reference_date TEXT,
+    fetched_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+    sync_type TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    status TEXT NOT NULL,
+    -- Parsed Enable Banking error code (e.g. EXPIRED_SESSION) when the failure
+    -- carried one; NULL otherwise. Carried here from creation (no ALTER needed):
+    -- this migration is unshipped, so no database has sync_log without the column.
+    error_code TEXT,
+    error_message TEXT
+);
+
+ALTER TABLE eb_sessions ADD COLUMN valid_until TEXT;
+ALTER TABLE eb_sessions ADD COLUMN logo TEXT;

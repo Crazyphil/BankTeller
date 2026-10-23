@@ -316,6 +316,18 @@ open class ApiClient {
                     } else null
                 }
                 val linkedBanks = parseLinkedBanks(body)
+                // One-shot wizard-initial-import signal (spec:
+                // wizard-initial-import): consumed by the first state read
+                // after the auth callback. Absent on servers predating the
+                // change → null → no import step.
+                val pendingInitialImport = extractJsonBool(body, "pending_initial_import") ?: false
+
+                // Registration environment re-export (spec: sandbox
+                // onboarding / design D16): "SANDBOX"/"PRODUCTION", or null
+                // when the lookup failed or a server predates the field.
+                // The SPA branches on this value for the BankSelection
+                // environment branch — it never guesses sandbox itself.
+                val environment = extractJsonStringOrNull(body, "environment")
 
                 return OnboardingState(
                     requiresRelogin = requiresRelogin,
@@ -332,6 +344,8 @@ open class ApiClient {
                     onboardingStage = onboardingStage,
                     stageBank = stageBank,
                     linkedBanks = linkedBanks,
+                    pendingInitialImport = pendingInitialImport,
+                    environment = environment,
                 )
             }
             return null
@@ -349,7 +363,7 @@ open class ApiClient {
                 return AspspsResult.Ok(aspsps)
             }
             val errorMsg = extractJsonString(body, "error").ifEmpty { "Server returned ${response.status.value}" }
-            return AspspsResult.Error(errorMsg)
+            return AspspsResult.Error(errorMsg, statusCode = response.status.value)
         } catch (e: Exception) {
             return AspspsResult.Error("Network error: ${e.message ?: "Unknown error"}")
         }
@@ -441,6 +455,170 @@ open class ApiClient {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * GET /api/accounts — the dashboard payload (spec: account-overview):
+     * banks with their accounts, last-known balances, per-bank sync state,
+     * consent expiry, and the global sync_in_progress flag.
+     *
+     * Returns null on non-200 / network error / unparseable body — the caller
+     * keeps the last-known data (stale-while-revalidate, design D6).
+     */
+    open suspend fun getAccounts(): AccountsData? {
+        return try {
+            val response = client.get("/api/accounts")
+            if (response.status.value == 200) {
+                parseAccountsData(response.bodyAsText())
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * POST /api/sync — manual balance refresh. Returns the trigger outcome
+     * (started/coalesced/cooldown), or null on request failure.
+     */
+    open suspend fun triggerSync(): SyncTriggerResult? {
+        return try {
+            val response = client.post("/api/sync")
+            if (response.status.value == 200) {
+                val body = response.bodyAsText()
+                val started = extractJsonBool(body, "started") ?: false
+                val coalesced = extractJsonBool(body, "coalesced") ?: false
+                val cooldownRemaining = extractJsonLong(body, "cooldown_remaining_seconds")
+                SyncTriggerResult(
+                    started = started,
+                    coalesced = coalesced,
+                    cooldownRemainingSeconds = cooldownRemaining,
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * POST /api/onboarding/import-balances — wizard initial import (spec:
+     * wizard-initial-import). Starts the engine-scoped run and returns
+     * immediately; completion is observed via [getAccounts]'s
+     * sync_in_progress flag. Returns the trigger outcome, or null on
+     * request failure.
+     */
+    open suspend fun importBalances(): SyncTriggerResult? {
+        return try {
+            val response = client.post("/api/onboarding/import-balances")
+            if (response.status.value == 200) {
+                val body = response.bodyAsText()
+                val started = extractJsonBool(body, "started") ?: false
+                val coalesced = extractJsonBool(body, "coalesced") ?: false
+                val cooldownRemaining = extractJsonLong(body, "cooldown_remaining_seconds")
+                SyncTriggerResult(
+                    started = started,
+                    coalesced = coalesced,
+                    cooldownRemainingSeconds = cooldownRemaining,
+                )
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Parses the /api/accounts payload. Hand-rolled JSON extraction like the
+     * rest of this client (no kotlinx-serialization on the SPA side).
+     *
+     * `internal` visibility so commonTest can exercise the consent-health
+     * parsing (task 8.9) directly.
+     */
+    internal fun parseAccountsData(json: String): AccountsData? {
+        val syncInProgress = extractJsonBool(json, "sync_in_progress") ?: false
+        val banksJson = extractJsonArray(json, "banks") ?: return null
+        val banks = mutableListOf<BankData>()
+        for (bankJson in banksJson) {
+            val accountsJson = extractJsonArray(bankJson, "accounts") ?: emptyList()
+            val accounts = mutableListOf<AccountData>()
+            for (accountJson in accountsJson) {
+                accounts.add(
+                    AccountData(
+                        id = extractJsonLong(accountJson, "id") ?: 0L,
+                        name = extractJsonString(accountJson, "name"),
+                        iban = extractJsonStringOrNull(accountJson, "iban"),
+                        currency = extractJsonString(accountJson, "currency"),
+                        balanceAmount = extractJsonStringOrNull(accountJson, "balance_amount"),
+                        balanceCurrency = extractJsonStringOrNull(accountJson, "balance_currency"),
+                        balanceType = extractJsonStringOrNull(accountJson, "balance_type"),
+                        referenceDate = extractJsonStringOrNull(accountJson, "reference_date"),
+                        fetchedAt = extractJsonLong(accountJson, "fetched_at"),
+                    ),
+                )
+            }
+            banks.add(
+                BankData(
+                    bankName = extractJsonString(bankJson, "bank_name"),
+                    bankCountry = extractJsonString(bankJson, "bank_country"),
+                    logo = extractJsonStringOrNull(bankJson, "logo"),
+                    validUntil = extractJsonStringOrNull(bankJson, "valid_until"),
+                    syncState = extractJsonString(bankJson, "sync_state"),
+                    lastSyncAt = extractJsonLong(bankJson, "last_sync_at"),
+                    lastSuccessAt = extractJsonLong(bankJson, "last_success_at"),
+                    accounts = accounts,
+                    consentBroken = extractJsonBool(bankJson, "consent_broken") ?: false,
+                    psuType = extractJsonStringOrNull(bankJson, "psu_type"),
+                ),
+            )
+        }
+        return AccountsData(banks = banks, syncInProgress = syncInProgress)
+    }
+
+    /**
+     * Extracts a top-level (or nested, first-occurrence) JSON array field as
+     * a list of raw object strings. Returns null when the field is absent or
+     * not an array.
+     */
+    private fun extractJsonArray(json: String, field: String): List<String>? {
+        val key = "\"$field\":"
+        val start = json.indexOf(key)
+        if (start < 0) return null
+        val remainder = json.substring(start + key.length).trimStart()
+        if (!remainder.startsWith("[")) return null
+
+        val result = mutableListOf<String>()
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        var objectStart = -1
+        for (i in remainder.indices) {
+            val c = remainder[i]
+            if (isEscaped) {
+                isEscaped = false
+                continue
+            }
+            when {
+                inString && c == '\\' -> isEscaped = true
+                inString && c == '"' -> inString = false
+                !inString && c == '"' -> inString = true
+                !inString && c == '{' -> {
+                    depth++
+                    if (depth == 1) objectStart = i
+                }
+                !inString && c == '}' -> {
+                    depth--
+                    if (depth == 0 && objectStart >= 0) {
+                        result.add(remainder.substring(objectStart, i + 1))
+                        objectStart = -1
+                    }
+                }
+            }
+        }
+        return result
     }
 
     /**
@@ -589,7 +767,13 @@ open class ApiClient {
         return result
     }
 
-    private fun parseAspspObject(json: String): Aspssp? {
+    /**
+     * Parses a single /api/aspsps bank entry.
+     *
+     * `internal` visibility so commonTest can exercise the sandbox-credentials
+     * parsing (task 8.5) directly.
+     */
+    internal fun parseAspspObject(json: String): Aspssp? {
         val name = extractJsonString(json, "name")
         val country = extractJsonString(json, "country")
         if (name.isEmpty() || country.isEmpty()) return null
@@ -599,7 +783,28 @@ open class ApiClient {
         val maxValidity = extractJsonLong(json, "maximum_consent_validity")
         val status = extractJsonStringOrNull(json, "status")
         val statusByPsuType = extractJsonStringMapOrNull(json, "status_by_psu_type")
-        return Aspssp(name, country, bic, logo, psuTypes, maxValidity, status, statusByPsuType)
+        // Connected flag (spec: add-account-overview — bank list): true when the
+        // bank holds an eb_sessions row. Absent on servers predating the change →
+        // false (the SPA never guesses a bank is connected).
+        val connected = extractJsonBool(json, "connected") ?: false
+        val sandbox = extractJsonObject(json, "sandbox")?.let { sandboxJson ->
+            val usersJson = extractJsonArray(sandboxJson, "users") ?: emptyList()
+            val users = usersJson.mapNotNull { userJson ->
+                val username = extractJsonString(userJson, "username")
+                val password = extractJsonString(userJson, "password")
+                // Some sandbox banks (e.g. SE Sparbanken) issue a username only —
+                // the bank's login asks for nothing else. Keep users with at
+                // least one non-empty field; skip only fully-blank entries.
+                if (username.isEmpty() && password.isEmpty()) return@mapNotNull null
+                SandboxUser(
+                    username = username,
+                    password = password,
+                    otp = extractJsonStringOrNull(userJson, "otp"),
+                )
+            }
+            SandboxCredentials(users = users)
+        }
+        return Aspssp(name, country, bic, logo, psuTypes, maxValidity, status, statusByPsuType, sandbox, connected)
     }
 
     private fun extractJsonStringMapOrNull(json: String, field: String): Map<String, String>? {
@@ -771,6 +976,14 @@ data class OnboardingState(
     val stageBank: SelectedBank? = null,
     /** Deduplicated `{aspsp_name, aspsp_country}` pairs derived from the whitelist; empty when unknown. */
     val linkedBanks: List<LinkedBank> = emptyList(),
+    /** One-shot wizard-initial-import signal (consumed by this very read). */
+    val pendingInitialImport: Boolean = false,
+    /**
+     * Registration environment re-export (spec: sandbox onboarding / design
+     * D16): `"SANDBOX"`/`"PRODUCTION"`, or null when the server could not
+     * resolve it (lookup failure — the SPA never guesses sandbox).
+     */
+    val environment: String? = null,
 )
 
 /**
@@ -806,12 +1019,40 @@ data class Aspssp(
     val maximumConsentValidity: Long?,
     val status: String? = null,
     val statusByPsuType: Map<String, String>? = null,
+    /** Sandbox test credentials (spec: onboarding — sandbox credentials panel); null when the entry carries no `sandbox` field. */
+    val sandbox: SandboxCredentials? = null,
+    /**
+     * Connected flag (spec: add-account-overview — bank list): true when the
+     * bank holds an eb_sessions row (a live authorization). Absent on servers
+     * predating the change → false.
+     */
+    val connected: Boolean = false,
+)
+
+/** A single sandbox test-user entry from the bank list's `sandbox.users` array (otp omitted server-side when absent). */
+data class SandboxUser(
+    val username: String,
+    val password: String,
+    val otp: String? = null,
+)
+
+/** The bank list's `sandbox` field. An EMPTY [users] list is a credential-less bank (explicit empty array). */
+data class SandboxCredentials(
+    val users: List<SandboxUser>,
 )
 
 /** Result of fetching the ASPSPs list. */
 sealed class AspspsResult {
     data class Ok(val aspsps: List<Aspssp>) : AspspsResult()
-    data class Error(val message: String) : AspspsResult()
+
+    /**
+     * @param statusCode HTTP status of the failed response, or null when the
+     *   request never completed (network error). Callers classify
+     *   authorization failures (401) on the status — the message alone is
+     *   unreliable (the auth plugin responds `{"error": "Not authenticated"}`,
+     *   which never mentions the code).
+     */
+    data class Error(val message: String, val statusCode: Int? = null) : AspspsResult()
 }
 
 /** Result of the account linking request. */
@@ -856,3 +1097,70 @@ enum class LinkingSessionPollState(val value: String) {
     /** Terminal — no stored sessionid/base URL or an EB error; silent manual fallback. */
     Unavailable("unavailable"),
 }
+
+/**
+ * GET /api/accounts payload (spec: account-overview). One [BankData] per
+ * connected bank (eb_sessions row), each carrying its accounts with the
+ * last-known balances plus per-bank sync state and consent expiry.
+ */
+data class AccountsData(
+    val banks: List<BankData>,
+    /** Global in-flight flag — true while a sync run is executing. */
+    val syncInProgress: Boolean,
+)
+
+/** A connected bank with its accounts and per-bank sync metadata. */
+data class BankData(
+    val bankName: String,
+    val bankCountry: String,
+    /** ASPSP logo URL (rendered via the /api/logo proxy); null when unknown. */
+    val logo: String?,
+    /** Consent expiry (RFC3339, authoritative EB timestamp); null when unknown. */
+    val validUntil: String?,
+    /** fresh | stale | error | rate_limited | never_synced (spec: account-overview). */
+    val syncState: String,
+    /** Completed-at of the latest sync_log row; null when no run completed. */
+    val lastSyncAt: Long?,
+    /** Completed-at of the latest successful run; null when none succeeded. */
+    val lastSuccessAt: Long?,
+    val accounts: List<AccountData>,
+    /**
+     * True when the session's most recent erroring run recorded a
+     * consent-dead EB error code (spec: account-overview — bank-scoped
+     * consent health). Overrides the valid_until countdown everywhere.
+     */
+    val consentBroken: Boolean = false,
+    /**
+     * The authorization's PSU type ("personal"/"business") from the session
+     * data (spec: add-account-overview — re-authorization derives the bank
+     * identity and psu_type from /api/accounts); null when the server does
+     * not report one.
+     */
+    val psuType: String? = null,
+)
+
+/** A single account with its last-known balance snapshot. */
+data class AccountData(
+    val id: Long,
+    val name: String,
+    /** Raw IBAN; null when the bank did not report one. */
+    val iban: String?,
+    val currency: String,
+    /** Balance amount as a plain string (server passes EB's string through); null when never synced. */
+    val balanceAmount: String?,
+    val balanceCurrency: String?,
+    val balanceType: String?,
+    val referenceDate: String?,
+    /** Epoch millis of the balance upsert. */
+    val fetchedAt: Long?,
+)
+
+/** POST /api/sync + /api/onboarding/import-balances trigger outcome. */
+data class SyncTriggerResult(
+    /** True when a run was started (or an in-flight run was coalesced onto). */
+    val started: Boolean,
+    /** True when an in-flight run absorbed this trigger (no new run started). */
+    val coalesced: Boolean,
+    /** Seconds remaining in the manual cooldown; non-null only when started=false. */
+    val cooldownRemainingSeconds: Long?,
+)

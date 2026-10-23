@@ -8,6 +8,7 @@ import io.ktor.server.routing.*
 import io.ktor.server.sessions.*
 import it.kapfer.bankteller.database.BankTellerDatabase
 import it.kapfer.bankteller.enablebanking.AisSessionStatusResult
+import it.kapfer.bankteller.enablebanking.Aspssp
 import it.kapfer.bankteller.enablebanking.AspsspListResult
 import it.kapfer.bankteller.enablebanking.AspspStatusResult
 import it.kapfer.bankteller.enablebanking.Access
@@ -24,7 +25,9 @@ import it.kapfer.bankteller.server.UserSession
 import it.kapfer.bankteller.util.TtlCache
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.slf4j.LoggerFactory
@@ -313,69 +316,72 @@ fun Route.accountLinkingRoutes(
 ) {
     val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
-    // 3.3 — Bank listing (control-plane GET /api/aspsps proxy, unfiltered)
+    // 3.3 — Bank listing (data-plane when active, control-plane fallback for
+    // the inactive-production outlier)
     //
-    // Uses the control-plane endpoint (Firebase idToken auth) rather than the
-    // data-plane GET /aspsps (application RS256 JWT), because the data-plane
-    // endpoint returns 403 "Application is not active" for an inactive production
-    // app — i.e. before the first account link. The control-plane endpoint works
-    // for inactive apps (same auth as /api/applications and /api/link_accounts).
+    // Source selection (spec: onboarding — bank listing endpoint; design D17):
+    //  - application ACTIVE → data-plane `GET /aspsps` (application RS256 JWT,
+    //    no refreshToken needed) — the same list `POST /api/auth` validates
+    //    the chosen bank against, so a shown bank always exists at auth
+    //    initiation;
+    //  - definitively inactive (inactiveNeverLinked / inactiveButLinked /
+    //    deleted — the data-plane endpoint returns 403 "Application is not
+    //    active" there) → the control-plane source (Firebase idToken auth,
+    //    same as /api/applications and /api/link_accounts), which works for
+    //    inactive apps;
+    //  - status lookup failed / state unknown → data-plane FIRST, falling back
+    //    to the control-plane source on a data-plane 403. A 403 is a direct,
+    //    authoritative active/inactive answer, so source selection
+    //    self-heals: a stale ACTIVE status-cache entry after an app deletion
+    //    at EB degrades to 403 → control-plane fallback (not an error), while
+    //    a working data-plane path is never routed through a possibly-broken
+    //    control plane.
+    //
+    // The control-plane refreshToken-missing failure (500) applies only when
+    // the control-plane source is actually used.
+    //
+    // Sandbox: the list is filtered server-side (data-plane source only) to
+    // connectable banks — entries carrying parsed `sandbox` data OR matching
+    // the credential-less whitelist — and availability status fields are
+    // suppressed (production incident data is meaningless for sandbox
+    // testing). Sandbox test credentials pass through on the data-plane path.
     // -----------------------------------------------------------------------
     get("/api/aspsps") {
         val session = call.sessions.get<UserSession>()
             ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
 
-        val refreshToken = database.systemConfigQueries
-            .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
-            ?: return@get call.respond(
-                HttpStatusCode.InternalServerError,
-                mapOf("error" to "Enable Banking is not configured (missing refresh token)"),
-            )
+        val status = onboardingService.getStatus()
+        val sandboxEnvironment = status.environment == Environment.SANDBOX.name
+        val definitivelyInactive = status.appState == EbApplicationState.INACTIVE_NEVER_LINKED ||
+            status.appState == EbApplicationState.INACTIVE_BUT_LINKED ||
+            status.appState == EbApplicationState.DELETED
 
-        // Fresh idToken (same pattern as link-accounts / auth / link-status routes).
-        val idToken = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
-            is IdTokenRefreshResult.Ok -> refresh.idToken
-            is IdTokenRefreshResult.Error -> return@get call.respond(
-                HttpStatusCode.BadGateway,
-                mapOf("error" to "Failed to refresh Enable Banking session: ${refresh.message}"),
-            )
+        if (definitivelyInactive) {
+            respondBankListFromControlPlane(call, database, controlPlaneClient, sandboxEnvironment)
+            return@get
         }
 
-        when (val result = controlPlaneClient.getAspsps(idToken)) {
-            is AspsspListResult.Ok -> {
-                // Enrich each bank with advisory availability status from the
-                // cached control-plane get_today_stats. A status-fetch failure
-                // NEVER fails the bank list — the fields are simply omitted.
-                val statusByBank = when (val status = controlPlaneClient.getAspspStatus()) {
-                    is AspspStatusResult.Ok -> status.statuses
-                        .entries
-                        .groupBy({ it.key.brand to it.key.country }, { it.key.psuType to it.value })
-                        .mapValues { (_, pairs) -> pairs.toMap() }
-                    is AspspStatusResult.Error -> emptyMap()
-                }
-                val banks = result.aspsps.map { aspsp ->
-                    val perType = statusByBank[aspsp.name to aspsp.country]
-                    buildJsonObject {
-                        put("name", aspsp.name)
-                        put("country", aspsp.country)
-                        put("bic", aspsp.bic)
-                        put("logo", aspsp.logo)
-                        put("psu_types", JsonArray(aspsp.psuTypes.map { JsonPrimitive(it) }))
-                        put("maximum_consent_validity", aspsp.maximumConsentValidity)
-                        if (perType != null && perType.isNotEmpty()) {
-                            put("status", worstStatus(perType.values))
-                            put("status_by_psu_type", buildJsonObject {
-                                perType.forEach { (k, v) -> put(k, v) }
-                            })
-                        }
+        // ACTIVE or status unknown → data-plane first.
+        val client = enableBankingClientFactory()
+        try {
+            when (val result = client.getAspsps()) {
+                is AspsspListResult.Ok -> call.respond(
+                    buildBankListPayload(result.aspsps, database, dataPlane = true, sandboxEnvironment, controlPlaneClient),
+                )
+                is AspsspListResult.Error ->
+                    if (result.statusCode == 403) {
+                        // Authoritative inactive answer — even with a stale
+                        // "ACTIVE" status-cache entry, the app is inactive at EB.
+                        respondBankListFromControlPlane(call, database, controlPlaneClient, sandboxEnvironment)
+                    } else {
+                        call.respond(
+                            HttpStatusCode.BadGateway,
+                            mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
+                        )
                     }
-                }
-                call.respond(banks)
             }
-            is AspsspListResult.Error -> call.respond(
-                HttpStatusCode.BadGateway,
-                mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
-            )
+        } finally {
+            client.close()
         }
     }
 
@@ -550,6 +556,7 @@ fun Route.accountLinkingRoutes(
                             stageAspspName = request.aspsp_name,
                             stageAspspCountry = request.aspsp_country,
                             stagePsuType = request.psu_type,
+                            stageAspspLogo = aspsp.logo,
                         ),
                     )
                     call.respond(buildJsonObject {
@@ -822,16 +829,23 @@ fun Route.accountLinkingRoutes(
 
         val authCompleted = ebSessionStore.hasAnySession()
         val authError = session.authError
-        // auth_failed: an auth error is only meaningful once linking completed
-        // and auth has NOT yet completed (design D3). Before linking, or after
-        // a successful auth, the error is stale/irrelevant.
-        val authFailed = authError != null && linkingCompleted && !authCompleted
 
         // Cached control-plane application-state derivation (30 s TTL) — the
         // same source the resolver consumes. enableBankingConfigured=false or a
         // failed lookup yield appState=null: unknown, NEVER deleted (a failed
         // lookup must not masquerade as a deletion).
         val status = onboardingService.getStatus()
+        // Sandbox input (design D9): resolved from the cached status
+        // derivation; a missing, blank, or unrecognized environment is never
+        // guessed as sandbox.
+        val sandboxEnvironment = status.environment == Environment.SANDBOX.name
+
+        // auth_failed: an auth error is only meaningful once linking completed
+        // (or the application is sandbox, which skips linking) and auth has NOT
+        // yet completed (design D3). Before linking, or after a successful
+        // auth, the error is stale/irrelevant.
+        val authFailed = authError != null && !authCompleted && (linkingCompleted || sandboxEnvironment)
+
         val appState = when (status.appState) {
             EbApplicationState.DELETED -> "deleted"
             EbApplicationState.INACTIVE_NEVER_LINKED -> "inactiveNeverLinked"
@@ -878,9 +892,20 @@ fun Route.accountLinkingRoutes(
                 // auth step (server state outranks the fine-grained stage).
                 // Conservative false when the whitelist lookup failed.
                 stageBankLinked = whitelist.linkedForStage(session),
-                sandboxEnvironment = status.environment == Environment.SANDBOX.name,
+                sandboxEnvironment = sandboxEnvironment,
             ),
         )
+
+        // One-shot pending_initial_import signal (spec: wizard-initial-import):
+        // reported and cleared in the same read. The signal is set in the
+        // auth-callback success path; the FIRST state read after the callback
+        // consumes it (the SPA then runs the wizard import step). A reload
+        // before the SPA consumed it re-reads it — but once consumed it never
+        // reappears (reload routes per the normal resolver).
+        val pendingInitialImport = session.pendingInitialImport == true
+        if (pendingInitialImport) {
+            call.sessions.set(session.copy(pendingInitialImport = null))
+        }
 
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
@@ -894,9 +919,11 @@ fun Route.accountLinkingRoutes(
             put("route", route)
             put("app_state", appState)
             put("pending_action", status.pendingAction)
+            put("environment", status.environment)
             put("onboarding_stage", session.onboardingStage)
             put("stage_bank", stageBank)
             put("linked_banks", linkedBanks)
+            put("pending_initial_import", pendingInitialImport)
         })
     }
 
@@ -928,6 +955,163 @@ fun Route.accountLinkingRoutes(
             ),
         )
         call.respond(mapOf("success" to true))
+    }
+}
+
+/**
+ * Credential-less sandbox banks — documented by Enable Banking to authenticate
+ * into the sandbox WITHOUT providing test credentials, and therefore present in
+ * the data-plane bank list without a `sandbox` field. A missing `sandbox` field
+ * is otherwise ambiguous (cannot distinguish "no credentials needed" from
+ * "not configured for sandbox"), so this whitelist is the explicit, verifiable
+ * exception list (spec: onboarding — bank listing endpoint; design D17).
+ * Re-verify against the EB sandbox's credential-less banks when editing.
+ */
+private val CREDENTIAL_LESS_SANDBOX_BANKS = listOf("Nordea", "Mock ASPSP")
+
+/**
+ * Serves the bank list from the control-plane source (Firebase idToken auth —
+ * the source for definitively-inactive production apps and the 403 fallback,
+ * see the route's kdoc). The refreshToken-missing 500 applies ONLY here — when
+ * the control-plane source is actually used.
+ */
+private suspend fun respondBankListFromControlPlane(
+    call: ApplicationCall,
+    database: BankTellerDatabase,
+    controlPlaneClient: EnableBankingControlPlaneClient,
+    sandboxEnvironment: Boolean,
+) {
+    val refreshToken = database.systemConfigQueries
+        .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        ?: return call.respond(
+            HttpStatusCode.InternalServerError,
+            mapOf("error" to "Enable Banking is not configured (missing refresh token)"),
+        )
+    val idToken = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
+        is IdTokenRefreshResult.Ok -> refresh.idToken
+        is IdTokenRefreshResult.Error -> return call.respond(
+            HttpStatusCode.BadGateway,
+            mapOf("error" to "Failed to refresh Enable Banking session: ${refresh.message}"),
+        )
+    }
+    when (val result = controlPlaneClient.getAspsps(idToken)) {
+        is AspsspListResult.Ok -> call.respond(
+            buildBankListPayload(result.aspsps, database, dataPlane = false, sandboxEnvironment, controlPlaneClient),
+        )
+        is AspsspListResult.Error -> call.respond(
+            HttpStatusCode.BadGateway,
+            mapOf("error" to result.message, "status" to (result.statusCode?.toString() ?: "network")),
+        )
+    }
+}
+
+/**
+ * Builds the JSON bank-list payload for GET /api/aspsps (both sources).
+ *
+ *  - SANDBOX environment, data-plane source: entries are filtered to
+ *    connectable banks — those carrying parsed `sandbox` data OR matching the
+ *    credential-less [CREDENTIAL_LESS_SANDBOX_BANKS] whitelist. Production
+ *    lists stay unfiltered.
+ *  - Sandbox credentials pass through as `"sandbox": {"users":
+ *    [{"username", "password", "otp"?}]}` whenever the parsed entry carries
+ *    them (otp omitted when absent). Control-plane entries never do — its
+ *    decoder tolerantly ignores unknown fields, by design.
+ *  - Availability `status`/`status_by_psu_type` fields are attached ONLY
+ *    outside the SANDBOX environment (production incident data is misleading
+ *    for sandbox testing). A status-fetch failure never fails the bank list —
+ *    the fields are simply omitted.
+ */
+private suspend fun buildBankListPayload(
+    aspsps: List<Aspssp>,
+    database: BankTellerDatabase,
+    dataPlane: Boolean,
+    sandboxEnvironment: Boolean,
+    controlPlaneClient: EnableBankingControlPlaneClient,
+): JsonElement {
+    val statusByBank = if (sandboxEnvironment) {
+        // Suppressed in the sandbox — do not even fetch the control-plane status.
+        emptyMap<Pair<String, String>, Map<String, String>>()
+    } else when (val status = controlPlaneClient.getAspspStatus()) {
+        is AspspStatusResult.Ok -> status.statuses
+            .entries
+            .groupBy({ it.key.brand to it.key.country }, { it.key.psuType to it.value })
+            .mapValues { (_, pairs) -> pairs.toMap() }
+        is AspspStatusResult.Error -> emptyMap()
+    }
+
+    val filtered = if (sandboxEnvironment && dataPlane) {
+        aspsps.filter { it.sandbox != null || it.name in CREDENTIAL_LESS_SANDBOX_BANKS }
+    } else {
+        aspsps
+    }
+
+    // Deterministic ordering (spec: onboarding "Deterministic ordering"):
+    // the response is sorted by bank name, then country — regardless of the
+    // source's native order (the control plane happens to arrive sorted, the
+    // data plane arrives in arbitrary order). Case-insensitive comparison so
+    // both sources present identically and the SPA needs no client-side
+    // sorting. Kotlin's sortedWith is stable, preserving the source order
+    // for full ties.
+    val ordered = filtered.sortedWith(
+        compareBy({ it.name.lowercase() }, { it.country.lowercase() }),
+    )
+
+    // Connected flag (spec: account-overview onboarding): a bank entry is
+    // "connected" when a local eb_sessions row exists for its {name, country}
+    // — computed from the LOCAL database, never from Enable Banking, in both
+    // environments and from both sources, so the SPA can block
+    // already-authorized banks without a second fetch.
+    val connectedBankKeys = database.ebSessionsQueries
+        .selectAllSessions()
+        .executeAsList()
+        .mapNotNull { row ->
+            row.aspsp_name?.let { name -> row.aspsp_country?.let { country -> name to country } }
+        }
+        .toSet()
+
+    return buildJsonArray {
+        for (aspsp in ordered) {
+            val perType = statusByBank[aspsp.name to aspsp.country]
+            add(
+                buildJsonObject {
+                    put("name", aspsp.name)
+                    put("country", aspsp.country)
+                    put("connected", aspsp.name to aspsp.country in connectedBankKeys)
+                    put("bic", aspsp.bic)
+                    put("logo", aspsp.logo)
+                    put("psu_types", JsonArray(aspsp.psuTypes.map { JsonPrimitive(it) }))
+                    put("maximum_consent_validity", aspsp.maximumConsentValidity)
+                    aspsp.sandbox?.let { sandbox ->
+                        put("sandbox", buildJsonObject {
+                            put("users", buildJsonArray {
+                                // EB repeats sandbox users per PSU type (e.g.
+                                // personal + business) with no distinguishing
+                                // data — dedupe by (username, password, otp),
+                                // preserving first-seen order.
+                                val seen = mutableSetOf<Triple<String, String, String?>>()
+                                for (user in sandbox.users) {
+                                    if (seen.add(Triple(user.username, user.password, user.otp))) {
+                                        add(
+                                            buildJsonObject {
+                                                put("username", user.username)
+                                                put("password", user.password)
+                                                if (user.otp != null) put("otp", user.otp)
+                                            }
+                                        )
+                                    }
+                                }
+                            })
+                        })
+                    }
+                    if (!sandboxEnvironment && perType != null && perType.isNotEmpty()) {
+                        put("status", worstStatus(perType.values))
+                        put("status_by_psu_type", buildJsonObject {
+                            perType.forEach { (k, v) -> put(k, v) }
+                        })
+                    }
+                }
+            )
+        }
     }
 }
 
