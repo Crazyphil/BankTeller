@@ -139,23 +139,20 @@ The system SHALL bundle Fraunces Variable and Inter Variable as WOFF2 files in `
 - **THEN** `<link rel="preload">` tags reference the Fraunces, Inter, and JetBrains Mono WOFF2 files
 
 ### Requirement: ScreenShell layout component
-The system SHALL provide a `ScreenShell` composable in `ui/components/ScreenShell.kt` that wraps screen content. It SHALL apply `fillMaxSize()`, `safeContentPadding()`, horizontal centering, and `widthIn(max = maxWidth)` where `maxWidth` defaults to `Dimens.contentMaxWidth` (720dp). It SHALL accept an optional `maxWidth` parameter so forms can use `Dimens.formMaxWidth` (400dp). It SHALL accept an optional `topBar: @Composable () -> Unit` parameter (default empty) — when provided, the top bar is rendered at the top of the Column above the content. It SHALL accept `verticalArrangement: Arrangement.Vertical` (default `Top`) and `scrollable: Boolean` (default `false`). It SHALL replace the duplicated `Column(fillMaxSize().safeContentPadding().padding(16.dp))` boilerplate across all screens.
 
-#### Scenario: ScreenShell centers content within reading width
-- **WHEN** a screen is wrapped in `ScreenShell`
-- **THEN** the content is centered horizontally and constrained to at most 720dp width
+The existing requirement is modified: the `ScreenShell` composable SHALL structure the screen into three vertical zones — a fixed `topBar` zone rendered outside the scrollable container (the top bar never scrolls with content; solid `background` color), a content zone occupying the remaining vertical space (`weight(1f)`) that scrolls when `scrollable` is true (the parameter's default flips from `false` to `true` — bespoke centered screens — the cold-start splash, login, callback, and sandbox-credentials screens — pass `false` explicitly; wizard screens also pass `false` (the `WizardScaffold` manages its own three-zone scroll per the WizardScaffold three-zone layout requirement). Screens that pass `scrollable = false` never render the shell divider — their dividers are their own), and an optional fixed `bottomBar: (@Composable () -> Unit)? = null` slot at the bottom outside the scrollable container, reserved for future navigation bars. When the content is scrolled past offset 0, the shell SHALL render a 1dp hairline divider (`outline` at 8% opacity) beneath the top bar; at offset 0 no divider renders (no elevation shadows). The divider keys on the content zone's scroll offset; internal scrollables embedded in the content (e.g. a screen's own list) do not affect it. Screens whose only overflow is an internal virtualized list MAY pass `scrollable = false` and manage their own scroll and scrollbar. All other behavior (fillMaxSize, safeContentPadding, horizontal centering, `widthIn(max = maxWidth)`, `verticalArrangement`) is unchanged.
 
-#### Scenario: ScreenShell with form max width
-- **WHEN** `ScreenShell(maxWidth = Dimens.formMaxWidth)` is used
-- **THEN** the content is constrained to at most 400dp width
+#### Scenario: Fixed top bar during content scroll
+- **WHEN** the dashboard's account cards exceed the viewport height and the user scrolls
+- **THEN** the BrandedTopBar stays anchored at the top while the content scrolls beneath it, and the 1dp hairline divider appears at the top bar's bottom edge
 
-#### Scenario: ScreenShell with top bar
-- **WHEN** `ScreenShell(topBar = { BrandedTopBar(...) })` is used
-- **THEN** the top bar is rendered at the top of the Column, above the content
+#### Scenario: Seamless boundary at rest
+- **WHEN** the content is at scroll offset 0
+- **THEN** no divider renders beneath the top bar — the boundary is seamless
 
-#### Scenario: ScreenShell without top bar
-- **WHEN** `ScreenShell` is used without a `topBar` parameter
-- **THEN** no top bar is rendered and the content occupies the full height
+#### Scenario: Bottom bar slot renders outside the scroll
+- **WHEN** a caller provides a `bottomBar` composable
+- **THEN** it renders fixed at the bottom of the shell, never scrolled by the content zone
 
 ### Requirement: BrandedTopBar component
 The system SHALL provide a `BrandedTopBar` composable in `ui/components/BrandedTopBar.kt` that renders a lightweight app chrome bar: logo icon (24dp, theme-aware variant via `painterResource`) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and an optional `actions: @Composable RowScope.() -> Unit` slot on the right. The bar SHALL have a transparent background, no elevation, and no shadow. It SHALL NOT use M3 `TopAppBar` or `Scaffold` — it is a simple `Row` with `SpaceBetween` arrangement. It SHALL be rendered via `ScreenShell`'s `topBar` parameter.
@@ -198,15 +195,16 @@ The system SHALL provide a `WizardScaffold` composable in `ui/components/WizardS
 - **THEN** the forward action is right-aligned in the footer and visually prominent
 
 ### Requirement: WizardProgressIndicator component
-The system SHALL provide a `WizardProgressIndicator` composable in `ui/components/WizardProgressIndicator.kt` that renders a step progress indicator as a `Canvas`-drawn composable. It SHALL show numbered step circles connected by a line. Completed steps SHALL have a filled circle with checkmark in `brass`. The current step SHALL have an outlined circle with number in `brass` stroke (2.5dp) and `brass` text. Future steps SHALL have an outlined circle with number in `outline` stroke (1.5dp) and `onSurface` 50% opacity text. The connecting line SHALL be `brass` for completed segments and `outline` for future segments. A label "Step N of M" SHALL appear beside the indicator in mono, `brass`.
 
-#### Scenario: Progress indicator shows completed, current, and future steps
-- **WHEN** `WizardProgressIndicator` is composed with `currentStep = 2`, `totalSteps = 5`
-- **THEN** step 1 has a brass filled circle with checkmark, step 2 has a brass outlined circle with number, steps 3-5 have outline circles with numbers, the line between steps 1-2 is brass, and lines between steps 2-5 are outline
+The existing requirement is modified: the mono "Step N of M" label beside the indicator SHALL be optional — callers whose chrome already carries the step count (the wizard scaffold's compound eyebrow, per the `onboarding` capability's wizard flow context requirement) SHALL omit the label so the count is never rendered twice within the same header block. The indicator's node rendering (completed/current/future circles, connecting line, colors) is unchanged.
 
-#### Scenario: Step label shows current position
-- **WHEN** `WizardProgressIndicator` is composed with `currentStep = 3`, `totalSteps = 5`
-- **THEN** the label "Step 3 of 5" is displayed in mono, brass
+#### Scenario: Label omitted when the eyebrow carries the count
+- **WHEN** the wizard chrome renders the compound eyebrow "ADD A BANK · STEP 1 OF 3" above the progress indicator
+- **THEN** the indicator renders without its mono step label — the eyebrow is the single source of the step count
+
+#### Scenario: Label renders for callers without an eyebrow count
+- **WHEN** the indicator is used outside the wizard scaffold's compound-eyebrow chrome
+- **THEN** the mono "Step N of M" label renders beside the indicator as before
 
 ### Requirement: DecisionBox component
 The system SHALL provide a `DecisionBox` composable in `ui/components/DecisionBox.kt` that implements the Tier 3 form grammar from `DESIGN-LANGUAGE.md` §4. It SHALL render a tinted surface with a 3dp left border in the specified semantic color and a 12% alpha wash of that color as background. It SHALL accept a `color: Color` parameter (brass for attention, emerald for guarantees, danger for warnings) and a `content: @Composable () -> Unit` slot for the decision text.
@@ -269,3 +267,51 @@ The system SHALL bundle the "Sovereign Ledger" logo as SVG drawable resources: `
 - **THEN** `logo_light.svg` is displayed
 - **WHEN** the app is in dark mode
 - **THEN** `logo_dark.svg` is displayed
+
+### Requirement: WizardScaffold three-zone layout
+
+The `WizardScaffold` composable SHALL structure guided multi-step flows as a full-viewport-height three-zone layout, running inside a non-scrolling `ScreenShell` (wizard screens pass `scrollable = false`; the scaffold fills the shell's content zone with `fillMaxSize()` and manages its own scroll):
+
+1. **Fixed header zone**: the compound eyebrow stamp, the flow progress indicator, the title, and the optional one-liner — fixed at the top, never scrolling with step content.
+2. **Flexible content zone** (`weight(1f)`): the step's content — always the primary scrolling container, with the `LedgerScrollbar` overlay when it overflows. Content sits at the top of the zone; on steps whose content is shorter than the zone, the remaining whitespace is intentional (the pinned footer defines the bottom edge — no stretching, no centering).
+3. **Fixed footer zone**: pinned to the bottom of the wizard container — quiet navigation and extra actions on the left, the primary forward action on the right. The footer's position SHALL be identical across all steps and flows (strict pinning, no hybrid hug-content mode: a footer that moves between steps breaks the spatial predictability of the primary advancement action).
+
+Symmetric hairline dividers (`outline` at 8% opacity): at rest (or when content fits) no dividers render. A 1dp divider SHALL render beneath the header only while the content zone is scrolled past offset 0, and above the footer only while content extends beyond the visible area (the container can scroll forward) — dissolving when the user reaches the end. The dividers key on the step's active scroll state — `LazyListState` for the bank-selection list, `ScrollState` for the other steps' scrollable columns. The layout is uniform at every height; below ~600dp the fixed chrome and footer leave a minimal but usable content area — the same scroll behavior applies.
+
+The bank-selection step's `LazyColumn` SHALL take the remaining content-zone height (`weight(1f)` within the step's non-scrolling column, below the pinned search input and orientation line — no height cap) as the step's single scrollable, and the `LedgerScrollbar` spans the full list height.
+
+#### Scenario: Footer position is identical across steps
+- **WHEN** the user advances from a short step (e.g. auth progress) to a tall step (e.g. bank selection)
+- **THEN** the footer renders at the same position at the bottom of the window — no layout jump between steps
+
+#### Scenario: Bank list fills the viewport
+- **WHEN** the bank-selection step renders in a tall window with a long bank list
+- **THEN** the list occupies the full content zone height down to the footer (no height crop) and scrolls internally with the LedgerScrollbar
+
+#### Scenario: Dividers key on scroll state
+- **WHEN** the step content is at rest and fits the zone
+- **THEN** no dividers render; when scrolled past the top, the header divider appears; while content extends below the fold, the footer divider appears and dissolves at the end of the content
+
+#### Scenario: Short steps leave intentional whitespace
+- **WHEN** a step's content is shorter than the content zone
+- **THEN** the content sits at the top of the zone and the space between it and the pinned footer stays empty — the footer does not hug the content
+
+### Requirement: LedgerScrollbar component
+
+The system SHALL provide a `LedgerScrollbar` overlay composable in `ui/components/` that renders a visible scrollbar affordance for internal scrollable containers (Compose for Web provides no native scrollbar). The thumb SHALL be a trackless floating overlay: 4dp wide at rest, expanding to 6dp on pointer hover or active drag; 2dp rounded caps; minimum thumb length 36dp; `onSurfaceVariant` at 30% alpha at rest and 60% alpha when hovered or dragged — never brass or semantic color (scrollbars are plumbing, not accents); inset 2dp from the trailing edge of the scrollable container. On pointer devices the thumb SHALL fade in during scrolling or cursor movement over the scrollable zone, fade out after 1.2s of inactivity, and be draggable (dragging updates the scroll state proportionally). On touch devices the thumb SHALL appear at 30% alpha only during momentum scrolling, fade out after 400ms, and be non-interactive. The scrollbar SHALL render only when the content overflows its container. It SHALL be applied to the dashboard's content zone, the wizard's content zone (the bank-selection `LazyColumn` and the other steps' scrollable content), and the legal screens' long text. The component SHALL support both `ScrollState`-driven and `LazyListState`-driven containers (the dashboard content zone and the wizard's `LazyColumn` imply different offset math; the API must not assume a single state type).
+
+#### Scenario: Scrollbar appears on overflow and fades when idle
+- **WHEN** scrollable content exceeds its container and the user scrolls
+- **THEN** the thumb fades in at the trailing edge and fades out after 1.2s of inactivity
+
+#### Scenario: Thumb expands on hover and is draggable
+- **WHEN** the pointer hovers over or drags the thumb
+- **THEN** it expands to 6dp at 60% alpha and stays visible for the duration of the interaction, with the drag updating the scroll position proportionally
+
+#### Scenario: No scrollbar when content fits
+- **WHEN** the content fits within its container
+- **THEN** no thumb renders
+
+#### Scenario: Touch shows the thumb only during momentum
+- **WHEN** a touch device scrolls the content
+- **THEN** the thumb appears at 30% alpha during the gesture and fades out 400ms after release; it is not interactive
