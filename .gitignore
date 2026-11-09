@@ -18,3 +18,7 @@ captures
 !*.xcworkspace/contents.xcworkspacedata
 **/xcshareddata/WorkspaceSettings.xcsettings
 node_modules/
+
+# Extracted epub knowledge bases (copyrighted books, not for commit)
+aux-docs/*
+!aux-docs/README.md
