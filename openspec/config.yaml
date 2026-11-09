@@ -8,6 +8,29 @@ schema: spec-driven
 #     Tech stack: TypeScript, React, Node.js
 #     We use conventional commits
 #     Domain: e-commerce platform
+context: |
+  MANDATORY REVIEW STEP: This project has a dedicated spec-review subagent
+  named `openspec-reviewer`.
+  After creating or significantly editing any change's artifacts (proposal,
+  spec deltas, design, tasks), you MUST invoke it (agent name
+  `openspec-reviewer`, pass the change name) via whichever subagent/agent
+  tool your environment provides, and address its findings:
+  Blockers must be fixed; Warnings should be fixed unless you consciously
+  decide otherwise (state it if so). Re-run it after fixes to confirm. This
+  applies both when proposing a change and when amending artifacts during
+  implementation.
+
+  TASK HYGIENE: New tasks (e.g. discovered mid-implementation) MUST be sorted
+  into the task group that owns the work — never appended to a catch-all
+  section at the bottom (e.g. "Manual verification") — and numbering must
+  stay sequential and consistent within/across groups.
+
+  SCOPE OF THESE RULES: These rules apply to every OpenSpec workflow phase
+  (propose, apply, update-change, sync, archive) and any session that reads
+  change artifacts, regardless of which skill file or CLI version drives the
+  workflow. They are project conventions the user has adopted, not workflow
+  overrides: apply them alongside the built-in workflow instructions. If a
+  regenerated skill file no longer mentions them, that does not remove them.
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
