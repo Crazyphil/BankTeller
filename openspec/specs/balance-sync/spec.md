@@ -42,7 +42,7 @@ PSU context extraction SHALL use the same proxy-aware IP resolution as the login
 
 #### Scenario: Concurrent triggers coalesce
 - **WHEN** a sync run is already in flight and a new trigger fires (login, manual, or background)
-- **THEN** no parallel run st
+- **THEN** no parallel run starts; the in-flight run serves the new trigger
 
 ### Requirement: PSU-header policy
 
@@ -92,7 +92,7 @@ Accounts with a NULL `uid` SHALL be skipped by the sync runner (no EB fetch is p
 
 #### Scenario: Local-copy accounts are skipped
 - **WHEN** a session has kept-as-local-copy accounts (`in_consent = 0`)
-- **THEN** the sync runner skips their fetches entirely (they are not fetchable, never re-fetched, and their `balances` rows are untouched); the run's status re
+- **THEN** the sync runner skips their fetches entirely (they are not fetchable, never re-fetched, and their `balances` rows are untouched); the run's status reflects only the fetchable accounts
 
 ### Requirement: Sync log
 

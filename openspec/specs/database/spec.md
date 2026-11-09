@@ -116,7 +116,7 @@ The schema extension is one amended migration (pre-release ruling: the change ha
 
 #### Scenario: Pre-migration-framework database migrates
 - **WHEN** the server starts against a `user_version = 0` database in a prior schema state
-- **THEN** the inference ladder resolves the correct prior version, the pending migrations ap
+- **THEN** the inference ladder resolves the correct prior version, the pending migrations apply, and the new columns exist afterwards
 
 
 ### Requirement: Ever-onboarded marker
@@ -137,7 +137,7 @@ The system SHALL persist an ever-onboarded marker (a `system_config` key, e.g. `
 
 #### Scenario: Pre-change users derive as onboarded
 - **WHEN** the marker key is absent but at least one `eb_sessions` row exists
-- **THEN** the marker read treats the user as onboarded — no
+- **THEN** the marker read treats the user as onboarded — no pre-change user regresses on upgrade
 
 
 ### Requirement: Remove-connection cleanup transaction
@@ -146,7 +146,7 @@ Removing a bank connection SHALL delete everything derived from that connection 
 
 #### Scenario: Remove deletes all derived rows atomically
 - **WHEN** a bank connection is removed
-- **THEN** the session row, its accounts (synced and local-copy), their balances, and the session's sync-log rows are all deleted in a single transacti
+- **THEN** the session row, its accounts (synced and local-copy), their balances, and the session's sync-log rows are all deleted in a single transaction — no partial state survives a failure mid-removal
 
 
 ### Requirement: Cross-session account matching by identification hash with IBAN fallback
@@ -167,7 +167,7 @@ The same-bank re-authorization merge SHALL match incoming accounts against the p
 
 #### Scenario: True IBAN change with stable hash
 - **WHEN** a bank-side identity change alters an account's IBAN but its `identification_hash` stays stable
-- **THEN** the hash match updates the row in place (including the new IBAN) — the accoun
+- **THEN** the hash match updates the row in place (including the new IBAN) — the account is recognized as the same real-world account, not duplicated and not reported missing
 
 
 ### Requirement: Local-copy deletion transaction

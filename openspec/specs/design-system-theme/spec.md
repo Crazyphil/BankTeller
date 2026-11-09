@@ -24,7 +24,7 @@ The system SHALL define all color tokens from `DESIGN-LANGUAGE.md` §2.1 as Kotl
 - **WHEN** the app is in light mode
 - **THEN** `LocalBankTellerColors.current.brass` is `#A67C2E` and `LocalBankTellerColors.current.emerald` is `#2E7D5B`
 - **WHEN** the app is in dark mode
-- **THEN** `LocalBankTellerColors.current.brass` is `#D4A94E` and `LocalBankTell
+- **THEN** `LocalBankTellerColors.current.brass` is `#D4A94E` and `LocalBankTellerColors.current.emerald` is `#4FAE87`
 
 ### Requirement: Typography definitions
 The system SHALL define an M3 `Typography` in `ui/theme/Type.kt` with `fontFamily` overrides mapping Fraunces Variable to `displayLarge`–`displaySmall` and `headlineLarge`–`headlineSmall`, and Inter Variable to `bodyLarge`–`bodySmall`, `labelLarge`–`labelSmall`, and `titleLarge`–`titleSmall`. JetBrains Mono SHALL be available as a `FontFamily` constant for use as an explicit `fontFamily` override at financial-figure call sites. All fonts SHALL be bundled as WOFF2 files in `composeResources/font/`.
@@ -157,7 +157,7 @@ The existing requirement is modified: the `ScreenShell` composable SHALL structu
 
 #### Scenario: Bottom bar slot renders outside the scroll
 - **WHEN** a caller provides a `bottomBar` composable
-- **THEN** it renders fixed at the bottom of th
+- **THEN** it renders fixed at the bottom of the shell, never scrolled by the content zone
 
 ### Requirement: BrandedTopBar component
 The system SHALL provide a `BrandedTopBar` composable in `ui/components/BrandedTopBar.kt` that renders a lightweight app chrome bar: logo icon (24dp, theme-aware variant via `painterResource`) + "BankTeller" wordmark (Inter `titleMedium`) on the left, and an optional `actions: @Composable RowScope.() -> Unit` slot on the right. The bar SHALL have a transparent background, no elevation, and no shadow. It SHALL NOT use M3 `TopAppBar` or `Scaffold` — it is a simple `Row` with `SpaceBetween` arrangement. It SHALL be rendered via `ScreenShell`'s `topBar` parameter.
@@ -343,7 +343,7 @@ The SPA SHALL provide a reusable scroll-container wrapper (`CropSignaledScroll`)
 
 #### Scenario: The detachment gap separates hairlines from cropped content
 - **WHEN** a card scrolls to the wrapper's crop edge
-- **THEN** the card's side borders terminate at the clip plane, 2dp short of the hairline — the 2dp empty band prevents the hairline from touching the card's outline, so it reads as chrome over pass
+- **THEN** the card's side borders terminate at the clip plane, 2dp short of the hairline — the 2dp empty band prevents the hairline from touching the card's outline, so it reads as chrome over passing content, never as the card's own border
 
 
 ### Requirement: Tab bar component
@@ -369,7 +369,7 @@ The SPA SHALL gain a hand-rolled top-level navigation bar rendered in `ScreenShe
 
 #### Scenario: Import step confines to the content zone, navigation stays live
 - **WHEN** the initial import runs (or fails, or the zero-account notice pends) while the user is on the dashboard
-- **THEN** the step renders inside the dashboard's content zone — beneath the dashboard greeting, which stays rendered (the zone remains the user's dashboard, not a blank overlay) — and the tab bar remains visible and functional: the user can switch to Settings, connect another bank, and return to the step still rendering in the zone (the zero-account notice still pending, never auto-continued). The in-flight wait uses the plain centered `WaitingIndicator.Zone` composition (no card/DecisionBox frame — framing an ambient wait as a semantic container is a tier-escalation error, §8.5); the failure state persists its retry/"Continue to dashboard" choice in the zone (a tab switch never auto-transitions it into the degraded presentation — the explicit diagnostic and the choice stay until the user acts); the failure's quiet action label reads "Continue to dashboard" (aligned with the zero-account notice footer, naming the destination now that
+- **THEN** the step renders inside the dashboard's content zone — beneath the dashboard greeting, which stays rendered (the zone remains the user's dashboard, not a blank overlay) — and the tab bar remains visible and functional: the user can switch to Settings, connect another bank, and return to the step still rendering in the zone (the zero-account notice still pending, never auto-continued). The in-flight wait uses the plain centered `WaitingIndicator.Zone` composition (no card/DecisionBox frame — framing an ambient wait as a semantic container is a tier-escalation error, §8.5); the failure state persists its retry/"Continue to dashboard" choice in the zone (a tab switch never auto-transitions it into the degraded presentation — the explicit diagnostic and the choice stay until the user acts); the failure's quiet action label reads "Continue to dashboard" (aligned with the zero-account notice footer, naming the destination now that the dashboard shell is present)
 
 
 ### Requirement: Settings master-detail layout

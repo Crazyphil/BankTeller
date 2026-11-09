@@ -22,7 +22,7 @@ The SPA SHALL replace the welcome dashboard with an account overview as the post
 
 #### Scenario: Long account lists scroll under the fixed header
 - **WHEN** connected accounts exceed the viewport height
-- **THEN** the content scrolls in the shell's content zone while the top bar stays anchored, and the ov
+- **THEN** the content scrolls in the shell's content zone while the top bar stays anchored, and the overlay scrollbar appears during scrolling
 
 ### Requirement: Total balance with multi-currency grouping
 
@@ -46,7 +46,7 @@ The SPA SHALL display a total balance in the hero position. When all accounts sh
 
 #### Scenario: Local copies are excluded from the total
 - **WHEN** a kept-as-local-copy account carries a stored (frozen) balance while live accounts carry current balances
-- **THEN** the hero total counts only the live accounts' figures — the greyed local-copy card signals its own exclusion (ta
+- **THEN** the hero total counts only the live accounts' figures — the greyed local-copy card signals its own exclusion (tag + dimmed treatment), and no partial-total note renders
 
 ### Requirement: Hero freshness indicator
 
@@ -78,7 +78,7 @@ The hero total SHALL carry a quiet freshness indicator when any contributing ban
 
 #### Scenario: Local copies never trigger the indicator
 - **WHEN** a bank's accounts are all kept-as-local-copy (greyed, excluded from the total) while other banks are fresh
-- **THEN** no indicator renders for the local-copy bank — its staleness is by design and carried by th
+- **THEN** no indicator renders for the local-copy bank — its staleness is by design and carried by the "Local copy" tag, not by a hero alarm
 
 ### Requirement: Amount formatting
 
@@ -196,7 +196,7 @@ The metadata strip carries no add-bank control — connecting a bank lives in th
 
 #### Scenario: Fixed footprint across states
 - **WHEN** the refresh control transitions between idle, syncing, cooldown, and rate-limited states
-- **THEN** its bounding box never changes — no text replaces the icon, and t
+- **THEN** its bounding box never changes — no text replaces the icon, and the strip never shifts horizontally
 
 ### Requirement: Stale-while-revalidate on login
 
@@ -238,7 +238,7 @@ Consent SHALL be considered broken (consent-dead) when the sync engine records a
 
 #### Scenario: Consent-dead re-authorization enters directly
 - **WHEN** the user activates the consent-dead notice's re-authorization action for a bank with stored accounts
-- **THEN** the wizard opens at the auth-progress step with that bank pre-selected (never at bank selection, which blocks connected banks), and the step shows the `ACCOUNT SELECTION NOTICE` decision box explaining that the new account selection
+- **THEN** the wizard opens at the auth-progress step with that bank pre-selected (never at bank selection, which blocks connected banks), and the step shows the `ACCOUNT SELECTION NOTICE` decision box explaining that the new account selection replaces the previous one for this bank
 
 ### Requirement: Empty presentations
 
@@ -266,7 +266,7 @@ The dashboard SHALL specify presentations for data-less states rather than impro
 
 #### Scenario: Fetch-failure presentation
 - **WHEN** the accounts request fails and no cached data exists (e.g. a server error on first dashboard load)
-- **THEN** the dashboard shows a quiet error presentation with a retry affordance instead o
+- **THEN** the dashboard shows a quiet error presentation with a retry affordance instead of an indefinite waiting indicator
 
 ### Requirement: Visual state matrix
 

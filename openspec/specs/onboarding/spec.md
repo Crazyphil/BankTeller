@@ -86,7 +86,7 @@ Additionally, on auth-callback success the route SHALL set a one-shot `pendingIn
 
 #### Scenario: Re-authorization cleans up dependent rows
 - **WHEN** a re-authorization replaces a previous same-bank session and accounts of the old session are missing from the new authorization
-- **THEN** those accounts are re-pointed to the new session row with `in_consent = 0` (their `balances` rows survive untouched), the old session's `sync_log` rows are deleted in the same transaction, and the merge reports the missing-accounts set via the one-shot signal consumed by
+- **THEN** those accounts are re-pointed to the new session row with `in_consent = 0` (their `balances` rows survive untouched), the old session's `sync_log` rows are deleted in the same transaction, and the merge reports the missing-accounts set via the one-shot signal consumed by the SPA's next `GET /api/accounts` fetch
 
 ### Requirement: Onboarding wait endpoint
 The system SHALL expose an authenticated endpoint `GET /api/onboarding/enable-banking/wait?state=<token>` that reports whether the email-link callback has been captured for the given `state` token. The endpoint SHALL validate that the `state` token belongs to the calling authenticated user (rejecting with 403 otherwise — multi-user future-proofing). The response SHALL be one of `{"status": "pending"}` (no `oobCode` captured yet), `{"status": "complete"}` (the callback has been received and the Firebase idToken is cached — auth validated), or `{"status": "auth_failed"}` (the callback was received but GIT `emailLinkSignin` failed — invalid/expired oobCode; the SPA surfaces an error and directs the user to restart onboarding). The SPA SHALL poll this endpoint every 1-2 seconds (with backoff) while in the "waiting for authentication…" state and, upon receiving `complete`, auto-advance by calling `POST /api/onboarding/enable-banking/complete` with the `state` token.
@@ -241,7 +241,7 @@ The existing requirement is modified: in addition to its current behavior, the e
 
 #### Scenario: Logo staged at auth initiation
 - **WHEN** `POST /api/auth` succeeds for a selected bank
-- **THEN** the user session stages that ASPSP's logo URL and BIC (from the already-fetched ASPSP lis
+- **THEN** the user session stages that ASPSP's logo URL and BIC (from the already-fetched ASPSP list) for consumption by the auth callback
 
 ### Requirement: Link-completion check endpoint
 `GET /api/onboarding/link-status` SHALL answer purely from the control-plane whitelist lookup, not from cookie state. Because the user just clicked "I've completed linking", the endpoint SHALL bypass/invalidate the shared ≤ 60 s whitelist cache and fetch fresh; on a fresh fetch that finds a match, it SHALL prime the cache with the fresh result so downstream `/api/onboarding/state` calls stay consistent. It SHALL NOT require a `psuIdHash` in the session. When the caller (SPA) is waiting for a specific bank, matching by aspsp name/country remains supported. Being user-triggered (one click per completion), this per-click cache bypass is acceptable load — the no-hammering guarantee applies to the polled `/api/onboarding/state` path only.
@@ -316,7 +316,7 @@ The step's bank list SHALL fill the wizard's flexible content zone (per the `des
 
 #### Scenario: Bank list shows the overlay scrollbar
 - **WHEN** the bank list exceeds the content zone's height
-- **THEN** the LedgerScrollbar thumb appears during scrolling
+- **THEN** the LedgerScrollbar thumb appears during scrolling and is draggable for fast navigation
 
 ### Requirement: SPA LinkingProgress step
 The existing requirement is modified: the SPA SHALL keep the LinkingProgress screen as the in-session step after `POST /api/link-accounts` (open linking page in a new tab), and it SHALL remain a resume point **within a session** — including the cold-boot case: when the server-resolved route is `linking_progress` (a stored `linking_progress` stage honored by the resolver — see the gate requirement), the SPA restores the LinkingProgress step in resume mode with the stored bank triple, including when `linking_completed == false` (the app is still `inactiveNeverLinked` mid-link). **Auth-callback failures do not resume here**: when the resolved route is `auth_progress` with `auth_failed=true` the SPA shows the AuthProgress step instead (per the SPA AuthProgress step requirement), so the failure is displayed where the retry lives. At the **login gate**, the `(linking_completed=true, auth_completed=false)` state SHALL NOT route here: the session state always only ENHANCES the server state, it never replaces it — once the server side can tell that linking has completed, the user routes to the auth step immediately, no matter that the fine-grained stage says the linking page was last shown. A linked-but-never-authorized user therefore resumes at the **resume card** for the stored bank when no usable stage is stored (see the gate requirement), and a previously-authorized user routes to the Dashboard; when a `linking_progress` stage IS stored and its bank is the linked one, the resolver PROMOTES the route to `auth_progress` (the stage triple feeds the auth step exactly like a stored `auth_progress` stage — the same coarse server-state level, refined by the session data); when the stage's bank is NOT the linked one (an in-flight link of a different bank), the stage is ignored — the resume card for the linked bank is the safe destination (authorizing the unlinked stage bank would fail at EB's side).
@@ -473,7 +473,7 @@ The onboarding/connect wizard SHALL gain a final step after session authorizatio
 
 #### Scenario: Step applies to additional bank connections
 - **WHEN** a user connects an additional bank through the add-bank entry point (the Settings bank connections section's "+ Connect bank" action)
-- **THEN** the same import step runs for the newly authorized a
+- **THEN** the same import step runs for the newly authorized accounts before returning to the dashboard
 
 ### Requirement: Add-bank entry point
 
@@ -523,7 +523,7 @@ Mode separation: the add-flow SHALL reuse the wizard's connect steps (bank selec
 
 #### Scenario: Callback return continues the add-flow mode-agnostically
 - **WHEN** the user returns from the bank's authorization page via the callback URL after starting an add-flow
-- **THEN** the callback processes the result identically to an onboarding authorization (no mode parameter on the URL), and the post-callback cold boot routes entirely from server-side state: on success the import step runs for the newly authorized session (confined in the dashboard's content zone with the bar visible) before the dashboard; on failure the dash
+- **THEN** the callback processes the result identically to an onboarding authorization (no mode parameter on the URL), and the post-callback cold boot routes entirely from server-side state: on success the import step runs for the newly authorized session (confined in the dashboard's content zone with the bar visible) before the dashboard; on failure the dashboard shows the auth-failure notice
 
 ### Requirement: Wizard flow context
 

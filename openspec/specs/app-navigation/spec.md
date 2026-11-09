@@ -20,7 +20,7 @@ The SPA SHALL introduce top-level navigation between authenticated feature scree
 
 #### Scenario: Import step keeps navigation live
 - **WHEN** the initial-import step renders on the dashboard (in flight, failed, or the zero-account notice pending)
-- **THEN** the tab bar remains visible and functional, and the step renders confined to the dashboard's content zone — switching to Settings and back returns to the step still rendering (th
+- **THEN** the tab bar remains visible and functional, and the step renders confined to the dashboard's content zone — switching to Settings and back returns to the step still rendering (the notice still pending, never auto-continued)
 
 ### Requirement: Settings surface
 

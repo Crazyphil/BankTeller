@@ -16,7 +16,7 @@ Data loss SHALL follow only explicit user choice. System failures — bank outag
 
 #### Scenario: Re-authorization never silently deletes
 - **WHEN** a re-authorization yields fewer accounts than previously stored
-- **THEN** the missing accounts survive as kept-as-local-copy accounts (per the missing-accounts dialog requirement) — deletion happens only thr
+- **THEN** the missing accounts survive as kept-as-local-copy accounts (per the missing-accounts dialog requirement) — deletion happens only through the user's explicit choice
 
 ### Requirement: Connections data contract
 
@@ -40,7 +40,7 @@ The existing `GET /api/accounts` payload SHALL be extended (one source of truth 
 
 #### Scenario: Accounts render in deterministic name order within a bank
 - **WHEN** a bank group carries multiple accounts (regardless of the bank API's arrival order)
-- **THEN** the accounts are ordered by display name (case-insensitive, NULL names last), then IBAN — both the connections section's account rows and the dashboard's ca
+- **THEN** the accounts are ordered by display name (case-insensitive, NULL names last), then IBAN — both the connections section's account rows and the dashboard's cards within the bank render in that order
 
 ### Requirement: Bank connections section
 
@@ -60,7 +60,7 @@ The Settings screen's Bank connections section SHALL list the user's connected b
 
 #### Scenario: Local-copy accounts are visible and removable
 - **WHEN** a bank has kept-as-local-copy accounts
-- **THEN** they render with the "Local copy" tag and stale balance styling, and the inline delete affordance opens a confirmation dialog naming the account; confirming removes the account and its balances (per the local-copy accounts requirement) — one-click dele
+- **THEN** they render with the "Local copy" tag and stale balance styling, and the inline delete affordance opens a confirmation dialog naming the account; confirming removes the account and its balances (per the local-copy accounts requirement) — one-click deletion without confirmation never happens
 
 ### Requirement: Connect bank action
 
@@ -68,7 +68,7 @@ The section header's "+ Connect bank" action SHALL enter the wizard at bank sele
 
 #### Scenario: Connect bank enters the add-mode wizard
 - **WHEN** the user activates "+ Connect bank" in the bank connections section
-- **THEN** the wizard opens at bank selection in add-mode, with already-connected banks blocked (the hon
+- **THEN** the wizard opens at bank selection in add-mode, with already-connected banks blocked (the honest already-connected explanation)
 
 ### Requirement: Refresh authorization action
 
@@ -84,7 +84,7 @@ Each connection card SHALL offer a "Refresh authorization" action for **every co
 
 #### Scenario: Naming distinction is preserved
 - **WHEN** a surface shows both balance refresh and authorization refresh
-- **THEN** the two are visually distinct by glyph and label: balance refresh uses the circular-arrow icon with its tooltip; authorization refresh carries explicit "Refresh authorization" text with a key glyph — the two are never conflated, and no circular ar
+- **THEN** the two are visually distinct by glyph and label: balance refresh uses the circular-arrow icon with its tooltip; authorization refresh carries explicit "Refresh authorization" text with a key glyph — the two are never conflated, and no circular arrow ever appears on an authorization action
 
 ### Requirement: Remove connection
 
@@ -104,7 +104,7 @@ Removing a bank connection SHALL follow the sequence: (1) a confirmation dialog 
 
 #### Scenario: Bank not found locally is an honest error
 - **WHEN** the remove endpoint is called for a bank with no local session row (stale SPA state or a double-remove)
-- **THEN** the endpoint responds with an honest not-found error — no Enable Banking call is made, no local deletion runs, and the SP
+- **THEN** the endpoint responds with an honest not-found error — no Enable Banking call is made, no local deletion runs, and the SPA re-syncs its connections state
 
 ### Requirement: Missing-accounts dialog
 
@@ -128,7 +128,7 @@ When a re-authorization's merge reports a missing-accounts set (accounts of the 
 
 #### Scenario: All-kept signal disables the danger action
 - **WHEN** the missing-accounts signal carries only already-kept entries (zero newly missing)
-- **THEN** "Delete newly missing data" renders disabled with the explanatory line (no new accounts went missing), and "Keep as local copy" is the only active action — the danger action is never a cli
+- **THEN** "Delete newly missing data" renders disabled with the explanatory line (no new accounts went missing), and "Keep as local copy" is the only active action — the danger action is never a clickable no-op and never silently hidden
 
 ### Requirement: Local-copy accounts
 
@@ -140,7 +140,7 @@ Accounts marked `in_consent = 0` (kept-as-local-copy) SHALL be skipped by the sy
 
 #### Scenario: Local copies present as permanently stale
 - **WHEN** the dashboard or connections section renders a local-copy account
-- **THEN** it shows the "Local copy" tag with its last-known balance in stale styling — never p
+- **THEN** it shows the "Local copy" tag with its last-known balance in stale styling — never presented as currently synchronized
 
 ### Requirement: Automation guard
 
