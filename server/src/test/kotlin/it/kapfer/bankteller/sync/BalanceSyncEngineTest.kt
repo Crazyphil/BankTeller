@@ -56,6 +56,7 @@ class BalanceSyncEngineTest {
      */
     private class FakeClient(
         val gate: CountDownLatch? = null,
+        val enteredBalanceFetch: CountDownLatch? = null,
     ) : EnableBankingClient(testCredentialProvider) {
         var sessionResults = mutableMapOf<String, SessionResult>()
         var balanceResults = mutableMapOf<String, FakeBalanceOutcome>()
@@ -69,6 +70,7 @@ class BalanceSyncEngineTest {
         }
 
         override suspend fun getBalances(accountUid: String, psuHeaders: PsuHeaders?): BalancesResult {
+            enteredBalanceFetch?.countDown()
             gate?.await(10, TimeUnit.SECONDS)
             balanceCalls.add(accountUid to psuHeaders)
             return when (val outcome = balanceResults[accountUid] ?: FakeBalanceOutcome.Ok(emptyList())) {
@@ -761,6 +763,114 @@ class BalanceSyncEngineTest {
 
         assertEquals("personal", byName["Bank s1"]!!.jsonObject["psu_type"]!!.jsonPrimitive.content)
         assertEquals("business", byName["Bank s2"]!!.jsonObject["psu_type"]!!.jsonPrimitive.content)
+    }
+
+    // =====================================================================
+    // Local-copy accounts (in_consent = 0) are skipped by the sync runner
+    // =====================================================================
+
+    @Test
+    fun `sync skips in_consent 0 accounts and reflects only fetchable accounts`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        // Two accounts in the first authorization; a re-auth without DE2 turns
+        // it into a kept local copy (in_consent = 0) with its balance intact.
+        store.mergeSession(
+            "s1", "Bank s1", "DE", "personal",
+            listOf(
+                it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+                it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Spar"),
+            ),
+        )
+        store.mergeSession(
+            "s2", "Bank s1", "DE", "personal",
+            listOf(it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+        )
+        val s2Row = db.ebSessionsQueries.selectSessionBySessionId("s2").executeAsOne()
+        val keptAccount = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(s2Row.id)).executeAsList().single { it.iban == "DE2" }
+        assertEquals(0L, keptAccount.in_consent)
+        db.balancesQueries.upsertBalance(keptAccount.id, "50.00", "EUR", "CLBD", "2026-09-01", 1_000L)
+
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry(amount = "100.00")))
+            // u2 would be fetched only if the local-copy skip failed.
+            balanceResults["u2"] = FakeBalanceOutcome.Ok(listOf(balanceEntry(amount = "999.00")))
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        assertEquals(listOf("u1"), client.balanceCalls.map { it.first }, "local-copy accounts are never fetched")
+        // The kept account's balance row is untouched.
+        assertEquals("50.00", db.balancesQueries.selectBalanceByAccountId(keptAccount.id).executeAsOne().balance_amount)
+        // The run's status reflects only the fetchable accounts → success.
+        val log = db.balancesQueries.selectLatestSyncLogBySessionId(s2Row.id).executeAsOne()
+        assertEquals("success", log.status)
+    }
+
+    @Test
+    fun `session with only local-copy accounts completes success with no fetches`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        store.mergeSession(
+            "s1", "Bank s1", "DE", "personal",
+            listOf(it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+        )
+        // Re-auth without DE1 → only a kept local copy remains under s2.
+        store.mergeSession(
+            "s2", "Bank s1", "DE", "personal",
+            emptyList(),
+        )
+        val s2Row = db.ebSessionsQueries.selectSessionBySessionId("s2").executeAsOne()
+
+        val client = FakeClient()
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        assertTrue(client.balanceCalls.isEmpty(), "no fetchable accounts → no fetches")
+        val log = db.balancesQueries.selectLatestSyncLogBySessionId(s2Row.id).executeAsOne()
+        assertEquals("success", log.status, "a run with zero fetchable accounts is a success")
+    }
+
+    // =====================================================================
+    // Remove-during-sync race guard
+    // =====================================================================
+
+    @Test
+    fun `session removed mid-run turns later upserts and the sync-log write into no-ops`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        store.mergeSession(
+            "s1", "Bank s1", "DE", "personal",
+            listOf(it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+        )
+        val s1Row = db.ebSessionsQueries.selectSessionBySessionId("s1").executeAsOne()
+        val accountId = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(s1Row.id)).executeAsOne().id
+
+        // Gate the run INSIDE u1's balance fetch so the removal happens mid-run.
+        val entered = CountDownLatch(1)
+        val gate = CountDownLatch(1)
+        val client = FakeClient(gate = gate, enteredBalanceFetch = entered).apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry(amount = "100.00")))
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+
+        check(entered.await(5, TimeUnit.SECONDS)) { "run must reach the gated balance fetch" }
+        // The user's explicit removal completes while the run is in flight.
+        store.removeConnectionCleanup(s1Row.id)
+        assertNull(db.ebSessionsQueries.selectSessionBySessionId("s1").executeAsOneOrNull(), "session row removed")
+
+        gate.countDown()
+        waitUntil { !engine.isSyncInProgress() }
+
+        // The fetch happened (the run reached it before the removal), but the
+        // guarded writes after it became no-ops: no orphaned balance row, no
+        // sync-log row for the removed session.
+        assertEquals(listOf("u1"), client.balanceCalls.map { it.first })
+        assertNull(db.balancesQueries.selectBalanceByAccountId(accountId).executeAsOneOrNull(), "no orphaned balance row")
+        assertEquals(0L, db.balancesQueries.countSyncLogsBySessionId(s1Row.id).executeAsOne(), "no orphaned sync-log row")
     }
 
     // =====================================================================

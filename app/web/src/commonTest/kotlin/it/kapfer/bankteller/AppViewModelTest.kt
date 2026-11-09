@@ -3011,6 +3011,995 @@ class AppViewModelTest {
         advanceUntilIdle()
         assertFalse(vm.refreshRequested)
     }
+
+    // ---------------------------------------------------------------
+    // Settings tab navigation (bank-connection-management 4.2/10.2)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun openSettingsTab_switchesClientSideWithoutServerRoundTrip() = runTest(testDispatcher) {
+        // Pure client-side switch (spec: app-navigation — "no page reload
+        // and no server round-trip"): currentScreen changes with NO fetch
+        // fired by the switch itself; the Settings screen's own entry
+        // effect handles stale-while-revalidate when data is missing.
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        assertEquals(Screen.Settings, vm.currentScreen)
+        assertEquals(0, fakeApi.accountsDataCallCount)
+    }
+
+    @Test
+    fun openDashboardTab_switchesBackWithoutServerCall() = runTest(testDispatcher) {
+        // The reverse tab switch is a pure state change — no fetch.
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        vm.openDashboardTab()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        assertEquals(0, fakeApi.accountsDataCallCount)
+    }
+
+    @Test
+    fun chromeFreeSurfaces_neverRenderSettingsAsRoute() = runTest(testDispatcher) {
+        // The resolver NEVER routes to Settings (spec: app-navigation —
+        // reachable only via the tab bar). Every cold-boot route lands on
+        // the resolver's destination; a dashboard-route state leaves the
+        // screen at Dashboard, never Settings.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState()
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    // ---------------------------------------------------------------
+    // Remove-connection flow (bank-connection-management 6.1/10.2)
+    // ---------------------------------------------------------------
+
+    private fun connectedBank(
+        name: String = "Demo Bank",
+        accounts: List<AccountData> = listOf(
+            AccountData(
+                id = 1L,
+                name = "Checking",
+                iban = "DE89370400440532013000",
+                currency = "EUR",
+                balanceAmount = "100.00",
+                balanceCurrency = "EUR",
+                balanceType = "closingBooked",
+                referenceDate = null,
+                fetchedAt = 100L,
+            ),
+        ),
+    ): BankData = BankData(
+        bankName = name,
+        bankCountry = "DE",
+        logo = null,
+        validUntil = "2999-01-01T00:00:00Z",
+        syncState = "fresh",
+        lastSyncAt = 50L,
+        lastSuccessAt = 50L,
+        accounts = accounts,
+        consentBroken = false,
+        psuType = "personal",
+    )
+
+    @Test
+    fun requestRemoveConnection_opensDialogWithoutServerCall() = runTest(testDispatcher) {
+        val bank = connectedBank()
+        vm.requestRemoveConnection(bank)
+        advanceUntilIdle()
+        assertEquals("Demo Bank" to "DE", vm.removeDialogBank)
+        assertTrue(fakeApi.removeConnectionCalls.isEmpty())
+    }
+
+    @Test
+    fun confirmRemoveConnection_successRefreshesAndClearsDialog() = runTest(testDispatcher) {
+        // Success (eb_deleted=true): the dialog closes, the data refreshes,
+        // no caveat renders.
+        fakeApi.nextRemoveConnectionResult = RemoveConnectionResult.Ok(
+            removed = true,
+            ebDeleted = true,
+            validUntil = null,
+        )
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.requestRemoveConnection(connectedBank())
+        vm.confirmRemoveConnection()
+        advanceUntilIdle()
+        assertNull(vm.removeDialogBank)
+        assertNull(vm.removeCaveat)
+        assertEquals(1, fakeApi.removeConnectionCalls.size)
+        assertTrue(fakeApi.accountsDataCallCount >= 1)
+    }
+
+    @Test
+    fun confirmRemoveConnection_ebFailureStillRemoves_withHonestCaveatLine() = runTest(testDispatcher) {
+        // eb_deleted=false (D7): the removal still happened locally — the
+        // honest one-line caveat renders with the consent-expiry date.
+        fakeApi.nextRemoveConnectionResult = RemoveConnectionResult.Ok(
+            removed = true,
+            ebDeleted = false,
+            validUntil = "2027-01-15T00:00:00Z",
+        )
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.requestRemoveConnection(connectedBank())
+        vm.confirmRemoveConnection()
+        advanceUntilIdle()
+        assertNull(vm.removeDialogBank)
+        val caveat = vm.removeCaveat
+        assertNotNull(caveat)
+        assertTrue(caveat.startsWith("The connection is removed from BankTeller."))
+        assertTrue(caveat.contains("your bank's own portal can revoke it sooner"))
+        assertFalse(caveat.contains("until it expires")) // a real date rendered
+    }
+
+    @Test
+    fun confirmRemoveConnection_notFoundResyncsConnectionsState() = runTest(testDispatcher) {
+        // 404 (stale SPA state / double remove): honest error + re-sync —
+        // the dialog closes and the honest error line renders in the
+        // connections section (visible without the dialog), with the
+        // connections state refreshed from the server's truth.
+        fakeApi.nextRemoveConnectionResult = RemoveConnectionResult.NotFound
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.requestRemoveConnection(connectedBank())
+        vm.confirmRemoveConnection()
+        advanceUntilIdle()
+        assertNull(vm.removeDialogBank) // closed — the bank is already gone
+        assertEquals(
+            "This bank is no longer connected. Your list has been refreshed.",
+            vm.settingsError,
+        )
+        assertTrue(fakeApi.accountsDataCallCount >= 1)
+    }
+
+    @Test
+    fun dismissRemoveDialog_cancelsWithoutServerCall() = runTest(testDispatcher) {
+        vm.requestRemoveConnection(connectedBank())
+        vm.dismissRemoveDialog()
+        advanceUntilIdle()
+        assertNull(vm.removeDialogBank)
+        assertTrue(fakeApi.removeConnectionCalls.isEmpty())
+    }
+
+    // ---------------------------------------------------------------
+    // Missing-accounts dialog state machine (6.2/10.2)
+    // ---------------------------------------------------------------
+
+    private fun missingAccount(
+        id: Long,
+        name: String? = "Old account",
+        iban: String? = "DE89370400440532013000",
+        newlyMissing: Boolean = true,
+    ): MissingAccount = MissingAccount(id = id, name = name, iban = iban, newlyMissing = newlyMissing)
+
+    @Test
+    fun refreshAccounts_stashesOneShotMissingAccountsSignal() = runTest(testDispatcher) {
+        // The signal arrives on exactly ONE fetch and reverts to null —
+        // the stash captures it on ANY accounts fetch (D14). No re-auth
+        // flow active → the stashed bank name is null (the dialog copy
+        // degrades by dropping the "at X" clause).
+        val withSignal = AccountsData(
+            banks = listOf(connectedBank()),
+            syncInProgress = false,
+            missingAccounts = listOf(missingAccount(7L)),
+        )
+        val withoutSignal = withSignal.copy(missingAccounts = emptyList())
+        fakeApi.accountsDataSequence = listOf(withSignal, withoutSignal)
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals(MissingAccountsSignal(listOf(missingAccount(7L)), bankName = null), vm.missingAccountsSignal)
+        // A second fetch without the signal does NOT clear the stash —
+        // only the dialog's actions consume it.
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals(MissingAccountsSignal(listOf(missingAccount(7L)), bankName = null), vm.missingAccountsSignal)
+    }
+
+    @Test
+    fun refreshAccounts_stashesReAuthBankNameWithTheSignal() = runTest(testDispatcher) {
+        // The dialog renders the BANK of the re-authorization: the signal
+        // items carry no bank, so the flow bank (reAuthBank — the flow the
+        // user just completed) is captured AT STASH TIME and rides with
+        // the stash (the redirect/cold boot wipes the flow state before
+        // the dialog renders).
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.startReauthorizationFlow(connectedBank())
+        advanceUntilIdle()
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank()),
+                syncInProgress = false,
+                missingAccounts = listOf(missingAccount(7L)),
+            ),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        val signal = vm.missingAccountsSignal
+        assertNotNull(signal)
+        assertEquals("Demo Bank", signal.bankName)
+        assertEquals(listOf(missingAccount(7L)), signal.accounts)
+    }
+
+    @Test
+    fun refreshAccounts_signalBankNameFromTheServer_beatsTheClientStash() = runTest(testDispatcher) {
+        // The real re-auth path (13.3/F4): the bank redirect cold-boots
+        // the SPA and wipes the client reAuthBank stash — the dialog's
+        // "at {bank}" copy can only come from the SERVER-side signal
+        // field. When the payload carries it, it WINS over any (stale or
+        // live) client stash; the client stash remains the null-fallback
+        // for a pre-change server (the previous test).
+        val withServerName = AccountsData(
+            banks = listOf(connectedBank()),
+            syncInProgress = false,
+            missingAccounts = listOf(missingAccount(7L)),
+            missingAccountsBankName = "Demo Bank",
+        )
+        fakeApi.accountsDataSequence = listOf(withServerName)
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals("Demo Bank", vm.missingAccountsSignal?.bankName)
+        // The server name wins even when a client stash is LIVE: the
+        // payload's signal is the authoritative source (a stale client
+        // stash must never override the server's one-shot truth).
+        val otherBank = BankData(
+            bankName = "Other Bank",
+            bankCountry = "DE",
+            logo = null,
+            validUntil = null,
+            syncState = "fresh",
+            lastSyncAt = null,
+            lastSuccessAt = null,
+            accounts = emptyList(),
+        )
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.com/sca")
+        vm.startReauthorizationFlow(otherBank)
+        advanceUntilIdle()
+        fakeApi.accountsDataSequence = listOf(
+            withServerName.copy(missingAccounts = listOf(missingAccount(8L))),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals(
+            MissingAccountsSignal(listOf(missingAccount(8L)), bankName = "Demo Bank"),
+            vm.missingAccountsSignal,
+        )
+    }
+
+    @Test
+    fun refreshAccounts_secondSignalReplacesTheStashedFirst() = runTest(testDispatcher) {
+        // The 12.8C walkthrough sequence: a SECOND re-authorization
+        // produced a second one-shot signal while the flow continued —
+        // the stash is a REPLACEMENT, not a merge. The LATEST detection's
+        // account set is the dialog's truth: a stale account from the
+        // first signal never lingers in the stash (the dialog would
+        // otherwise offer to act on data the server no longer reports).
+        val firstDetection = AccountsData(
+            banks = listOf(connectedBank()),
+            syncInProgress = false,
+            missingAccounts = listOf(missingAccount(7L)),
+        )
+        val secondDetection = AccountsData(
+            banks = listOf(connectedBank()),
+            syncInProgress = false,
+            missingAccounts = listOf(missingAccount(8L), missingAccount(9L, newlyMissing = false)),
+        )
+        fakeApi.accountsDataSequence = listOf(firstDetection, secondDetection)
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals(MissingAccountsSignal(listOf(missingAccount(7L)), bankName = null), vm.missingAccountsSignal)
+        // The second detection REPLACES the stash: account 7 (the first
+        // signal's account) is GONE — not merged in.
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertEquals(
+            MissingAccountsSignal(
+                accounts = listOf(missingAccount(8L), missingAccount(9L, newlyMissing = false)),
+                bankName = null,
+            ),
+            vm.missingAccountsSignal,
+        )
+    }
+
+    @Test
+    fun keepMissingAccounts_closesDialogWithoutServerCall() = runTest(testDispatcher) {
+        // "Keep as local copy" (D8): PRIMARY action — no server call; the
+        // keep is already the effective state.
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank()),
+                syncInProgress = false,
+                missingAccounts = listOf(missingAccount(7L)),
+            ),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        vm.keepMissingAccounts()
+        advanceUntilIdle()
+        assertNull(vm.missingAccountsSignal)
+        assertTrue(fakeApi.deleteLocalAccountsCalls.isEmpty())
+    }
+
+    @Test
+    fun deleteMissingAccounts_deletesNewlyMissingOnly_thenRefreshes() = runTest(testDispatcher) {
+        // "Delete newly missing data" (D8/D14, task 11.12 scope): the
+        // deletion endpoint receives ONLY the newlyMissing == true ids —
+        // the already-kept local copies are never in the deletion set (a
+        // prior keep decision is a standing choice no later dialog
+        // re-makes; intent principle).
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank()),
+                syncInProgress = false,
+                missingAccounts = listOf(missingAccount(7L), missingAccount(8L, newlyMissing = false)),
+            ),
+            AccountsData(banks = emptyList(), syncInProgress = false),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        fakeApi.nextDeleteLocalAccountsResult = listOf(7L)
+        vm.deleteMissingAccounts()
+        advanceUntilIdle()
+        assertEquals(listOf(listOf(7L)), fakeApi.deleteLocalAccountsCalls, "only the newly missing id is in the deletion set")
+        assertNull(vm.missingAccountsSignal)
+        assertTrue(fakeApi.accountsDataCallCount >= 2)
+    }
+
+    @Test
+    fun deleteMissingAccounts_failureKeepsDialogOpenWithInDialogError() = runTest(testDispatcher) {
+        // A failed deletion keeps the stashed signal (dialog open,
+        // retryable) — and the failure surfaces IN THE DIALOG (F4): the
+        // dialog renders on the dashboard, so the error rides the
+        // dialog's own slot (missingAccountsError), never the
+        // settings-surface slot that would be invisible there.
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank()),
+                syncInProgress = false,
+                missingAccounts = listOf(missingAccount(7L)),
+            ),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        fakeApi.nextDeleteLocalAccountsResult = null // request failure
+        vm.deleteMissingAccounts()
+        advanceUntilIdle()
+        assertNotNull(vm.missingAccountsSignal)
+        assertEquals(
+            "The accounts could not be deleted just now. Please try again.",
+            vm.missingAccountsError,
+        )
+        assertNull(vm.settingsError) // the Settings-surface slot stays clean
+        // Retry starts clean, and closing (keep) clears both the signal
+        // and the error.
+        vm.deleteMissingAccounts()
+        advanceUntilIdle()
+        assertEquals(
+            "The accounts could not be deleted just now. Please try again.",
+            vm.missingAccountsError,
+        )
+        vm.keepMissingAccounts()
+        advanceUntilIdle()
+        assertNull(vm.missingAccountsSignal)
+        assertNull(vm.missingAccountsError)
+    }
+
+    @Test
+    fun deleteMissingAccounts_retryAfterFailureSucceedsAndClosesTheDialog() = runTest(testDispatcher) {
+        // The 12.8C walkthrough's unpinned path: a failed deletion keeps
+        // the dialog open with the in-dialog error (F4); the user RETRIES
+        // and the second call SUCCEEDS — the dialog closes (signal and
+        // error cleared), the accounts refresh, and the retry re-sent the
+        // SAME newlyMissing-filtered id set (the deletion scope is
+        // identical on every attempt — a retry never widens the scope).
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank()),
+                syncInProgress = false,
+                missingAccounts = listOf(missingAccount(7L), missingAccount(10L, newlyMissing = false)),
+            ),
+            // The refresh that follows the successful retry consumes this.
+            AccountsData(banks = emptyList(), syncInProgress = false),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        assertNotNull(vm.missingAccountsSignal)
+        // Sequential delete results: attempt 1 fails (null entry — the
+        // same request-failure mechanics as the F4 test), attempt 2
+        // succeeds.
+        fakeApi.deleteLocalAccountsResultSequence = listOf(null, listOf(7L))
+        vm.deleteMissingAccounts()
+        advanceUntilIdle()
+        // The failure state: dialog open, in-dialog error set, one
+        // deletion attempt recorded (only the newly missing id).
+        assertNotNull(vm.missingAccountsSignal)
+        assertEquals(
+            "The accounts could not be deleted just now. Please try again.",
+            vm.missingAccountsError,
+        )
+        assertEquals(listOf(listOf(7L)), fakeApi.deleteLocalAccountsCalls)
+        // The retry succeeds: dialog closed, error cleared, refresh ran.
+        vm.deleteMissingAccounts()
+        advanceUntilIdle()
+        assertNull(vm.missingAccountsSignal)
+        assertNull(vm.missingAccountsError)
+        // Exactly two deletion calls, both carrying the SAME
+        // newlyMissing-filtered set (account 10 — already kept — is in
+        // NEITHER).
+        assertEquals(listOf(listOf(7L), listOf(7L)), fakeApi.deleteLocalAccountsCalls)
+        assertTrue(fakeApi.accountsDataCallCount >= 2)
+    }
+
+    @Test
+    fun deleteLocalAccount_singleIdDeletionThenRefresh() = runTest(testDispatcher) {
+        // The inline extra-small danger delete (D5/D9): single-id deletion
+        // via the same endpoint, then a refresh.
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = false),
+            AccountsData(banks = emptyList(), syncInProgress = false),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        fakeApi.nextDeleteLocalAccountsResult = listOf(3L)
+        vm.deleteLocalAccount(3L)
+        advanceUntilIdle()
+        assertEquals(listOf(listOf(3L)), fakeApi.deleteLocalAccountsCalls)
+        assertNull(vm.settingsError)
+    }
+
+    // ---------------------------------------------------------------
+    // Local-copy deletion confirmation dialog (task 11.3 — one-click
+    // deletion never happens)
+    // ---------------------------------------------------------------
+
+    private fun localCopyAccount(id: Long = 3L, name: String = "Salary account"): AccountData =
+        AccountData(
+            id = id,
+            name = name,
+            iban = "DE89370400440532013000",
+            currency = "EUR",
+            balanceAmount = "100.00",
+            balanceCurrency = "EUR",
+            balanceType = "closingBooked",
+            referenceDate = null,
+            fetchedAt = 100L,
+            inConsent = 0L,
+        )
+
+    @Test
+    fun inlineDelete_opensTheDialogWithoutDeleting() = runTest(testDispatcher) {
+        // Task 11.3 ruling: ONE-CLICK DELETION NEVER HAPPENS — the inline
+        // affordance opens the confirmation dialog; no server call fires.
+        val account = localCopyAccount()
+        vm.requestDeleteLocalAccount(account)
+        advanceUntilIdle()
+        assertEquals(3L, vm.deleteDialogAccount?.id)
+        assertTrue(fakeApi.deleteLocalAccountsCalls.isEmpty())
+    }
+
+    @Test
+    fun deleteDialog_confirmDeletesViaTheSingleAccountPathThenCloses() = runTest(testDispatcher) {
+        // Confirm → the existing single-account deletion path → refresh;
+        // the dialog closes on success (the account + its balances are
+        // gone everywhere).
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = false),
+            AccountsData(banks = emptyList(), syncInProgress = false),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        vm.requestDeleteLocalAccount(localCopyAccount())
+        fakeApi.nextDeleteLocalAccountsResult = listOf(3L)
+        vm.confirmDeleteLocalAccount()
+        advanceUntilIdle()
+        assertEquals(listOf(listOf(3L)), fakeApi.deleteLocalAccountsCalls)
+        assertNull(vm.deleteDialogAccount)
+        assertNull(vm.settingsError)
+    }
+
+    @Test
+    fun deleteDialog_failureKeepsTheDialogOpen() = runTest(testDispatcher) {
+        // A failed deletion keeps the dialog open (honest error, retryable)
+        // — the destructive gate has not passed.
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = false),
+        )
+        vm.refreshAccounts()
+        advanceUntilIdle()
+        vm.requestDeleteLocalAccount(localCopyAccount())
+        fakeApi.nextDeleteLocalAccountsResult = null // request failure
+        vm.confirmDeleteLocalAccount()
+        advanceUntilIdle()
+        assertEquals(listOf(listOf(3L)), fakeApi.deleteLocalAccountsCalls)
+        assertNotNull(vm.deleteDialogAccount)
+        assertEquals(
+            "The account could not be deleted just now. Please try again.",
+            vm.settingsError,
+        )
+    }
+
+    @Test
+    fun deleteDialog_cancelClosesWithoutDeleting() = runTest(testDispatcher) {
+        // Cancel/dismiss: closes the dialog; no server call, no error.
+        vm.requestDeleteLocalAccount(localCopyAccount())
+        vm.dismissDeleteDialog()
+        advanceUntilIdle()
+        assertNull(vm.deleteDialogAccount)
+        assertTrue(fakeApi.deleteLocalAccountsCalls.isEmpty())
+        assertNull(vm.settingsError)
+    }
+
+    // ---------------------------------------------------------------
+    // Zero-account notice gating (8.1/10.2)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun zeroAccountNotice_firesOnFirstConnectionOnly() = runTest(testDispatcher) {
+        // The REAL first-connection sequence (13.1(d), re-keyed from the
+        // impossible fabricated states): the auth callback's merge sets
+        // the one-shot first_connection_import signal → the redirect cold
+        // boot's STATE READ consumes it (BEFORE any import starts —
+        // pending_initial_import arms the import step from the same
+        // read) → the import completes with the ONLY bank sharing zero
+        // accounts → the notice arms and holds the import step composed;
+        // NO routing gating (the connection is stored).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        // The genuine first connection's state read: the one-shot
+        // first_connection_import=true rides the response (consumed by
+        // this read), and the MARKER is ALREADY true — flipped inside
+        // the merge transaction before this read — which is exactly why
+        // the signal, not the marker, keys the detection. (The import
+        // step itself is armed below, as on the real path where the
+        // same read's pending_initial_import one-shot triggers it.)
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = true, firstConnectionImport = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(true, vm.firstConnectionImport)
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L) // first poll tick
+        runCurrent()
+        assertNotNull(vm.zeroAccountNoticeBank)
+        assertEquals("Demo Bank", vm.zeroAccountNoticeBank?.bankName)
+        // The notice holds the ImportStep overlay composed on the dashboard
+        // surface (DashboardScreen keys the overlay on importInProgress ||
+        // importFailed || zeroAccountNoticeBank != null).
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun zeroAccountNotice_neverFiresWhenOtherBanksExist() = runTest(testDispatcher) {
+        // Add-mode import on a running system (D11): a zero-account bank
+        // beside a working bank never arms the notice.
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(
+                    connectedBank(name = "Working Bank"),
+                    connectedBank(name = "Empty Bank", accounts = emptyList()),
+                ),
+                syncInProgress = false,
+            ),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNull(vm.zeroAccountNoticeBank)
+    }
+
+    @Test
+    fun zeroAccountNotice_neverFiresWithAccounts() = runTest(testDispatcher) {
+        // A first connection WITH accounts never arms the notice.
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNull(vm.zeroAccountNoticeBank)
+    }
+
+    @Test
+    fun zeroAccountNotice_neverFiresInAddMode_evenAsTheOnlyBank() = runTest(testDispatcher) {
+        // Task 11.7b — add-mode-after-remove edge: the only previously
+        // connected bank was removed and a NEW zero-account bank is
+        // connected through the add-flow. The payload shape (single bank,
+        // zero accounts) matches the onboarding first connection, but the
+        // spec's "SHALL NOT fire in add-mode" rules the notice out — the
+        // mode flag (still live in-session here) suppresses it, and the
+        // import step ROUTES NORMALLY (dashboard, standing empty state).
+        vm.startAddBankFlow()
+        advanceUntilIdle()
+        assertTrue(vm.isAddMode)
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(name = "New Bank", accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        // NO notice (mode-gated) — and the import completed + routed
+        // normally (never mode-gated): the dashboard's standing empty
+        // state carries the presentation.
+        assertNull(vm.zeroAccountNoticeBank)
+        assertFalse(vm.importInProgress)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun zeroAccountNotice_everOnboardedReconnect_signalFalse_neverFires() = runTest(testDispatcher) {
+        // 13.1(d)'s remove-all-then-reconnect shape (re-keyed from the
+        // marker-only encoding): a user who completed onboarding removes
+        // their only bank and reconnects one returning zero accounts.
+        // The cold boot's state read carries the one-shot signal FALSE
+        // (the merge was NOT a first connection — 0→1 was already
+        // consumed) and the marker TRUE. The signal truth rules the
+        // notice out; the import routes normally and the dashboard's
+        // standing empty state carries the presentation.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = true, firstConnectionImport = false)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(false, vm.firstConnectionImport)
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(name = "Reconnected Bank", accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNull(vm.zeroAccountNoticeBank)
+        assertFalse(vm.importInProgress)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun zeroAccountNotice_prechangeServer_signalAbsent_fallsBackToTheMarkerChain() = runTest(testDispatcher) {
+        // 13.1(d)'s transitional-tolerance shape: a server predating the
+        // change omits first_connection_import (null) — the 11.13/F7
+        // marker chain applies unchanged. The marker TRUE (an
+        // ever-onboarded user) rules the notice out exactly as before;
+        // the marker is the pre-change key, the signal only overrides it
+        // when the server reports one.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = true, firstConnectionImport = null)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertNull(vm.firstConnectionImport)
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(name = "Reconnected Bank", accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNull(vm.zeroAccountNoticeBank)
+        assertFalse(vm.importInProgress)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun firstConnectionImportSignal_stashedOnTheStateRead_andToleratesAbsence() = runTest(testDispatcher) {
+        // The one-shot signal rides the state response: stashed on the
+        // cold boot's read (checkAuth → checkOnboardingStatus), and
+        // ABSENT on a server predating the change → null (never a
+        // guessed boolean). The marker keeps its routing role unchanged.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = true, firstConnectionImport = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(true, vm.firstConnectionImport)
+        assertEquals(true, vm.everOnboarded)
+        // A later read WITHOUT the signal (the one-shot was consumed by
+        // the first read) → false on a post-change server: a subsequent
+        // import in the same session is never a first connection.
+        fakeApi.onboardingStateSequence = listOf(dashboardRouteState(everOnboarded = true, firstConnectionImport = false))
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(false, vm.firstConnectionImport)
+        // Absence (a pre-change server) → null, not a guess.
+        fakeApi.onboardingStateSequence = listOf(dashboardRouteState(everOnboarded = true, firstConnectionImport = null))
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertNull(vm.firstConnectionImport)
+    }
+
+    @Test
+    fun zeroAccountNotice_firstConnectionSignalTrue_firesOnTheGenuineFirstConnection() = runTest(testDispatcher) {
+        // RE-KEYED (13.1(d)): the old name
+        // (zeroAccountNotice_everOnboardedMarkerFalse_...) fabricated
+        // everOnboarded=false POST-merge — a state the server cannot
+        // produce (the marker flips to true INSIDE the merge transaction,
+        // before the redirect cold boot's state read; that unreachability
+        // was review F1's finding). The genuine first connection is keyed
+        // on the one-shot SIGNAL: first_connection_import=true (consumed
+        // by the state read), marker already true. The notice fires
+        // exactly as before — the signal truth is the key, not the
+        // marker.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = true, firstConnectionImport = true)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(true, vm.firstConnectionImport)
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNotNull(vm.zeroAccountNoticeBank)
+        assertEquals("Demo Bank", vm.zeroAccountNoticeBank?.bankName)
+    }
+
+    @Test
+    fun everOnboardedMarker_stashedOnEveryStateRead_andToleratesAbsence() = runTest(testDispatcher) {
+        // The marker rides the state response: stashed on a cold boot
+        // (checkAuth → checkOnboardingStatus), refreshed on each read,
+        // and ABSENT on a server predating the change → null (the
+        // pre-change tolerance — never a guessed boolean).
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState(everOnboarded = false)
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(false, vm.everOnboarded)
+        // A later read refreshes the marker (remove-all-then-reconnect:
+        // the server now reports true — the marker persists per the
+        // backend contract, but the stash follows the response truth).
+        fakeApi.onboardingStateSequence = listOf(dashboardRouteState(everOnboarded = true))
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(true, vm.everOnboarded)
+        // Absence (a pre-change server) → null, not a guess.
+        fakeApi.onboardingStateSequence = listOf(dashboardRouteState(everOnboarded = null))
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertNull(vm.everOnboarded)
+    }
+
+    @Test
+    fun zeroAccountNotice_neverFiresWhenMissingAccountsReported_dialogInstead() = runTest(testDispatcher) {
+        // SUPPRESSION (D11 vs D8/D14): a re-authorization narrowing to zero
+        // accounts produces the same payload SHAPE (single bank, zero
+        // accounts) — but the narrowing case is covered by the
+        // missing-accounts dialog. The same fetch stashes the signal, so
+        // the dialog state renders and the notice never arms.
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(
+                banks = listOf(connectedBank(accounts = emptyList())),
+                syncInProgress = false,
+                missingAccounts = listOf(
+                    MissingAccount(id = 7L, name = "Salary", iban = "DE89370400440532013000", newlyMissing = true),
+                ),
+            ),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        // NO notice — the missing-accounts dialog's stash is the
+        // presentation for this merge.
+        assertNull(vm.zeroAccountNoticeBank)
+        assertEquals(
+            MissingAccountsSignal(
+                accounts = listOf(MissingAccount(7L, "Salary", "DE89370400440532013000", newlyMissing = true)),
+                bankName = null, // no re-auth flow in this test — degraded "at X" copy
+            ),
+            vm.missingAccountsSignal,
+        )
+    }
+
+    @Test
+    fun zeroAccountNotice_continueRoutesToDashboard() = runTest(testDispatcher) {
+        // "Continue to dashboard" (D11): consumes the notice, routes
+        // normally — completion unchanged.
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        vm.continueToDashboardFromZeroAccountNotice()
+        advanceUntilIdle()
+        assertNull(vm.zeroAccountNoticeBank)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun zeroAccountNotice_connectAnotherBankReentersBankSelection() = runTest(testDispatcher) {
+        // "Connect another bank" (D11): re-enters bank selection mid-flow
+        // (onboarding mode — the notice only arms on the first connection).
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        vm.reconnectAnotherBankFromOnboarding()
+        advanceUntilIdle()
+        assertNull(vm.zeroAccountNoticeBank)
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(OnboardingStep.BankSelection, vm.onboardingStep)
+    }
+
+    // ---------------------------------------------------------------
+    // Import-step confinement (task 11.11): the step composes inside the
+    // dashboard's content zone — the bar stays live, the greeting renders
+    // above the step, and the step's pending state persists across
+    // tab-away/return. State-machine level: the dashboard surface stays
+    // composed with the step active, tab switches are side-effect-free,
+    // and no state auto-transitions.
+    // ---------------------------------------------------------------
+
+    @Test
+    fun importStep_staysOnDashboardSurface_barStaysLive() = runTest(testDispatcher) {
+        // The confinement ruling: the in-flight import keeps the user on
+        // the DASHBOARD surface (the step composes in the content zone
+        // beneath the standing chrome — the tab bar renders ALWAYS on
+        // the dashboard surface). No routing change while the import
+        // runs. Setup mirrors routeDashboard's contract: the resolver
+        // routes to the dashboard FIRST, then arms the import.
+        vm.openDashboardTab()
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = true),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        // Still in flight (syncInProgress=true) → still the dashboard
+        // surface with the step composed, not a modal takeover.
+        assertTrue(vm.importInProgress)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun importStep_failure_persistsRetryChoiceAcrossTabAway() = runTest(testDispatcher) {
+        // The failure state persists its retry/continue choice (designer
+        // confirm): a tab-away NEVER auto-transitions into the degraded
+        // presentation — importFailed stays armed, the surface returns
+        // to the step on tab-back. Setup mirrors routeDashboard's
+        // contract: the dashboard surface is set, then the import arms.
+        vm.openDashboardTab()
+        fakeApi.nextImportBalancesResult = null // import trigger fails → importFailed arms
+        vm.startInitialImport()
+        advanceUntilIdle()
+        assertTrue(vm.importFailed)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        // Tab away to Settings and back: the failure choice persists —
+        // no auto-continue, no signal clearing.
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        assertTrue(vm.importFailed)
+        vm.openDashboardTab()
+        advanceUntilIdle()
+        assertTrue(vm.importFailed)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        // The user's explicit choice still routes normally.
+        vm.continueToDashboard()
+        advanceUntilIdle()
+        assertFalse(vm.importFailed)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    @Test
+    fun importStep_zeroAccountNotice_persistsAcrossTabAway_noAutoContinue() = runTest(testDispatcher) {
+        // The zero-account notice persists as a composed pending decision
+        // (designer confirm): tab-away does NOT dismiss it, and no silent
+        // auto-continue runs — the notice is still pending on return.
+        // Setup mirrors routeDashboard's contract.
+        vm.openDashboardTab()
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank(accounts = emptyList())), syncInProgress = false),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertNotNull(vm.zeroAccountNoticeBank)
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        assertNotNull(vm.zeroAccountNoticeBank)
+        vm.openDashboardTab()
+        advanceUntilIdle()
+        assertNotNull(vm.zeroAccountNoticeBank)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+        // Only the explicit action consumes the notice.
+        vm.continueToDashboardFromZeroAccountNotice()
+        advanceUntilIdle()
+        assertNull(vm.zeroAccountNoticeBank)
+    }
+
+    @Test
+    fun importStep_greetingDataAvailable_aboveTheConfinedStep() = runTest(testDispatcher) {
+        // Designer amendment 1 (state-machine level): the greeting
+        // renders ABOVE the confined step — which requires the username
+        // to be present while the step is composed. The resolver sets it
+        // on every authenticated dashboard route; the step never gets a
+        // blank canvas.
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        fakeApi.nextOnboardingState = dashboardRouteState()
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals("admin", vm.username)
+        // And the step arms on top of that authenticated state.
+        fakeApi.nextImportBalancesResult = SyncTriggerResult(started = true, coalesced = false, cooldownRemainingSeconds = null)
+        fakeApi.accountsDataSequence = listOf(
+            AccountsData(banks = listOf(connectedBank()), syncInProgress = true),
+        )
+        vm.startInitialImport()
+        advanceTimeBy(3100L)
+        runCurrent()
+        assertTrue(vm.importInProgress)
+        assertEquals("admin", vm.username)
+        assertEquals(Screen.Dashboard, vm.currentScreen)
+    }
+
+    // ---------------------------------------------------------------
+    // Wizard origin (4.2/D2): the overlay exits to its origin surface
+    // ---------------------------------------------------------------
+
+    @Test
+    fun addFlowFromSettings_exitsBackToSettings() = runTest(testDispatcher) {
+        // The wizard is a full-page overlay (D2): entered from Settings,
+        // the exit affordance returns there (not the dashboard).
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        vm.startAddBankFlow()
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(Screen.Settings, vm.wizardOriginScreen)
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.exitAddMode()
+        advanceUntilIdle()
+        assertEquals(Screen.Settings, vm.currentScreen)
+    }
+
+    @Test
+    fun reAuthFromSettings_exitsBackToSettings() = runTest(testDispatcher) {
+        // Same origin rule for the re-authorization flow (D2/D6).
+        vm.openSettingsTab()
+        advanceUntilIdle()
+        fakeApi.nextStartAuthResult = StartAuthResult.Ok("https://bank.example/auth")
+        vm.startReauthorizationFlow(connectedBank())
+        advanceUntilIdle()
+        assertEquals(Screen.Onboarding, vm.currentScreen)
+        assertEquals(Screen.Settings, vm.wizardOriginScreen)
+        fakeApi.accountsDataSequence = listOf(AccountsData(banks = emptyList(), syncInProgress = false))
+        vm.exitReAuthMode()
+        advanceUntilIdle()
+        assertEquals(Screen.Settings, vm.currentScreen)
+    }
+
+    /** A dashboard-route state for resolver tests. */
+    private fun dashboardRouteState(
+        everOnboarded: Boolean? = null,
+        firstConnectionImport: Boolean? = null,
+    ): OnboardingState = OnboardingState(
+        requiresRelogin = false,
+        linkingCompleted = false,
+        authCompleted = true,
+        authError = null,
+        selectedBank = null,
+        authFailed = false,
+        authErrorKind = null,
+        authorizationId = null,
+        route = "dashboard",
+        appState = null,
+        pendingAction = null,
+        onboardingStage = null,
+        stageBank = null,
+        linkedBanks = emptyList(),
+        pendingInitialImport = false,
+        environment = null,
+        everOnboarded = everOnboarded,
+        firstConnectionImport = firstConnectionImport,
+    )
 }
 
 /**
@@ -3144,6 +4133,69 @@ private class FakeApiClient : ApiClient() {
         accountsDataCallCount++
         val index = accountsDataCallCount - 1
         return if (index < accountsDataSequence.size) accountsDataSequence[index] else null
+    }
+
+    // --- Bank-connection-management fakes (remove / delete-local / import) ---
+
+    var nextImportBalancesResult: SyncTriggerResult? = null
+        set(value) {
+            field = value
+            importBalancesCallCount = 0
+        }
+    var importBalancesCallCount = 0
+        private set
+    override suspend fun importBalances(): SyncTriggerResult? {
+        importBalancesCallCount++
+        return nextImportBalancesResult
+    }
+
+    var nextRemoveConnectionResult: RemoveConnectionResult? = null
+        set(value) {
+            field = value
+            removeConnectionCalls.clear()
+        }
+    var removeConnectionCalls: MutableList<Pair<String, String>> = mutableListOf()
+    override suspend fun removeConnection(aspspName: String, aspspCountry: String): RemoveConnectionResult {
+        removeConnectionCalls.add(aspspName to aspspCountry)
+        return nextRemoveConnectionResult ?: RemoveConnectionResult.Error("not configured")
+    }
+
+    var nextDeleteLocalAccountsResult: List<Long>? = null
+        set(value) {
+            field = value
+            deleteLocalAccountsCalls.clear()
+        }
+
+    /**
+     * Sequential delete-local results for retry paths (same convention as
+     * [accountsDataSequence]): when NON-EMPTY, each call consumes the next
+     * entry — a null entry simulates a request failure — and the last entry
+     * repeats once exhausted; when EMPTY, [nextDeleteLocalAccountsResult]
+     * applies (single-response semantics, the pre-existing convention).
+     * Re-assigning resets the index AND clears [deleteLocalAccountsCalls]
+     * (same reset semantics as [nextDeleteLocalAccountsResult] — its
+     * clear-on-set is why a retry test cannot simply re-assign the
+     * single-response var between calls and still read both entries from
+     * the recorder).
+     */
+    var deleteLocalAccountsResultSequence: List<List<Long>?> = emptyList()
+        set(value) {
+            field = value
+            deleteLocalAccountsResultIndex = 0
+            deleteLocalAccountsCalls.clear()
+        }
+    private var deleteLocalAccountsResultIndex = 0
+    var deleteLocalAccountsCalls: MutableList<List<Long>> = mutableListOf()
+    override suspend fun deleteLocalAccounts(accountIds: List<Long>): List<Long>? {
+        deleteLocalAccountsCalls.add(accountIds)
+        if (deleteLocalAccountsResultSequence.isEmpty()) return nextDeleteLocalAccountsResult
+        val index = deleteLocalAccountsResultIndex
+        deleteLocalAccountsResultIndex++
+        return if (index < deleteLocalAccountsResultSequence.size) {
+            deleteLocalAccountsResultSequence[index]
+        } else {
+            deleteLocalAccountsResultSequence.last()
+        }
     }
 
     override suspend fun getLinkStatus(aspspName: String?, aspspCountry: String?): Boolean? {

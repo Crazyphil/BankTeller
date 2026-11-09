@@ -8,7 +8,7 @@ import androidx.compose.ui.graphics.Color
 private val LightBg = Color(0xFFFAF8F3)
 private val LightSurface = Color(0xFFFFFFFF)
 private val LightSurfaceContainer = Color(0xFFF5F2EB)
-private val LightPrimary = Color(0xFF1B2A4A)
+private val LightPrimary = Color(0xFF2E4A7A)
 private val LightOnPrimary = Color(0xFFFAF8F3)
 private val LightOnSurface = Color(0xFF1A1A1A)
 private val LightOnSurfaceVariant = Color(0xFF5C584F)
@@ -100,17 +100,40 @@ fun darkColorScheme() = darkColorScheme(
 
 // ── Custom semantic colors ───────────────────────────────────────────────────
 
+/**
+ * Theme-aware hairline color (task 12.1 finding: the dividers were
+ * invisible in LIGHT mode). The old treatment — `outline` at 8% alpha —
+ * works in dark (DarkOutline already carries 12% on-color alpha, so the
+ * extra 8% reads) but is imperceptible in light: LightOutline #E6E0D4 is
+ * so close to the light surfaces (#FAF8F3 background / #F5F2EB
+ * surfaceContainer) that cutting it to 8% leaves no perceivable line.
+ *
+ * The fix keeps the line quiet but VISIBLE in both themes:
+ * - LIGHT: LightOutline at FULL opacity — the exact tone the 1dp card
+ *   borders already use (the OutlinedCard hairlines read as quiet lines
+ *   on light surfaces; same vocabulary, one tone).
+ * - DARK: the previous value — DarkOutline (rgba(240,237,229,.12),
+ *   i.e. `outline` as defined) at its own opacity; the line stays as
+ *   subtle as it was.
+ */
+private val LightHairline = LightOutline
+private val DarkHairline = DarkOutline
+
 data class BankTellerColors(
     val brass: Color,
     val emerald: Color,
+    /** The 1dp hairline tone for dividers (§6.1.4/§6.1.6/§6.1.7) — theme-aware. */
+    val hairline: Color,
 )
 
 val LightBankTellerColors = BankTellerColors(
     brass = LightBrass,
     emerald = LightEmerald,
+    hairline = LightHairline,
 )
 
 val DarkBankTellerColors = BankTellerColors(
     brass = DarkBrass,
     emerald = DarkEmerald,
+    hairline = DarkHairline,
 )

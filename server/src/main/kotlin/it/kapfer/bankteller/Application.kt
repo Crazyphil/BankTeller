@@ -25,6 +25,7 @@ import it.kapfer.bankteller.onboarding.OnboardingService
 import it.kapfer.bankteller.onboarding.StateJwt
 import it.kapfer.bankteller.onboarding.accountLinkingRoutes
 import it.kapfer.bankteller.onboarding.onboardingRoutes
+import it.kapfer.bankteller.connections.connectionsRoutes
 import it.kapfer.bankteller.server.*
 import it.kapfer.bankteller.sync.BalanceSyncEngine
 import it.kapfer.bankteller.sync.syncRoutes
@@ -214,6 +215,7 @@ fun Application.module(
         onboardingRoutes(database, onboardingService, cpClient, ebClientFactory, stateJwt)
         accountLinkingRoutes(database, cpClient, ebClientFactory, stateJwt, onboardingService)
         syncRoutes(syncEngine)
+        connectionsRoutes(database, ebClientFactory)
 
         // API routes
         post("/api/login") {

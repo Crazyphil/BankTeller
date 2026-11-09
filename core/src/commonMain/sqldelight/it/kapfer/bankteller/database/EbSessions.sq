@@ -1,14 +1,23 @@
 -- Enable Banking session + account storage (server-side onboarding state).
 --
--- Cross-session account matching is by IBAN ONLY (a deliberate simplification
--- relative to the VISION.md identification-hash design): when a new session's
--- account carries an IBAN that already exists in `accounts`, the existing row
--- is updated in place (uid/currency/name refreshed) and re-pointed at the new
--- session row. Accounts arriving WITHOUT an IBAN are always inserted as new
--- rows — they may duplicate an older null-IBAN account of the same logical
--- bank account. Those orphans are cleaned up automatically when the session
--- they belonged to is deleted (see mergeSessionAccounts below), so blast
--- radius is limited.
+-- Cross-session account matching is a two-step cascade (design D16):
+--   1. identification_hash FIRST — Enable Banking's primary cross-session
+--      account match key, documented as usable "for matching accounts between
+--      multiple sessions (even in case the sessions are authorized by
+--      different PSUs)", and present for IBAN-less accounts where IBAN
+--      matching can never succeed. The lookup is GLOBAL (no session scoping),
+--      mirroring the IBAN lookup's cross-session/cross-PSU property.
+--   2. IBAN FALLBACK for stored rows carrying no hash (pre-migration rows,
+--      or a malformed response that dropped the hash) — the prior behavior
+--      with its global-uniqueness property intact; a fallback match persists
+--      the incoming hash onto the row (self-healing upgrade to primary-key
+--      matching).
+-- A matched account keeps its row (and thus its `balances`): the update
+-- refreshes uid/iban/currency/name/identification_hash, re-points the row at
+-- the new session and restores `in_consent = 1`. Accounts matching nothing by
+-- either key are inserted as new rows; accounts of a superseded same-bank
+-- session that match nothing are kept as local copies (`in_consent = 0`),
+-- never deleted.
 
 CREATE TABLE eb_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -18,7 +27,8 @@ CREATE TABLE eb_sessions (
     psu_type TEXT,
     created_at INTEGER NOT NULL,
     valid_until TEXT,
-    logo TEXT
+    logo TEXT,
+    bic TEXT
 );
 
 CREATE TABLE accounts (
@@ -27,7 +37,9 @@ CREATE TABLE accounts (
     iban TEXT,
     uid TEXT,
     currency TEXT,
-    name TEXT
+    name TEXT,
+    identification_hash TEXT,
+    in_consent INTEGER NOT NULL DEFAULT 1
 );
 
 -- ---------------------------------------------------------------------------
@@ -35,14 +47,17 @@ CREATE TABLE accounts (
 -- ---------------------------------------------------------------------------
 
 insertSession:
-INSERT INTO eb_sessions(session_id, aspsp_name, aspsp_country, psu_type, created_at, valid_until, logo)
-VALUES (?, ?, ?, ?, ?, ?, ?);
+INSERT INTO eb_sessions(session_id, aspsp_name, aspsp_country, psu_type, created_at, valid_until, logo, bic)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 updateSessionConsent:
 UPDATE eb_sessions SET valid_until = ? WHERE id = ?;
 
 selectSessionBySessionId:
 SELECT * FROM eb_sessions WHERE session_id = ?;
+
+selectSessionById:
+SELECT * FROM eb_sessions WHERE id = ?;
 
 selectSessionsByBank:
 SELECT * FROM eb_sessions WHERE aspsp_name = ? AND aspsp_country = ?;
@@ -64,8 +79,18 @@ DELETE FROM eb_sessions;
 -- ---------------------------------------------------------------------------
 
 insertAccount:
-INSERT INTO accounts(session_id, iban, uid, currency, name)
-VALUES (?, ?, ?, ?, ?);
+INSERT INTO accounts(session_id, iban, uid, currency, name, identification_hash)
+VALUES (?, ?, ?, ?, ?, ?);
+
+selectAccountById:
+SELECT * FROM accounts WHERE id = ?;
+
+-- Global scope (no session scoping) — consistent with EB's cross-session/
+-- cross-PSU documentation. Duplicates may exist (defensive): consumers MUST
+-- resolve with executeAsList().firstOrNull(), NEVER a throwing single-row
+-- query.
+selectAccountByIdentificationHash:
+SELECT * FROM accounts WHERE identification_hash = ?;
 
 selectAccountsByIban:
 SELECT * FROM accounts WHERE iban = ?;
@@ -73,10 +98,37 @@ SELECT * FROM accounts WHERE iban = ?;
 selectAccountsBySessionIds:
 SELECT * FROM accounts WHERE session_id IN ?;
 
+-- Matched account (by identification_hash or IBAN fallback): refreshed in
+-- place (uid, iban, currency, name, identification_hash), re-pointed at the
+-- new session, `in_consent` restored to 1 — an IBAN-matched or hash-matched
+-- account is by definition within the new authorization's account filter, so a
+-- kept-as-local-copy account (0) that returns in a later authorization becomes
+-- a live synced account again, and a true IBAN change with a stable hash
+-- updates the row instead of duplicating it.
 updateAccountSessionAndFields:
 UPDATE accounts
-SET session_id = ?, uid = ?, currency = ?, name = ?
+SET session_id = ?, uid = ?, iban = ?, currency = ?, name = ?, identification_hash = ?, in_consent = 1
 WHERE id = ?;
+
+-- Re-points a kept-as-local-copy account at a new session row WITHOUT touching
+-- its uid/iban/currency/name/identification_hash (unlike
+-- updateAccountSessionAndFields, which refreshes them). Used by the merge's
+-- default-keep semantics (accounts of a superseded same-bank session missing
+-- from the new import are kept, not deleted).
+updateAccountSessionKeepLocal:
+UPDATE accounts SET session_id = ?, in_consent = 0 WHERE id = ?;
+
+-- The local-copy deletion path: only kept-as-local-copy accounts
+-- (in_consent = 0) are ever per-account deletable. The WHERE clause enforces
+-- this at the query level — live accounts are never deletable here.
+deleteLocalCopyAccountById:
+DELETE FROM accounts WHERE id = ? AND in_consent = 0;
+
+-- Remove-connection cleanup: deletes all accounts of one session (including
+-- kept-as-local-copy accounts); their balances and the session's sync_log rows
+-- are deleted in the same transaction by the wrapper (see EbSessionStore).
+deleteAccountsBySessionId:
+DELETE FROM accounts WHERE session_id = ?;
 
 deleteAccountsByIds:
 DELETE FROM accounts WHERE id IN ?;

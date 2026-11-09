@@ -4,6 +4,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.api.createClientPlugin
+import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -86,13 +87,24 @@ sealed class StartAuthResult {
     data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : StartAuthResult()
 }
 
-/** An account resource as returned in the `POST /sessions` response's `accounts[]`. */
+/**
+ * An account resource as returned in the `POST /sessions` response's `accounts[]`.
+ *
+ * `identification_hash` is Enable Banking's primary cross-session account match
+ * key (documented as usable "for matching accounts between multiple sessions
+ * (even in case the sessions are authorized by different PSUs)") — REQUIRED by
+ * EB's schema; nullable in BankTeller's type only because a malformed response
+ * could drop it (a null value never means an account lacking identity). The
+ * parser is tolerant of unknown fields but MUST NOT drop `identification_hash`.
+ */
 @Serializable
 data class AccountResource(
     val uid: String? = null,
     val iban: String? = null,
     val currency: String? = null,
     val name: String? = null,
+    @SerialName("identification_hash")
+    val identificationHash: String? = null,
 )
 
 sealed class AuthorizeSessionResult {
@@ -216,6 +228,22 @@ sealed class SessionResult {
         val accountUids: List<String>,
     ) : SessionResult()
     data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : SessionResult()
+}
+
+/**
+ * Outcome of `DELETE /sessions/{session_id}`. Best-effort by contract: EB
+ * closes the EB-side session and the PSU's bank-side consent "automatically if
+ * possible" (ASPSP-dependent — the bank-side closure is never promised).
+ *
+ * `Ok` covers both 200 (deleted) and 404 (already gone — the caller's purpose
+ * is achieved either way). Anything else (network error, 5xx) is an honest
+ * [Error] that the caller reports but never blocks user-initiated removal on.
+ * No retry exists — no revocation-retry queue (spec: enable-banking-client
+ * data-plane session deletion).
+ */
+sealed class DeleteSessionResult {
+    data object Ok : DeleteSessionResult()
+    data class Error(val statusCode: Int?, val errorCode: String?, val message: String) : DeleteSessionResult()
 }
 
 @Serializable
@@ -504,6 +532,28 @@ open class EnableBankingClient(
             }
         } catch (e: Exception) {
             SessionResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
+        }
+    }
+
+    /**
+     * Deletes an EB session — `DELETE /sessions/{sessionId}`. RS256 JWT auth
+     * via the installed plugin. Best-effort: 200 → the session is gone; 404 →
+     * already gone (both [DeleteSessionResult.Ok]). Network errors and 5xx
+     * surface as an honest [DeleteSessionResult.Error]. No retry.
+     */
+    open suspend fun deleteSession(sessionId: String): DeleteSessionResult {
+        return try {
+            val response = client.delete("https://api.enablebanking.com/sessions/$sessionId")
+            val body = response.bodyAsText()
+            when {
+                response.status.isSuccess() || response.status.value == 404 -> DeleteSessionResult.Ok
+                else -> {
+                    val (errorCode, message) = parseErrorBody(body, response.status.description)
+                    DeleteSessionResult.Error(response.status.value, errorCode, message)
+                }
+            }
+        } catch (e: Exception) {
+            DeleteSessionResult.Error(statusCode = null, errorCode = null, message = e.message ?: "Unknown error")
         }
     }
 

@@ -222,5 +222,81 @@ class ApiClientParsingTest {
         assertNull(banks[1].psuType)
     }
 
+    // ---------------------------------------------------------------
+    // parseAccountsData — the signal-level bank_name (13.3, review F4)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun parseAccountsData_signalBankName_prefersTheSignalSibling_overThePerBankField() {
+        // The wire carries TWO `bank_name` spellings: the per-bank field
+        // INSIDE the banks array (earlier in the wire) and the signal's
+        // SIBLING field after `missing_accounts` (later). The signal
+        // parse must anchor on the top-level `missing_accounts` and read
+        // the sibling — never the per-bank field.
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh","accounts":[]}],
+             "missing_accounts":[{"id":7,"name":"Salary","iban":"DE11","newly_missing":true}],
+             "bank_name":"Demo Bank"}
+        """.trimIndent()
+        val data = data(json)
+        assertEquals(1, data.missingAccounts.size)
+        assertEquals("Demo Bank", data.missingAccountsBankName)
+    }
+
+    @Test
+    fun parseAccountsData_signalBankName_distinguishesFromThePerBankName() {
+        // Same spelling, DIFFERENT values: the per-bank field says
+        // "Other Bank" (a second connected bank's row) while the signal
+        // names the re-authorized "Demo Bank" — the parse must take the
+        // SIBLING, proving the anchor (a first-occurrence extraction
+        // would grab the per-bank value).
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Other Bank","bank_country":"DE","sync_state":"fresh","accounts":[]}],
+             "missing_accounts":[{"id":7,"name":"Salary","iban":"DE11","newly_missing":false}],
+             "bank_name":"Demo Bank"}
+        """.trimIndent()
+        assertEquals("Demo Bank", data(json).missingAccountsBankName)
+    }
+
+    @Test
+    fun parseAccountsData_signalBankName_nullWhenJsonNull() {
+        // The callback lacked the name → the server emits JsonNull — the
+        // degrade contract (the client stash remains the null-fallback).
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh","accounts":[]}],
+             "missing_accounts":[{"id":7,"name":"Salary","iban":"DE11","newly_missing":true}],
+             "bank_name":null}
+        """.trimIndent()
+        assertNull(data(json).missingAccountsBankName)
+    }
+
+    @Test
+    fun parseAccountsData_signalBankName_absentOnAPrechangeServer() {
+        // A server predating the change carries no signal sibling at all
+        // (and no missing_accounts): null, never a guess.
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh","accounts":[]}]}
+        """.trimIndent()
+        assertNull(data(json).missingAccountsBankName)
+        assertTrue(data(json).missingAccounts.isEmpty())
+    }
+
+    @Test
+    fun parseAccountsData_signalBankName_nullWhenTheSignalIsNotCarried() {
+        // The one-shot lifetime: the sibling is JsonNull whenever the
+        // signal is not carried (the server emits both as JsonNull).
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh","accounts":[]}],
+             "missing_accounts":null,
+             "bank_name":null}
+        """.trimIndent()
+        assertNull(data(json).missingAccountsBankName)
+    }
+
     private fun data(json: String): AccountsData = api.parseAccountsData(json)!!
 }

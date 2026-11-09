@@ -11,6 +11,7 @@ import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.Environment
+import it.kapfer.bankteller.server.MissingAccountSignalStore
 import it.kapfer.bankteller.server.UserSession
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
@@ -144,22 +145,33 @@ fun Route.onboardingRoutes(
                             try {
                                 // The authorize response's `aspsp` object uses EB's
                                 // minimal ASPSP schema (name + country only — no
-                                // logo, per the OpenAPI). The logo staged at
-                                // POST /api/auth (from the already-fetched bank
-                                // list) is the authoritative fallback.
-                                ebSessionStore.mergeSession(
+                                // logo/BIC, per the OpenAPI). The logo and BIC
+                                // staged at POST /api/auth (from the already-fetched
+                                // bank list) are the authoritative fallback.
+                                val mergeOutcome = ebSessionStore.mergeSession(
                                     sessionId = result.sessionId,
                                     aspspName = result.aspsp?.name,
                                     aspspCountry = result.aspsp?.country,
                                     psuType = result.psuType,
                                     accounts = result.accounts.map {
-                                        EbSessionStore.MergedAccount(it.iban, it.uid, it.currency, it.name)
+                                        EbSessionStore.MergedAccount(
+                                            iban = it.iban,
+                                            uid = it.uid,
+                                            currency = it.currency,
+                                            name = it.name,
+                                            identificationHash = it.identificationHash,
+                                        )
                                     },
                                     validUntil = result.access?.validUntil,
                                     logo = result.aspsp?.logo?.takeIf { it.isNotEmpty() }
                                         ?: session.stageAspspLogo,
+                                    bic = result.aspsp?.bic?.takeIf { it.isNotEmpty() }
+                                        ?: session.stageAspspBic,
                                 )
-                                logger.info("EB callback: session persisted, stage cleared, pendingInitialImport set")
+                                logger.info(
+                                    "EB callback: session persisted, stage cleared, pendingInitialImport set ({} missing accounts kept, firstConnection={})",
+                                    mergeOutcome.missingAccounts.size, mergeOutcome.firstConnection,
+                                )
                                 call.sessions.set(
                                     session.copy(
                                         authError = null,
@@ -179,12 +191,53 @@ fun Route.onboardingRoutes(
                                         sessionid = null,
                                         stageSessionBaseUrl = null,
                                         stageAspspLogo = null,
+                                        stageAspspBic = null,
                                         // One-shot signal (spec: wizard-initial-import):
                                         // a freshly authorized session's initial
                                         // balance import is pending. Cleared on the
                                         // next GET /api/onboarding/state read.
                                         pendingInitialImport = true,
+                                        // One-shot signal (spec: onboarding —
+                                        // zero-account notice, amended): the merge
+                                        // says this was the FIRST connection ever
+                                        // (eb_sessions 0 → 1). Set ONLY then — an
+                                        // ever-onboarded user's reconnect is never
+                                        // a first connection (the marker flips
+                                        // inside this transaction and cannot
+                                        // distinguish the two on the redirect cold
+                                        // boot). Consumed-and-cleared by the FIRST
+                                        // GET /api/onboarding/state read, exactly
+                                        // the pendingInitialImport pattern.
+                                        // OR-composed (delta review F1-2): a
+                                        // defensive re-delivery whose idempotency
+                                        // guard reports firstConnection=false
+                                        // must never DISARM an already-armed
+                                        // genuine signal — not arming is not
+                                        // license to clobber.
+                                        firstConnectionImport = session.firstConnectionImport == true || mergeOutcome.firstConnection,
                                     ),
+                                )
+                                // One-shot informational signal (spec:
+                                // onboarding — email-link callback route,
+                                // modified): accounts of the previous
+                                // same-bank session kept as local copies.
+                                // Stored SERVER-SIDE, in-memory (review F6
+                                // ruling: the set is merge-computed server
+                                // data — never a cookie payload; volatile
+                                // by design, the registrationInProgress
+                                // pattern); carried — and cleared — by the
+                                // next GET /api/accounts response (the
+                                // callback serves the SPA bundle, not
+                                // JSON). The bank name rides the signal
+                                // (review F4: the redirect cold boot wipes
+                                // the client's reAuthBank stash, so the
+                                // dialog's "at {bank}" copy can only come
+                                // from here — in-memory only, NEVER a
+                                // database row).
+                                MissingAccountSignalStore.store(
+                                    username = session.username,
+                                    bankName = result.aspsp?.name ?: session.stageAspspName,
+                                    accounts = mergeOutcome.missingAccounts,
                                 )
                             } catch (e: Exception) {
                                 logger.warn("Failed to persist EB session ${result.sessionId}", e)

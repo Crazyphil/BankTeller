@@ -557,6 +557,7 @@ fun Route.accountLinkingRoutes(
                             stageAspspCountry = request.aspsp_country,
                             stagePsuType = request.psu_type,
                             stageAspspLogo = aspsp.logo,
+                            stageAspspBic = aspsp.bic.takeIf { it.isNotBlank() },
                         ),
                     )
                     call.respond(buildJsonObject {
@@ -828,6 +829,10 @@ fun Route.accountLinkingRoutes(
         )
 
         val authCompleted = ebSessionStore.hasAnySession()
+        // Ever-onboarded marker (spec: database — ever-onboarded marker):
+        // routing state derived as marker-present OR sessions-exist
+        // (backfill-on-read), resolved here so the resolver stays pure.
+        val everOnboarded = ebSessionStore.isEverOnboarded()
         val authError = session.authError
 
         // Cached control-plane application-state derivation (30 s TTL) — the
@@ -841,10 +846,14 @@ fun Route.accountLinkingRoutes(
         val sandboxEnvironment = status.environment == Environment.SANDBOX.name
 
         // auth_failed: an auth error is only meaningful once linking completed
-        // (or the application is sandbox, which skips linking) and auth has NOT
-        // yet completed (design D3). Before linking, or after a successful
-        // auth, the error is stale/irrelevant.
-        val authFailed = authError != null && !authCompleted && (linkingCompleted || sandboxEnvironment)
+        // (or the application is sandbox, which skips linking) and the user
+        // has NEVER completed onboarding. An ever-onboarded user's failed
+        // re-authorization is a dashboard notice (presentation signal), not a
+        // wizard regression — the flag stays false for them (spec:
+        // onboarding-view-position — auth_failed rung gains the ever-onboarded
+        // guard). Before linking, or after a successful auth, the error is
+        // stale/irrelevant.
+        val authFailed = authError != null && !everOnboarded && (linkingCompleted || sandboxEnvironment)
 
         val appState = when (status.appState) {
             EbApplicationState.DELETED -> "deleted"
@@ -883,7 +892,7 @@ fun Route.accountLinkingRoutes(
                 applicationIdPresent = !applicationId.isNullOrBlank(),
                 appState = status.appState,
                 linkingCompleted = linkingCompleted,
-                authCompleted = authCompleted,
+                everOnboarded = everOnboarded,
                 authFailed = authFailed,
                 onboardingStage = session.onboardingStage,
                 stageBankKnown = stageBankKnown,
@@ -896,21 +905,42 @@ fun Route.accountLinkingRoutes(
             ),
         )
 
-        // One-shot pending_initial_import signal (spec: wizard-initial-import):
-        // reported and cleared in the same read. The signal is set in the
-        // auth-callback success path; the FIRST state read after the callback
-        // consumes it (the SPA then runs the wizard import step). A reload
-        // before the SPA consumed it re-reads it — but once consumed it never
-        // reappears (reload routes per the normal resolver).
+        // One-shot pending_initial_import signal (spec: wizard-initial-import)
+        // and one-shot first_connection_import signal (spec: onboarding —
+        // zero-account notice, amended; review F1): both reported and cleared
+        // in the same read, in a SINGLE session write. Set at the auth callback
+        // — pendingInitialImport on every successful authorization,
+        // firstConnectionImport ONLY when the merge outcome says first-
+        // connection (eb_sessions 0 → 1; the ever-onboarded marker flips inside
+        // the same merge transaction and cannot distinguish a genuine first
+        // connection from an ever-onboarded reconnect after the redirect cold
+        // boot). The FIRST state read after the callback consumes them (the
+        // SPA then runs the wizard import step, its zero-account detection
+        // keyed on first_connection_import). A reload before the SPA consumed
+        // them re-reads them — but once consumed they never reappear.
+        //
+        // ONE call.sessions.set for both: two chained writes would emit two
+        // Set-Cookie headers from the same original session (each copy starts
+        // from the stale original), and the client may honor either — the
+        // second field would appear to "survive" its clear.
         val pendingInitialImport = session.pendingInitialImport == true
-        if (pendingInitialImport) {
-            call.sessions.set(session.copy(pendingInitialImport = null))
+        val firstConnectionImport = session.firstConnectionImport == true
+        if (pendingInitialImport || firstConnectionImport) {
+            call.sessions.set(
+                session.copy(pendingInitialImport = null, firstConnectionImport = null),
+            )
         }
 
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
             put("linking_completed", linkingCompleted)
             put("auth_completed", authCompleted)
+            // Ever-onboarded marker exposed to the SPA (spec: database —
+            // ever-onboarded marker; onboarding — zero-account notice): the
+            // first-connection predicate derives from this server-side truth,
+            // never from client-side mode snapshots (a redirect cold boot
+            // wipes those).
+            put("ever_onboarded", everOnboarded)
             put("auth_error", authError)
             put("auth_error_kind", session.authErrorKind)
             put("authorization_id", session.authorizationId)
@@ -924,6 +954,7 @@ fun Route.accountLinkingRoutes(
             put("stage_bank", stageBank)
             put("linked_banks", linkedBanks)
             put("pending_initial_import", pendingInitialImport)
+            put("first_connection_import", firstConnectionImport)
         })
     }
 

@@ -289,7 +289,7 @@ class BalancesSyncLogTest {
     // =====================================================================
 
     @Test
-    fun `re-auth same-bank purge removes balances and sync_log of superseded sessions`() {
+    fun `re-auth same-bank keeps missing accounts and balances but purges the superseded session sync_log`() {
         val (database, store) = createStore()
         // Old session of Test Bank with an account, a balance row, and sync history.
         store.mergeSession(
@@ -317,21 +317,29 @@ class BalancesSyncLogTest {
         database.balancesQueries.upsertBalance(otherAccountId, "50.00", "EUR", "CLBD", null, 1500L)
         database.balancesQueries.insertSyncLog(otherSessionRowId, "login", 1500L, 2500L, "success", null, null)
 
-        // Re-auth of Test Bank with a DIFFERENT iban → old session + its
-        // account + its balance + its sync_log rows must all be purged.
-        store.mergeSession(
+        // Re-auth of Test Bank with a DIFFERENT iban → the old session row is
+        // superseded (its sync_log rows purged in the same transaction), but the
+        // old account is KEPT as a local copy (in_consent = 0) with its balance
+        // surviving (design D8/D9 — deletion simply stops happening).
+        val mergeOutcome = store.mergeSession(
             sessionId = "new-sess",
             aspspName = "Test Bank",
             aspspCountry = "DE",
             psuType = "personal",
             accounts = listOf(EbSessionStore.MergedAccount(iban = "DE2", uid = "u3", currency = "EUR", name = "Giro")),
         )
+        val missing = mergeOutcome.missingAccounts
 
         assertEquals(listOf("new-sess", "other-bank"), database.sessionIdsCompat().sorted())
-        // Old account gone, new + other-bank accounts remain.
-        assertEquals(2L, database.ebSessionsQueries.countAccounts().executeAsOne())
-        assertEquals(null, database.balancesQueries.selectBalanceByAccountId(oldAccountId).executeAsOneOrNull())
+        // Kept copy (DE1) + new account (DE2) + other-bank account (FR1).
+        assertEquals(3L, database.ebSessionsQueries.countAccounts().executeAsOne())
+        // The kept account's balance survives untouched.
+        assertEquals("100.00", database.balancesQueries.selectBalanceByAccountId(oldAccountId).executeAsOne().balance_amount)
+        // The superseded session's sync_log rows are deleted in the same transaction.
         assertEquals(0L, database.balancesQueries.countSyncLogsBySessionId(oldSessionRowId).executeAsOne())
+        // The kept account is reported as newly missing.
+        assertEquals(1, missing.size)
+        assertTrue(missing.single().newlyMissing)
         // Surviving bank's data intact.
         assertEquals("50.00", database.balancesQueries.selectBalanceByAccountId(otherAccountId).executeAsOne().balance_amount)
         assertEquals(1L, database.balancesQueries.countSyncLogsBySessionId(otherSessionRowId).executeAsOne())

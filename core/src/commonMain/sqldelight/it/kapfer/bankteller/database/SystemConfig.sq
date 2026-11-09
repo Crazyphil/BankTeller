@@ -8,3 +8,6 @@ SELECT value FROM system_config WHERE key = ?;
 
 insertOrReplace:
 INSERT OR REPLACE INTO system_config(key, value) VALUES (?, ?);
+
+deleteValue:
+DELETE FROM system_config WHERE key = ?;

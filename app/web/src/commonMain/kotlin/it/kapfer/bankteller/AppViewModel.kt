@@ -22,9 +22,16 @@ import it.kapfer.bankteller.onboarding.wizardFlowContextFor
  * [Screen.Loading] is the transient cold-start routing state (design D5): it is
  * the initial value until [checkAuth] completes, and every branch of
  * [checkAuth]/[checkOnboardingStatus] sets a concrete screen (Login/Dashboard/
- * Onboarding), so Loading is never a resting state.
+ * Onboarding/Settings), so Loading is never a resting state.
+ *
+ * [Screen.Settings] (bank-connection-management D2/D3) is the second top-level
+ * authenticated surface, reachable ONLY via client-side tab switching from the
+ * dashboard ([AppViewModel.openSettingsTab] / [AppViewModel.openDashboardTab])
+ * — the resolver never routes there (a cold boot always lands on the resolver's
+ * destination). It APPENDS at the end of the enum: the ordinal positions of the
+ * pre-existing members are part of the AppViewModelSmokeTest contract.
  */
-enum class Screen { Loading, Login, Onboarding, Dashboard }
+enum class Screen { Loading, Login, Onboarding, Dashboard, Settings }
 
 /** Steps within the Enable Banking onboarding flow. */
 enum class OnboardingStep {
@@ -73,6 +80,23 @@ data class ProductionFieldOverrides(
 )
 
 /**
+ * The stashed one-shot missing-accounts signal (D14) with the bank of the
+ * re-authorization captured AT STASH TIME (the flow the user just
+ * completed): the signal items themselves carry no bank, and the
+ * redirect/cold boot wipes the view model's flow state before the dialog
+ * renders — so [MissingAccountsSignal.bankName] rides WITH the stash.
+ * The dialog copy renders "at <bankName>" honestly; null degrades by
+ * dropping the "at X" clause entirely (an account holder's name is never
+ * a bank, and no fake label is ever fabricated).
+ */
+data class MissingAccountsSignal(
+    /** The kept-as-local-copy accounts reported by the merge (D14). */
+    val accounts: List<MissingAccount>,
+    /** The re-authorized bank's name when the flow state was live at stash time; null otherwise. */
+    val bankName: String? = null,
+)
+
+/**
  * The pre-selected bank of a direct re-authorization flow (spec:
  * account-overview consent health — tasks 9.3/9.5; onboarding 10.1/10.2):
  * entered from the dashboard's consent notices or the auth-failure notice's
@@ -114,6 +138,17 @@ class AppViewModel(
     // ---------------------------------------------------------------
 
     var currentScreen: Screen by mutableStateOf(Screen.Loading)
+        private set
+
+    /**
+     * The surface the wizard was entered from (bank-connection-management
+     * D2: the wizard is a full-page OVERLAY that exits back to its origin
+     * surface). [Screen.Dashboard] while no wizard flow is active (the
+     * historical default — every exit path previously abandoned to the
+     * dashboard); [Screen.Settings] while an add-mode or re-authorization
+     * flow was started from the Settings bank connections section.
+     */
+    var wizardOriginScreen: Screen by mutableStateOf(Screen.Dashboard)
         private set
 
     var isAuthenticated: Boolean by mutableStateOf(false)
@@ -394,7 +429,135 @@ class AppViewModel(
     var importFailed: Boolean by mutableStateOf(false)
         private set
 
-    /** Non-null while the dashboard poll (accounts while sync in flight) is active. */
+    /**
+     * Zero-account notice (bank-connection-management D11, spec: onboarding —
+     * zero-account notice on first-connection import): armed when the
+     * import step completes and the FIRST-ever connection's bank yields an
+     * empty accounts list in the fresh payload; consumed by either footer
+     * action. Null means no notice.
+     *
+     * Gating (D11, re-keyed on the one-shot first-connection signal —
+     * 13.1/F1): fires ONLY on the genuine onboarding FIRST connection —
+     * the server's one-shot `first_connection_import` signal says the
+     * just-completed merge was the first connection, the payload shows
+     * the just-connected bank as the ONLY bank sharing zero accounts,
+     * and no missing-accounts signal was reported. An ever-onboarded
+     * user (remove-all-then-reconnect) never sees it again; a
+     * re-authorization narrowing to zero accounts is covered by the
+     * missing-accounts dialog instead.
+     */
+    var zeroAccountNoticeBank: BankData? by mutableStateOf(null)
+        private set
+
+    /**
+     * Ever-onboarded marker (11.13/F7): server-side first-connection truth
+     * from `GET /api/onboarding/state`'s `ever_onboarded` field — TRUE once
+     * the first `eb_sessions` row was ever created, false when the user has
+     * NEVER completed onboarding. Stashed on every state read (cold boot,
+     * login, and the registration-progress re-route poll). Null = unknown
+     * (a server predating the change) — the zero-account detection falls
+     * back to the pre-change client-side mode-snapshot tolerance.
+     */
+    var everOnboarded: Boolean? by mutableStateOf(null)
+        private set
+
+    /**
+     * One-shot first-connection signal (13.1, review F1): the server-side
+     * truth that the JUST-completed merge was the genuine FIRST
+     * connection — stashed from `GET /api/onboarding/state`'s
+     * `first_connection_import` field (consumed-and-cleared by that very
+     * read, exactly the pending_initial_import pattern). The
+     * ever-onboarded marker flips to true INSIDE the merge transaction,
+     * before the redirect cold boot's state read, so the marker can
+     * never distinguish the genuine first connection from an
+     * ever-onboarded reconnect — THIS signal is the zero-account
+     * notice's first-connection key. Null = unknown (a server predating
+     * the change) → the detection falls back to the ever-onboarded
+     * marker / mode-snapshot chain (the transitional tolerance).
+     */
+    var firstConnectionImport: Boolean? by mutableStateOf(null)
+        private set
+
+    // ---------------------------------------------------------------
+    // Bank connections (bank-connection-management)
+    // ---------------------------------------------------------------
+
+    /**
+     * Stashed one-shot missing-accounts payload (D14): set by
+     * [refreshAccounts]/[startInitialImport] when a GET /api/accounts
+     * response carries a non-empty `missing_accounts` signal (the payload
+     * reverts to null on the NEXT fetch, so it is stashed here exactly
+     * once), cleared by the dialog's keep/delete actions. Non-null means
+     * the missing-accounts dialog renders — on EVERY detection (no
+     * remember-preference; a rare event needs no machinery).
+     *
+     * [MissingAccountsSignal.bankName] carries the bank of the
+     * re-authorization (captured from [reAuthBank] AT STASH TIME — the
+     * flow the user just completed; the redirect/cold boot wipes it
+     * before the dialog renders, so it rides WITH the stash): the dialog
+     * copy renders "at <bankName>" honestly — an account holder's name
+     * is never a bank. Null when no flow bank is known (cold boot) — the
+     * copy degrades by dropping the "at X" clause entirely.
+     */
+    var missingAccountsSignal: MissingAccountsSignal? by mutableStateOf(null)
+        private set
+
+    /**
+     * True while a removal (POST /api/connections/remove) is in flight for
+     * the bank in [removingBankName] — guards double-triggering while the
+     * confirmation dialog's action is executing.
+     */
+    var removingBankName: String? by mutableStateOf(null)
+        private set
+
+    /**
+     * Honest one-line report of a COMPLETED removal whose Enable Banking
+     * delete failed (D7: eb_deleted=false — the removal still happened
+     * locally; the authorization remains active at the bank until its
+     * consent expiry). Rendered in the connections section as a
+     * dismissible brass warning panel that PERSISTS until the user
+     * dismisses it ([clearRemoveCaveat]) — a data refresh never clears
+     * it (the caveat outlives the payload that produced it; only the
+     * user's dismissal ends it). Null when no caveat is pending.
+     */
+    var removeCaveat: String? by mutableStateOf(null)
+        private set
+
+    /** Non-null while a local-copy deletion (POST /api/accounts/delete-local) is in flight. */
+    var deletingLocalAccountId: Long? by mutableStateOf(null)
+        private set
+
+    /**
+     * The local-copy deletion confirmation dialog's target account (task
+     * 11.3 ruling — one-click deletion never happens); null when the
+     * dialog is closed.
+     */
+    var deleteDialogAccount: AccountData? by mutableStateOf(null)
+        private set
+
+    /** The removal dialog's target bank (name, country); null when the dialog is closed. */
+    var removeDialogBank: Pair<String, String>? by mutableStateOf(null)
+        private set
+
+    /** Non-null while a server request initiated from the Settings surface failed (honest error). */
+    var settingsError: String? by mutableStateOf(null)
+        private set
+
+    /** Non-null while the 404 re-sync path (remove dialog) has a message to show. */
+    var removeError: String? by mutableStateOf(null)
+        private set
+
+    /**
+     * In-dialog error slot for the missing-accounts dialog (F4): set when
+     * its "Delete newly missing data" action fails, rendered INSIDE the
+     * dialog (the dialog renders on the dashboard — a [settingsError]
+     * would be invisible there; the dialog must show its own failure).
+     * Cleared on retry (a new delete attempt) and on dialog close.
+     */
+    var missingAccountsError: String? by mutableStateOf(null)
+        private set
+
+    /** Non-null while the account polls are active. */
     private var accountsPollJob: Job? = null
 
     /** Non-null while a cooldown tick timer is active. */
@@ -541,6 +704,29 @@ class AppViewModel(
     // ---------------------------------------------------------------
 
     /**
+     * Client-side tab switch to the Settings surface
+     * (bank-connection-management D2/D3, spec: app-navigation): a pure
+     * state change — no page reload, no server round-trip, no back stack.
+     * The Settings screen's own entry effect performs the
+     * stale-while-revalidate accounts fetch when needed (the bank
+     * connections section consumes the shared payload). The resolver
+     * NEVER routes here; only the tab bar calls this.
+     */
+    fun openSettingsTab() {
+        currentScreen = Screen.Settings
+    }
+
+    /**
+     * Client-side tab switch back to the dashboard. Pure state change —
+     * no reload, no server call (stale-while-revalidate: the data shown
+     * on return is the last-known payload; the dashboard's entry effect
+     * refreshes when appropriate).
+     */
+    fun openDashboardTab() {
+        currentScreen = Screen.Dashboard
+    }
+
+    /**
      * Fetches GET /api/accounts into [accountsData]. Stale-while-revalidate
      * (design D6): a failed fetch keeps the last-known data — the dashboard
      * never blocks on a transient error. Does NOT set [isLoading] (a data
@@ -552,6 +738,32 @@ class AppViewModel(
             val data = apiClient.getAccounts()
             if (data != null) {
                 accountsData = data
+                // One-shot missing-accounts signal (D14): stash it when this
+                // very response carries it — the next fetch reverts to null,
+                // so this is the only place it can be captured. The bank of
+                // the re-authorization rides WITH the stash (captured from
+                // reAuthBank at stash time — the flow the user just
+                // completed; the redirect/cold boot wipes it before the
+                // dialog renders). The dialog renders from the stash on
+                // EVERY detection (no remember-preference). Cleared by the
+                // dialog's actions (keep / delete), never silently dropped.
+                if (data.missingAccounts.isNotEmpty()) {
+                    missingAccountsSignal = MissingAccountsSignal(
+                        accounts = data.missingAccounts,
+                        // The bank of the re-authorization (13.3/F4): the
+                        // SERVER-side signal bank name wins when present
+                        // (the redirect cold boot wipes the client
+                        // reAuthBank stash before this fetch carries the
+                        // signal — the "at {bank}" copy can only come
+                        // from the server); the client stash remains the
+                        // null-fallback for a pre-change server.
+                        bankName = data.missingAccountsBankName ?: reAuthBank?.name,
+                    )
+                    // A fresh detection opens a clean dialog (F4): a stale
+                    // error from a prior failed delete attempt never
+                    // bleeds into the new one.
+                    missingAccountsError = null
+                }
                 if (data.syncInProgress) {
                     startAccountsPoll()
                 } else {
@@ -609,6 +821,16 @@ class AppViewModel(
     fun startInitialImport() {
         importInProgress = true
         importFailed = false
+        // Flow-mode snapshot (task 11.1): the import step's zero-account
+        // notice arms ONLY in onboarding mode. The mode flags are read ONCE
+        // here — the poll below can outlive in-session flag changes, and in
+        // the sandbox environment the add-mode flow continues in-session
+        // (popup completion, no redirect), so the flags are live and
+        // meaningful at this point. The import step itself ROUTES
+        // NORMALLY in every mode (add-mode included) — the mode only gates
+        // the NOTICE, never the routing (the connection is stored
+        // regardless; D11's no-gating rule).
+        val importInOnboardingMode = !addModeActive && !reAuthActive
         viewModelScope.launch {
             val result = apiClient.importBalances()
             if (result == null || !result.started) {
@@ -626,9 +848,67 @@ class AppViewModel(
                     continue // transient fetch failure — keep waiting
                 }
                 accountsData = data
+                // The signal may arrive on ANY accounts fetch (D14) — the
+                // import-step poll is one of them. Stash it (the bank of the
+                // re-authorization rides with the stash, captured from
+                // reAuthBank at stash time); the dialog renders once the
+                // import step has completed (the wizard is a full-page
+                // overlay — the dialog must not pop over it) or immediately
+                // when on the dashboard.
+                if (data.missingAccounts.isNotEmpty()) {
+                    missingAccountsSignal = MissingAccountsSignal(
+                        accounts = data.missingAccounts,
+                        // The bank of the re-authorization (13.3/F4): the
+                        // SERVER-side signal bank name wins when present
+                        // (the redirect cold boot wipes the client
+                        // reAuthBank stash before this fetch carries the
+                        // signal — the "at {bank}" copy can only come
+                        // from the server); the client stash remains the
+                        // null-fallback for a pre-change server.
+                        bankName = data.missingAccountsBankName ?: reAuthBank?.name,
+                    )
+                    // A fresh detection opens a clean dialog (F4): a stale
+                    // error from a prior failed delete attempt never
+                    // bleeds into the new one.
+                    missingAccountsError = null
+                }
                 if (!data.syncInProgress) {
                     importInProgress = false
                     importFailed = false
+                    // Zero-account detection (D11, re-keyed on the
+                    // one-shot first-connection signal — 13.1/F1): the
+                    // genuine onboarding FIRST connection ONLY. The
+                    // server signal truth keys the first-connection
+                    // predicate: the notice fires only when the server
+                    // says the just-completed merge was the FIRST
+                    // connection (firstConnectionImport == true) — the
+                    // ever-onboarded marker flips to true inside the
+                    // merge transaction BEFORE the redirect cold boot's
+                    // state read, so it can never carry this truth; a
+                    // remove-all-then-reconnect user (signal false/absent,
+                    // marker true) never sees the onboarding notice again;
+                    // the dashboard's standing empty state carries that
+                    // case. A null signal (a server predating the change)
+                    // falls back to the marker/mode-snapshot chain. The
+                    // other conditions stand: the just-connected bank is
+                    // the ONLY bank in the payload and shares zero
+                    // accounts, and NO missing-accounts set was reported
+                    // for this merge (a re-authorization narrowing to
+                    // zero accounts produces the same shape but is covered
+                    // by the missing-accounts dialog, whose signal the
+                    // same fetch stashed). NO gating of the routing: the
+                    // connection is stored regardless; the notice stays
+                    // rendered on the import step until the user acts.
+                    if (isFirstConnectionZeroAccount(
+                            banks = data.banks,
+                            missingAccounts = data.missingAccounts,
+                            firstConnectionImport = firstConnectionImport,
+                            everOnboarded = everOnboarded,
+                            onboardingMode = importInOnboardingMode,
+                        )
+                    ) {
+                        zeroAccountNoticeBank = data.banks.first()
+                    }
                     currentScreen = Screen.Dashboard
                     return@launch
                 }
@@ -646,6 +926,89 @@ class AppViewModel(
     }
 
     /**
+     * Pure zero-account-notice derivation (bank-connection-management D11,
+     * task 11.1; re-keyed on the server's first-connection signal —
+     * 13.1/F1): TRUE exactly when the fresh post-import payload shows ONE
+     * bank whose authorization shares zero accounts, the merge reported
+     * NO missing-accounts set, AND the just-completed connection was the
+     * genuine FIRST connection.
+     *
+     * FIRST-CONNECTION KEY (the one-shot server signal, 13.1/F1):
+     * [firstConnectionImport] == true — the server set the one-shot
+     * `first_connection_import` flag in the auth-callback merge and this
+     * state read consumed it. The ever-onboarded MARKER cannot serve as
+     * this key: it flips to true INSIDE the merge transaction, BEFORE
+     * the redirect cold boot's state read, so a marker-derived predicate
+     * can never distinguish the genuine first connection from an
+     * ever-onboarded reconnect (the review's unreachability finding).
+     * false → NEVER the first connection (an ever-onboarded
+     * reconnect — remove-all-then-reconnect included; the dashboard's
+     * standing empty state carries the case).
+     *
+     * NULL-SIGNAL TOLERANCE (a server predating the change omits the
+     * field): the 11.13/F7 marker chain applies unchanged — the marker
+     * truth keys the detection whenever the server reports one, with the
+     * [onboardingMode] client snapshot (captured at import entry, live
+     * where the flow continues in-session) as the pre-marker fallback.
+     *
+     * - Two or more banks with one zero-account bank (add-mode import on
+     *   a running system) never arm it — the system is already working.
+     * - SUPPRESSION (D11 vs D8/D14): a RE-AUTHORIZATION that narrows to
+     *   zero accounts can produce the same payload shape (single bank,
+     *   zero accounts) — but the narrowing case is covered by the
+     *   MISSING-ACCOUNTS dialog, never the zero-account notice. A
+     *   non-empty missing-accounts set (the merge's one-shot signal,
+     *   stashed by the very same fetch) therefore suppresses the notice:
+     *   the dialog renders from the stash instead.
+     *
+     * The routing is NEVER mode-gated — the import step completes
+     * normally in every mode; only the NOTICE is. Pure so the gating is
+     * unit-testable.
+     */
+    internal fun isFirstConnectionZeroAccount(
+        banks: List<BankData>,
+        missingAccounts: List<MissingAccount>,
+        firstConnectionImport: Boolean?,
+        everOnboarded: Boolean?,
+        onboardingMode: Boolean,
+    ): Boolean {
+        val firstConnection = when (firstConnectionImport) {
+            // The one-shot server signal (13.1/F1): the genuine first
+            // connection, and ONLY it.
+            true -> true
+            // An ever-onboarded reconnect — never the onboarding first
+            // connection.
+            false -> false
+            // Unknown (a server predating the change): the 11.13/F7
+            // marker chain, unchanged — the marker truth keys the
+            // detection, the mode snapshot is the pre-marker fallback.
+            null -> when (everOnboarded) {
+                false -> true
+                true -> false
+                null -> onboardingMode
+            }
+        }
+        return firstConnection &&
+                missingAccounts.isEmpty() &&
+                banks.size == 1 &&
+                banks.single().accounts.isEmpty()
+    }
+
+    /**
+     * "Continue to dashboard" on the zero-account notice (D11): consumes
+     * the notice and routes normally — the connection is stored, onboarding
+     * completion is unchanged, and the dashboard renders its standing
+     * empty state (connected-but-zero-accounts copy).
+     */
+    fun continueToDashboardFromZeroAccountNotice() {
+        zeroAccountNoticeBank = null
+        importInProgress = false
+        importFailed = false
+        currentScreen = Screen.Dashboard
+        refreshAccounts()
+    }
+
+    /**
      * Continue-anyway after a failed/abandoned import: route to the
      * dashboard with whatever data exists (degraded never_synced
      * presentation). Transient client state only — a reload routes per
@@ -654,6 +1017,7 @@ class AppViewModel(
     fun continueToDashboard() {
         importInProgress = false
         importFailed = false
+        zeroAccountNoticeBank = null
         currentScreen = Screen.Dashboard
         refreshAccounts()
     }
@@ -677,6 +1041,24 @@ class AppViewModel(
                 val data = apiClient.getAccounts()
                 if (data != null) {
                     accountsData = data
+                    // The one-shot signal may arrive on ANY fetch (D14) —
+                    // the bank of the re-authorization rides with the
+                    // stash (captured from reAuthBank at stash time).
+                    if (data.missingAccounts.isNotEmpty()) {
+                        missingAccountsSignal = MissingAccountsSignal(
+                            accounts = data.missingAccounts,
+                            // The bank of the re-authorization (13.3/F4): the
+                            // SERVER-side signal bank name wins when present
+                            // (the redirect cold boot wipes the client
+                            // reAuthBank stash before this fetch carries the
+                            // signal — the "at {bank}" copy can only come
+                            // from the server); the client stash remains the
+                            // null-fallback for a pre-change server.
+                            bankName = data.missingAccountsBankName ?: reAuthBank?.name,
+                        )
+                        // A fresh detection opens a clean dialog (F4).
+                        missingAccountsError = null
+                    }
                     if (!data.syncInProgress) {
                         refreshRequested = false
                         accountsPollJob = null
@@ -761,6 +1143,18 @@ class AppViewModel(
         // Cold-boot environment re-export (design D16): the SPA branches on
         // the server-resolved value — it never guesses sandbox itself.
         registrationEnvironment = state.environment
+        // Ever-onboarded marker (11.13/F7): server-side first-connection
+        // truth, stashed on every state read (the field rides the same
+        // response the resolver consumes). Null = unknown (a server
+        // predating the change) — the detection falls back to the
+        // pre-change client-side tolerance.
+        everOnboarded = state.everOnboarded
+        // One-shot first-connection signal (13.1/F1): consumed-and-cleared
+        // by this very read server-side, stashed here for the import
+        // step's zero-account detection. The field rides the same
+        // response as the marker; null = a pre-change server (the
+        // fallback chain applies).
+        firstConnectionImport = state.firstConnectionImport
 
         // Presentation-only notes (5.3): surfaced regardless of route.
         if (state.appState == "inactiveButLinked") surfaceInactiveButLinkedNote()
@@ -1352,6 +1746,12 @@ class AppViewModel(
         linkStatusChecking = false
         authRedirectUrl = null
         addModeActive = true
+        // The wizard is a full-page overlay (D2) — remember the surface it
+        // was opened from so the exit affordance returns there. Loading is
+        // transient cold-start state, never a resting surface: an entry
+        // from it (artificial in tests) records the Dashboard default so
+        // the exit never strands the user.
+        wizardOriginScreen = if (currentScreen == Screen.Loading) Screen.Dashboard else currentScreen
         currentScreen = Screen.Onboarding
         onboardingStep = OnboardingStep.BankSelection
         // No loadAspsps() here — the BankSelectionStep enter effect fetches
@@ -1374,7 +1774,10 @@ class AppViewModel(
         authFailed = false
         authErrorKind = null
         authorizationId = null
-        currentScreen = Screen.Dashboard
+        // Full-page overlay exits to its ORIGIN surface (D2) — Settings when
+        // the flow was started from the bank connections section, the
+        // dashboard otherwise (the historical default).
+        currentScreen = wizardOriginScreen
         refreshAccounts()
         viewModelScope.launch {
             apiClient.cancelLinking()
@@ -1463,7 +1866,10 @@ class AppViewModel(
         authFailed = false
         authErrorKind = null
         authorizationId = null
-        currentScreen = Screen.Dashboard
+        // Full-page overlay exits to its ORIGIN surface (D2) — Settings when
+        // the re-authorization was started from a connection card, the
+        // dashboard otherwise (the historical default).
+        currentScreen = wizardOriginScreen
         refreshAccounts()
         viewModelScope.launch {
             apiClient.cancelLinking()
@@ -1531,6 +1937,12 @@ class AppViewModel(
         addModeActive = false
         reAuthActive = true
         reAuthBank = bank
+        // The wizard is a full-page overlay (D2) — remember the surface it
+        // was opened from so the exit affordance returns there. Loading is
+        // transient cold-start state, never a resting surface: an entry
+        // from it (artificial in tests) records the Dashboard default so
+        // the exit never strands the user.
+        wizardOriginScreen = if (currentScreen == Screen.Loading) Screen.Dashboard else currentScreen
         currentScreen = Screen.Onboarding
         onboardingStep = OnboardingStep.AuthProgress
         // POST /api/auth with the pre-selected bank identity + psu_type —
@@ -1539,9 +1951,222 @@ class AppViewModel(
         startAuth(bank.name, bank.country, bank.psuType)
     }
 
+    /** Triggers the ASPSP catalog fetch (mark-busy variant for user actions). */
     fun loadAspsps() {
         fetchAspsps(markBusy = true)
     }
+
+    // ---------------------------------------------------------------
+    // Bank connections: remove + missing-accounts + local-copy delete
+    // (bank-connection-management D7/D8/D14)
+    // ---------------------------------------------------------------
+
+    /**
+     * Opens the remove-confirmation dialog for the given bank
+     * (bank-connection-management D7): the dialog carries the honest
+     * best-effort copy — the connection closes locally; the bank-side
+     * consent is closed "where supported", never promised.
+     */
+    fun requestRemoveConnection(bank: BankData) {
+        removeDialogBank = bank.bankName to bank.bankCountry
+        removeError = null
+    }
+
+    /** Closes the remove-confirmation dialog without removing anything. */
+    fun dismissRemoveDialog() {
+        removeDialogBank = null
+        removeError = null
+    }
+
+    /**
+     * Confirms the removal (D7): POST /api/connections/remove. The server
+     * runs EB's DELETE /sessions first, then the local cleanup transaction.
+     * - success (eb_deleted=true): refresh the data; the bank disappears
+     *   from all surfaces.
+     * - eb_deleted=false (EB network/5xx failure): the removal STILL
+     *   happened locally — report the honest one-line caveat (the
+     *   authorization remains active at the bank until <valid_until>).
+     * - 404 (bank not found locally — stale SPA state / double remove):
+     *   honest error + re-sync the connections state.
+     * - request failure: honest error.
+     */
+    fun confirmRemoveConnection() {
+        val target = removeDialogBank ?: return
+        if (removingBankName != null) return
+        removingBankName = target.first
+        removeError = null
+        viewModelScope.launch {
+            when (val result = apiClient.removeConnection(target.first, target.second)) {
+                is RemoveConnectionResult.Ok -> {
+                    removeDialogBank = null
+                    if (!result.ebDeleted) {
+                        // Honest caveat (D7): the removal completed locally,
+                        // the bank-side consent could not be revoked — the
+                        // stored expiry is the honest bound.
+                        removeCaveat = removeCaveatLine(result.validUntil)
+                    } else {
+                        removeCaveat = null
+                    }
+                    refreshAccounts()
+                }
+                is RemoveConnectionResult.NotFound -> {
+                    // Honest error + re-sync (stale SPA state / double
+                    // remove): the dialog closes (the bank is already
+                    // gone server-side — a dialog about a nonexistent
+                    // bank is noise), the honest line renders in the
+                    // connections SECTION, and the fresh payload below
+                    // makes the list reflect the server's truth.
+                    settingsError = "This bank is no longer connected. Your list has been refreshed."
+                    removeError = null
+                    refreshAccounts()
+                    removeDialogBank = null
+                }
+                is RemoveConnectionResult.Error -> {
+                    removeError = result.message
+                }
+            }
+            removingBankName = null
+        }
+    }
+
+    /**
+     * "Keep as local copy" (D8): primary action of the missing-accounts
+     * dialog. NO server call — the keep is already the effective state
+     * (the merge kept the accounts before the dialog was ever shown).
+     * Closes the dialog by consuming the stashed signal.
+     */
+    fun keepMissingAccounts() {
+        missingAccountsSignal = null
+        missingAccountsError = null
+    }
+
+    /**
+     * "Delete their data" (D8/D14): danger action of the missing-accounts
+     * dialog. Calls the local-copy deletion endpoint with the account ids
+     * (account rows + balances in one server-side transaction), then
+     * refreshes so the accounts disappear from all surfaces. A failed
+     * deletion keeps the dialog open (honest error, retryable); the
+     * deletion is the only destructive path and never happens silently.
+     *
+     * SCOPE (task 11.12, intent principle): the deletion covers ONLY the
+     * NEWLY missing accounts (`newlyMissing == true`). The already-kept
+     * local copies in the signal are NOT in the deletion set — a prior
+     * keep decision is a standing choice no later dialog re-makes; a
+     * repeated detection must never delete data the user already chose
+     * to keep (the finding that motivated the scope). Already-kept copies
+     * remain deletable only via the connections-section inline delete
+     * with its confirmation dialog (11.9's gate — one decision, one
+     * path).
+     */
+    fun deleteMissingAccounts() {
+        val accounts = missingAccountsSignal?.accounts ?: return
+        if (deletingLocalAccountId != null) return
+        deletingLocalAccountId = -1L // sentinel: the batch dialog action is in flight
+        missingAccountsError = null // a retry starts clean
+        viewModelScope.launch {
+            val deleted = apiClient.deleteLocalAccounts(accounts.filter { it.newlyMissing }.map { it.id })
+            if (deleted != null) {
+                missingAccountsSignal = null
+                missingAccountsError = null
+                settingsError = null
+                refreshAccounts()
+            } else {
+                // In-dialog error (F4): the dialog renders on the dashboard,
+                // so the failure must surface INSIDE it — a settingsError
+                // there would be invisible. The dialog stays open, the
+                // buttons re-enable, the line reads honestly.
+                missingAccountsError = "The accounts could not be deleted just now. Please try again."
+            }
+            deletingLocalAccountId = null
+        }
+    }
+
+    /**
+     * Inline extra-small danger delete affordance on a local-copy account
+     * row in the connections section (D5/D9): deletes THIS account row +
+     * its balances via the same endpoint, then refreshes. The only
+     * per-account deletion path in the system — gated by its confirmation
+     * dialog (task 11.9's ruling: one-click deletion never happens).
+     *
+     * Task 11.9 walkthrough ruling: ONE-CLICK DELETION NEVER HAPPENS —
+     * the inline affordance OPENS a confirmation dialog naming the
+     * account ([requestDeleteLocalAccount]); [confirmDeleteLocalAccount]
+     * is the destructive gate.
+     */
+    fun requestDeleteLocalAccount(account: AccountData) {
+        deleteDialogAccount = account
+        settingsError = null
+    }
+
+    /** Closes the local-copy deletion confirmation dialog without deleting. */
+    fun dismissDeleteDialog() {
+        if (deletingLocalAccountId == null) {
+            deleteDialogAccount = null
+        }
+    }
+
+    /**
+     * Confirms the local-copy deletion (task 11.9): calls the existing
+     * single-account deletion path ([deleteLocalAccount]) — the account
+     * row and its balances go in one server-side transaction, then the
+     * refresh removes them from all surfaces. The dialog closes only on
+     * the click (stays open while the request is in flight; a failure
+     * keeps it open with the honest error).
+     */
+    fun confirmDeleteLocalAccount() {
+        val account = deleteDialogAccount ?: return
+        deleteLocalAccount(account.id)
+    }
+
+    fun deleteLocalAccount(accountId: Long) {
+        if (deletingLocalAccountId != null) return
+        deletingLocalAccountId = accountId
+        settingsError = null
+        viewModelScope.launch {
+            val deleted = apiClient.deleteLocalAccounts(listOf(accountId))
+            if (deleted == null) {
+                settingsError = "The account could not be deleted just now. Please try again."
+            } else {
+                deleteDialogAccount = null
+                refreshAccounts()
+            }
+            deletingLocalAccountId = null
+        }
+    }
+
+    /** Clears the honest settings-surface error line (rendered beside the section). */
+    fun dismissSettingsError() {
+        settingsError = null
+    }
+
+    /** Clears a stale caveat line (e.g. after the user read it and refreshed). */
+    fun clearRemoveCaveat() {
+        removeCaveat = null
+    }
+
+    /**
+     * Re-enters bank selection mid-flow from the onboarding zero-account
+     * notice's "Connect another bank" (bank-connection-management D11):
+     * a fresh onboarding-mode selection — the just-connected bank
+     * correctly appears blocked-connected there (its `connected` flag is
+     * server-derived). Pure client-side step navigation; the notice is
+     * consumed (the connection itself stays stored — no gating).
+     */
+    fun reconnectAnotherBankFromOnboarding() {
+        zeroAccountNoticeBank = null
+        importInProgress = false
+        importFailed = false
+        selectedAspsp = null
+        selectedPsuType = "personal"
+        currentScreen = Screen.Onboarding
+        onboardingStep = OnboardingStep.BankSelection
+    }
+
+    /**
+     * The honest bank-side caveat line (D7) is built by the top-level
+     * [removeCaveatLine] pure copy builder — see its kdoc for the exact
+     * spec wording and the graceful degradation.
+     */
 
     /**
      * Shared GET /api/aspsps (D11): dedups concurrent callers through
@@ -1983,6 +2608,7 @@ class AppViewModel(
         addModeActive = false
         reAuthActive = false
         reAuthBank = null
+        wizardOriginScreen = Screen.Dashboard
     }
 
     /**
@@ -2012,5 +2638,27 @@ class AppViewModel(
          * of the refresh control (spec: refresh affordance).
          */
         const val MANUAL_REFRESH_COOLDOWN_SECONDS = 60L
+    }
+}
+
+/**
+ * The honest bank-side caveat line (bank-connection-management D7, exact
+ * spec wording): "the authorization remains active at the bank until
+ * <valid_until>; your bank's own portal can revoke it sooner" — rendered
+ * after a removal whose Enable Banking delete failed (the removal still
+ * completed locally). Top-level pure copy builder so the wording is
+ * unit-testable without a view-model instance. A missing/unparseable
+ * expiry degrades to the same sentence without a date (never a
+ * fabricated date).
+ */
+internal fun removeCaveatLine(validUntil: String?): String {
+    val until = validUntil
+        ?.takeIf { it.isNotBlank() }
+        ?.let { parseRfc3339ToEpochMillis(it) }
+        ?.let { consentCaveatDate(it) }
+    return if (until != null) {
+        "The connection is removed from BankTeller. The authorization remains active at the bank until $until; your bank's own portal can revoke it sooner."
+    } else {
+        "The connection is removed from BankTeller. The authorization remains active at the bank until it expires; your bank's own portal can revoke it sooner."
     }
 }

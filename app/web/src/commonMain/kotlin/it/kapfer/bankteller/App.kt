@@ -8,7 +8,6 @@ import it.kapfer.bankteller.onboarding.OnboardingScreen
 import it.kapfer.bankteller.ui.components.LocalActionBusy
 import it.kapfer.bankteller.ui.components.LoadingSplash
 import it.kapfer.bankteller.ui.theme.BankTellerTheme
-
 /**
  * Root composable for the BankTeller SPA.
  *
@@ -61,6 +60,11 @@ fun App() {
                 Screen.Login -> LoginScreen(viewModel)
                 Screen.Onboarding -> OnboardingScreen(viewModel)
                 Screen.Dashboard -> DashboardScreen(viewModel)
+                // Settings (bank-connection-management D2/D3): the second
+                // authenticated top-level surface — reachable only via the
+                // client-side tab bar (the resolver never routes here), and
+                // chrome-sharing with the dashboard through the same shell.
+                Screen.Settings -> SettingsScreen(viewModel)
             }
         }
     }

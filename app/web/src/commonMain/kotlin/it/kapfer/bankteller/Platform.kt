@@ -28,8 +28,18 @@ expect suspend fun preScaleImageBytes(srcBytes: ByteArray, dstWidth: Int, dstHei
 /** Logs a message to the browser console (or stdout on non-web targets). */
 expect fun consoleLog(msg: String)
 
-/** Returns the browser's device pixel ratio (1, 2, 3, etc.). Returns 1 on non-web targets. */
-expect fun getDevicePixelRatio(): Int
+/**
+ * Returns the browser's device pixel ratio as a FRACTIONAL Double (F3):
+ * common hardware reports 1.25, 1.5, 1.75 (Windows 125%/150% scaling
+ * among others), and Compose for Web uses the fractional value as the
+ * layout density — the rendered layout follows px/DPR while an
+ * Int-rounded DPR would misclassify every derived dp width at those
+ * ratios (a 1200px window at DPR 1.5 is really 800dp, not the 600dp a
+ * `Math.round` derivation computes). Defaults to 1.0 when unavailable
+ * (non-web targets, missing window). The single consumer is
+ * [viewportWidthDpFrom] (the Settings master-detail breakpoint).
+ */
+expect fun devicePixelRatio(): Double
 
 /** Reads a value from `window.localStorage`, or null if absent. Synchronous. */
 expect fun localStorageGet(key: String): String?
@@ -127,6 +137,30 @@ expect fun decodeUriComponent(value: String): String?
 expect fun browserLocaleTag(): String
 
 /**
+ * The browser viewport's CSS width in pixels (`window.innerWidth`),
+ * used with the display density to derive the viewport width in dp for the
+ * Settings master-detail's hand-rolled 768dp breakpoint
+ * (bank-connection-management D4). Returns null when unavailable.
+ */
+expect fun viewportWidthPx(): Int?
+
+/**
+ * Viewport width in dp for the Settings master-detail breakpoint (D4):
+ * CSS pixels divided by the device pixel ratio. Compose for Web renders
+ * CSS px as dp at DPR 1; at higher densities one dp == density CSS px —
+ * the FRACTIONAL DPR (F3), matching the density Compose itself uses, so
+ * fractional-scaled hardware (Windows 125%/150%) classifies the same
+ * side of the 768dp threshold as the rendered layout does. Returns null
+ * when the raw measurement is unavailable. Pure in its inputs so the
+ * derivation is unit-testable.
+ */
+fun viewportWidthDpFrom(px: Int?, devicePixelRatio: Double): Int? {
+    if (px == null || px <= 0) return null
+    val density = devicePixelRatio.coerceAtLeast(1.0)
+    return (px / density).toInt()
+}
+
+/**
  * Locale-aware amount formatting per the account-overview spec's amount
  * formatting requirement: digit grouping and decimal separators follow
  * [localeTag] (via `Intl.NumberFormat` on wasmJs), the fraction is normalized
@@ -136,6 +170,40 @@ expect fun browserLocaleTag(): String
  * verbatim string plus the currency code.
  */
 expect fun formatAmountForLocale(amount: String, currency: String, localeTag: String): String
+
+/**
+ * The amount-only half of [formatAmountForLocale] (task 13.7 — decimal-
+ * separator alignment): the locale-formatted number WITHOUT the ISO code
+ * suffix. The mixed-currency hero subtotals render their figures in a
+ * right-aligned block with the codes as separate trailing labels outside
+ * it, so the figure and the code must be derivable as separate strings.
+ * Same formatting contract as [formatAmountForLocale] (digit grouping and
+ * decimal separators per [localeTag], the fraction normalized to the
+ * currency's standard digits via [currencyFractionDigits]); unparseable
+ * input falls back to the verbatim number — the code suffix remains the
+ * composing caller's concern.
+ */
+expect fun formatAmountNumberForLocale(amount: String, currency: String, localeTag: String): String
+
+/**
+ * Locale-aware calendar date for the bank-side consent caveat line
+ * (bank-connection-management D7): the honest "until <date>" bound after a
+ * removal whose Enable Banking delete failed. Formats [epochMillis] with the
+ * browser locale's standard date style (e.g. "12/3/2026" en-US,
+ * "3.12.2026" de-DE) via `Intl.DateTimeFormat` on wasmJs — no weekday, no
+ * time-of-day. Returns null when the timestamp is unrepresentable.
+ */
+expect fun formatDateForLocale(epochMillis: Long, localeTag: String): String?
+
+/**
+ * Pure builder for the caveat line's date fragment (bank-connection-management
+ * D7): maps the stored consent expiry to its rendered form. Parseable
+ * timestamps format via [formatDateForLocale] with the browser locale;
+ * absent/unparseable values yield null (the caveat copy degrades to
+ * "until it expires" — never a fabricated date).
+ */
+internal fun consentCaveatDate(epochMillis: Long): String? =
+    formatDateForLocale(epochMillis, browserLocaleTag())
 
 /**
  * Standard (ISO 4217) fraction digits for [currency]; 2 for the vast

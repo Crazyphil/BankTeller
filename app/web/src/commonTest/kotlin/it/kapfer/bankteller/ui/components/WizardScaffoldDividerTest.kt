@@ -10,17 +10,20 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * Wizard scaffold divider predicates (task 8.24, §6.1.5): the symmetric
- * hairlines at the content-zone boundaries key on the ACTIVE step's scroll
- * progress — header divider only while scrolled past 0, footer divider only
- * while more content remains below the fold, both dissolving at rest/end and
- * hidden when the content fits. Both shapes (ScrollState-driven zone,
- * LazyListState-driven bank list) reduce to the same (rangePx, offsetPx)
- * pair via the shared [ScrollbarMetrics] machinery. Pure logic, tested
- * directly (the repo has no Compose UI test harness for wasmJs).
+ * CropSignaledScroll predicates (task 11.14, design D19 — formerly the
+ * wizard scaffold's zone-edge dividers): the symmetric crop-signal
+ * hairlines render at the SCROLLABLE'S OWN bounds — the top one only
+ * while scrolled past 0 (on the bank-list step: BELOW the pinned search
+ * field, never over it — the geometry defect the wrapper fixes), the
+ * bottom one only while more content remains below the fold, both
+ * dissolving at rest/end and hidden when the content fits. Both shapes
+ * (ScrollState-driven columns, LazyListState-driven lists) reduce to the
+ * same (rangePx, offsetPx) pair via the shared [ScrollbarMetrics]
+ * machinery. Pure logic, tested directly (the repo has no Compose UI
+ * test harness for wasmJs).
  *
  * The pinned-footer property itself is structural: the footer row renders
- * outside the scrollable zone in every shape, so no per-step state can move
+ * outside the scrollable in every shape, so no per-step state can move
  * it — nothing pure remains to test there.
  */
 class WizardScaffoldDividerTest {
@@ -29,49 +32,49 @@ class WizardScaffoldDividerTest {
 
     @Test
     fun headerDivider_absentWhenContentFits() {
-        assertFalse(showWizardHeaderDivider(rangePx = 0, offsetPx = 0))
-        assertFalse(showWizardHeaderDivider(rangePx = 0, offsetPx = 500))
+        assertFalse(showCropTopHairline(rangePx = 0, offsetPx = 0))
+        assertFalse(showCropTopHairline(rangePx = 0, offsetPx = 500))
     }
 
     @Test
     fun headerDivider_absentAtRest() {
-        assertFalse(showWizardHeaderDivider(rangePx = 1600, offsetPx = 0))
+        assertFalse(showCropTopHairline(rangePx = 1600, offsetPx = 0))
     }
 
     @Test
     fun headerDivider_visibleOnceScrolled() {
-        assertTrue(showWizardHeaderDivider(rangePx = 1600, offsetPx = 1))
-        assertTrue(showWizardHeaderDivider(rangePx = 1600, offsetPx = 800))
+        assertTrue(showCropTopHairline(rangePx = 1600, offsetPx = 1))
+        assertTrue(showCropTopHairline(rangePx = 1600, offsetPx = 800))
     }
 
     @Test
     fun headerDivider_visibleAtEnd() {
         // Scrolled to the very end the header hairline stays — only the
         // footer one dissolves.
-        assertTrue(showWizardHeaderDivider(rangePx = 1600, offsetPx = 1600))
+        assertTrue(showCropTopHairline(rangePx = 1600, offsetPx = 1600))
     }
 
     // ---- Footer divider: renders on overflow, dissolves at the end ----
 
     @Test
     fun footerDivider_absentWhenContentFits() {
-        assertFalse(showWizardFooterDivider(rangePx = 0, offsetPx = 0))
-        assertFalse(showWizardFooterDivider(rangePx = 0, offsetPx = 500))
+        assertFalse(showCropBottomHairline(rangePx = 0, offsetPx = 0))
+        assertFalse(showCropBottomHairline(rangePx = 0, offsetPx = 500))
     }
 
     @Test
     fun footerDivider_visibleAtRestWhenOverflowing() {
-        assertTrue(showWizardFooterDivider(rangePx = 1600, offsetPx = 0))
+        assertTrue(showCropBottomHairline(rangePx = 1600, offsetPx = 0))
     }
 
     @Test
     fun footerDivider_visibleMidScroll() {
-        assertTrue(showWizardFooterDivider(rangePx = 1600, offsetPx = 800))
+        assertTrue(showCropBottomHairline(rangePx = 1600, offsetPx = 800))
     }
 
     @Test
     fun footerDivider_dissolvesAtEnd() {
-        assertFalse(showWizardFooterDivider(rangePx = 1600, offsetPx = 1600))
+        assertFalse(showCropBottomHairline(rangePx = 1600, offsetPx = 1600))
     }
 
     // ---- ScrollState shape (default): the zone scrolls the step ----
@@ -81,27 +84,37 @@ class WizardScaffoldDividerTest {
         // e.g. AuthProgress on a short window: range = maxValue > 0.
         val range = 1600
         val offset = 0
-        assertFalse(showWizardHeaderDivider(range, offset))
-        assertTrue(showWizardFooterDivider(range, offset))
+        assertFalse(showCropTopHairline(range, offset))
+        assertTrue(showCropBottomHairline(range, offset))
     }
 
     @Test
     fun scrollStateShape_scrolledMidShowsBoth() {
         val range = 1600
         val offset = 800
-        assertTrue(showWizardHeaderDivider(range, offset))
-        assertTrue(showWizardFooterDivider(range, offset))
+        assertTrue(showCropTopHairline(range, offset))
+        assertTrue(showCropBottomHairline(range, offset))
     }
 
     @Test
     fun scrollStateShape_atEndShowsHeaderOnly() {
         val range = 1600
         val offset = 1600
-        assertTrue(showWizardHeaderDivider(range, offset))
-        assertFalse(showWizardFooterDivider(range, offset))
+        assertTrue(showCropTopHairline(range, offset))
+        assertFalse(showCropBottomHairline(range, offset))
     }
 
     // ---- LazyListState shape (bank list): adapter + predicates ----
+    //
+    // PLACEMENT RULING (task 11.14, D19 — the geometry defect this
+    // wrapper fixes): the bank-list step wraps ONLY the LazyColumn in
+    // CropSignaledScroll; the search field and the orientation line sit
+    // ABOVE the wrapper (pinned). The predicates below therefore trigger
+    // hairlines at the LIST'S OWN bounds — the top hairline renders
+    // BELOW the pinned search field, never over it (the retired
+    // zone-edge overlay rendered over the field because it assumed the
+    // whole zone was the scrollable). The placement is structural: the
+    // wrapper wraps the scrollable, and only the scrollable.
 
     @Test
     fun lazyShape_metricsExtrapolateFromVisibleWindow() {
@@ -124,8 +137,8 @@ class WizardScaffoldDividerTest {
             totalItems = 20,
         )
         val metrics = lazyListScrollbarMetrics(info)
-        assertFalse(showWizardHeaderDivider(metrics.rangePx, metrics.offsetPx))
-        assertTrue(showWizardFooterDivider(metrics.rangePx, metrics.offsetPx))
+        assertFalse(showCropTopHairline(metrics.rangePx, metrics.offsetPx))
+        assertTrue(showCropBottomHairline(metrics.rangePx, metrics.offsetPx))
     }
 
     @Test
@@ -138,8 +151,8 @@ class WizardScaffoldDividerTest {
         )
         val metrics = lazyListScrollbarMetrics(info)
         assertEquals(600, metrics.offsetPx)
-        assertTrue(showWizardHeaderDivider(metrics.rangePx, metrics.offsetPx))
-        assertTrue(showWizardFooterDivider(metrics.rangePx, metrics.offsetPx))
+        assertTrue(showCropTopHairline(metrics.rangePx, metrics.offsetPx))
+        assertTrue(showCropBottomHairline(metrics.rangePx, metrics.offsetPx))
     }
 
     @Test
@@ -152,8 +165,8 @@ class WizardScaffoldDividerTest {
         )
         val metrics = lazyListScrollbarMetrics(info)
         assertEquals(1600, metrics.offsetPx)
-        assertTrue(showWizardHeaderDivider(metrics.rangePx, metrics.offsetPx))
-        assertFalse(showWizardFooterDivider(metrics.rangePx, metrics.offsetPx))
+        assertTrue(showCropTopHairline(metrics.rangePx, metrics.offsetPx))
+        assertFalse(showCropBottomHairline(metrics.rangePx, metrics.offsetPx))
     }
 
     @Test
@@ -166,8 +179,46 @@ class WizardScaffoldDividerTest {
         )
         val metrics = lazyListScrollbarMetrics(info)
         assertEquals(0, metrics.rangePx)
-        assertFalse(showWizardHeaderDivider(metrics.rangePx, metrics.offsetPx))
-        assertFalse(showWizardFooterDivider(metrics.rangePx, metrics.offsetPx))
+        assertFalse(showCropTopHairline(metrics.rangePx, metrics.offsetPx))
+        assertFalse(showCropBottomHairline(metrics.rangePx, metrics.offsetPx))
+    }
+
+    // ---- The 2dp detachment gap (task 11.16): the mechanism split ----
+
+    @Test
+    fun detachmentGap_is2dp_survivingFractionalZoom() {
+        // 2dp, not 1dp: the gap must survive 125%/150% browser zoom —
+        // 1dp rounds away at those scales (the reason 1dp was rejected).
+        assertEquals(2, CropSignalDetachmentGap.value.toInt())
+    }
+
+    @Test
+    fun shellOverlayOffset_displacesTheHairlineIntoTheChrome_bandBeforeTheClip() {
+        // SHELL mechanism (ScreenShell's top-bar divider + bottom-bar
+        // crop hairline): OVERLAY OFFSETS — the 1dp hairline's INNER edge
+        // (facing the content) sits exactly the 2dp gap away from the clip
+        // plane, which stays AT the zone boundary. Top edge: displaced
+        // UP into the top-bar zone; bottom edge: DOWN into the bottom-bar
+        // zone. At rest nothing renders and NO content offset exists.
+        assertEquals(-3, shellHairlineOffsetDp(gapDp = 2, hairlineHeightDp = 1, topEdge = true))
+        assertEquals(3, shellHairlineOffsetDp(gapDp = 2, hairlineHeightDp = 1, topEdge = false))
+        // The band: |offset| − hairline height = 2dp on both edges —
+        // card side borders terminate at the clip plane (boundary), the
+        // 2dp band before the hairline, never touching.
+        assertEquals(2, kotlin.math.abs(shellHairlineOffsetDp(2, 1, true)) - 1)
+        assertEquals(2, shellHairlineOffsetDp(2, 1, false) - 1)
+    }
+
+    @Test
+    fun wrapperContentInset_isPermanent_theBandIsTheInsetItself() {
+        // WRAPPER mechanism (CropSignaledScroll): a PERMANENT 2dp
+        // content-slot inset — cropped content clips 2dp short of the
+        // outer-bounds hairlines (the band = the inset), and at rest the
+        // 2dp stays as breathing room (fixed inset: the hairline's
+        // fade-in causes no layout shift). The hairlines render at the
+        // OUTER bounds via the offset-cancel; the scrollbar (composed
+        // inside the content slot per D19) inherits the inset.
+        assertEquals(2, wrapperContentInsetDp(gapDp = 2))
     }
 }
 

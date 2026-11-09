@@ -52,12 +52,22 @@ object OnboardingRoute {
  *   control-plane signal.
  * @property linkingCompleted Server-derived: application active AND whitelist
  *   non-empty.
- * @property authCompleted True when at least one `eb_sessions` row exists.
- * @property authFailed Routing flag: auth error recorded AND not yet
- *   authorized AND (linking completed OR sandbox environment). The
- *   linking-precedes-authorization consistency rule is production-only —
- *   sandbox applications skip linking, so a sandbox auth error is meaningful
- *   without a completed linking step.
+ * @property everOnboarded True once the user has EVER completed onboarding —
+ *   the persisted ever-onboarded marker, derived by the caller as
+ *   marker-present OR sessions-exist (backfill-on-read for pre-change
+ *   databases; see `EbSessionStore.isEverOnboarded()`). Keys the dashboard
+ *   rung and survives connection removal: removing the last connection never
+ *   regresses an ever-onboarded user to the wizard. Routing state, NOT
+ *   progress authority — the completion condition itself remains "at least
+ *   one `eb_sessions` row".
+ * @property authFailed Routing flag: auth error recorded AND the user has
+ *   NEVER completed onboarding (ever-onboarded marker absent) AND (linking
+ *   completed OR sandbox environment). The linking-precedes-authorization
+ *   consistency rule is production-only — sandbox applications skip linking,
+ *   so a sandbox auth error is meaningful without a completed linking step.
+ *   Definitively false for an ever-onboarded user: a failed re-authorization
+ *   lands on the dashboard with the failure notice (the presentation signal),
+ *   never back in the wizard.
  * @property onboardingStage The stored session view-position stage, or null.
  * @property stageBankKnown True when the stored stage carries a non-blank
  *   bank triple (`stageAspspName`/`stageAspspCountry` non-blank; psu_type is
@@ -84,7 +94,7 @@ data class OnboardingRouteInput(
     val applicationIdPresent: Boolean,
     val appState: EbApplicationState?,
     val linkingCompleted: Boolean,
-    val authCompleted: Boolean,
+    val everOnboarded: Boolean = false,
     val authFailed: Boolean,
     val onboardingStage: String?,
     val stageBankKnown: Boolean,
@@ -109,11 +119,12 @@ data class OnboardingRouteInput(
  * 2. Application `deleted` (positive control-plane signal only) →
  *    [OnboardingRoute.REGISTRATION_REVIEW] — outranks a stored stage.
  * 3. `inactiveNeverLinked` → [OnboardingRoute.ACTIVATION_GUIDE] unless a
- *    stored stage is honored (rung 4). This rung sits ABOVE the `eb_sessions`
- *    check (activation-first: onboarding is not complete until the
- *    application works, even for a previously-authorized user).
- * 4. Stored stage honored (only when `auth_completed == false` — a stale stage
- *    never beats real authorization): `auth_progress` iff
+ *    stored stage is honored (rung 4). This rung sits ABOVE the
+ *    ever-onboarded check (activation-first: onboarding is not complete until
+ *    the application works, even for a previously-authorized user).
+ * 4. Stored stage honored (only when `ever_onboarded == false` — a stale stage
+ *    never beats completed onboarding; the marker outranks it, so add-flow
+ *    stages stay dead letters after a remove-all): `auth_progress` iff
  *    `linking_completed == true` OR `sandbox_environment == true` (the
  *    linking-precedes-authorization consistency rule is production-only —
  *    sandbox applications skip linking and authorize directly);
@@ -130,13 +141,28 @@ data class OnboardingRouteInput(
  *    bank is the safe destination. `bank_selection` is always consumable
  *    (it carries no triple by design); a `linking_progress`/`auth_progress`
  *    stage with a missing/blank bank triple is treated as no stage.
- * 5. At least one `eb_sessions` row → [OnboardingRoute.DASHBOARD]. Expired or
- *    revoked consent does NOT regress to onboarding.
+ * 5. EVER ONBOARDED (the persisted marker — set at the first successful
+ *    authorization, cleared only by the re-registration purge; or
+ *    derived-on-read as "sessions exist" for pre-change databases) →
+ *    [OnboardingRoute.DASHBOARD]. The rung keys on the MARKER, not on "at
+ *    least one `eb_sessions` row": removing the last connection (zero rows,
+ *    marker set) still routes to the dashboard's standing empty state with
+ *    its "Connect a bank" action — a deliberate, confirmed removal is not a
+ *    regression to the wizard, and the wizard would lock the user out of the
+ *    screen that explains what happened. Expired or revoked consent does NOT
+ *    regress to onboarding either. The failsafe repair paths live ABOVE this
+ *    rung (1–3 — missing credentials, deleted/inactive application → repair
+ *    regardless of the marker); this rung only decides where a HEALTHY
+ *    ever-onboarded user with zero connections lands.
  * 6. `inactiveButLinked` → best-effort continuation: evaluation continues
- *    against whitelist/`eb_sessions` as if the app were working (a
- *    non-blocking status note is surfaced from `app_state` — presentation,
- *    not routing).
- * 7. `auth_failed` → [OnboardingRoute.AUTH_PROGRESS] (failure display).
+ *    against whitelist as if the app were working (a non-blocking status note
+ *    is surfaced from `app_state` — presentation, not routing).
+ * 7. `auth_failed` → [OnboardingRoute.AUTH_PROGRESS] (failure display) — ONLY
+ *    when the ever-onboarded marker is ABSENT. An ever-onboarded user's
+ *    failed re-authorization lands on the dashboard with the auth-failure
+ *    notice (the presentation signal), never back in the wizard. (Rung 5
+ *    already returns dashboard for such a user; the explicit guard keeps the
+ *    intent local and survives rung reordering.)
  * 8. Whitelist non-empty → [OnboardingRoute.BANK_SELECTION] (resume card);
  *    else → [OnboardingRoute.BANK_SELECTION] (fresh start).
  *
@@ -167,7 +193,7 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
     }
 
     // 3. Registered but never linked (fresh registration pending activation).
-    //    Activation-first: evaluated BEFORE the eb_sessions check — even a
+    //    Activation-first: evaluated BEFORE the ever-onboarded check — even a
     //    previously-authorized user routes here on a dead application. The
     //    only mid-flow escape is a stored stage (rung 4).
     if (input.appState == EbApplicationState.INACTIVE_NEVER_LINKED) {
@@ -175,21 +201,27 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
         return OnboardingRoute.ACTIVATION_GUIDE
     }
 
-    // 4. Stored stage — consumed only before real authorization completes.
+    // 4. Stored stage — consumed only before onboarding was ever completed.
     //    For every other app state (active / inactiveButLinked / unknown) the
-    //    stage is checked here, below deletion but above eb_sessions.
+    //    stage is checked here, below deletion but above the marker.
     honoredStageRoute(input)?.let { return it }
 
-    // 5. Authorized at least once ever — Dashboard, never back to onboarding.
-    if (input.authCompleted) {
+    // 5. Ever onboarded (the persisted marker — or sessions exist for
+    //    pre-change databases) → Dashboard, never back to onboarding. Keys on
+    //    the MARKER, not on "a session row exists right now": removing the
+    //    last connection still lands on the dashboard's standing empty state.
+    if (input.everOnboarded) {
         return OnboardingRoute.DASHBOARD
     }
 
     // 6. inactiveButLinked — best-effort continuation: fall through to the
     //    whitelist-derived rungs as if the application were working.
 
-    // 7. A recorded authorization failure the user must see and retry.
-    if (input.authFailed) {
+    // 7. A recorded authorization failure the user must see and retry — only
+    //    for a user who never completed onboarding. An ever-onboarded user's
+    //    failure surfaces as the dashboard notice (rung 5 already routes
+    //    there; this guard keeps the intent local and survives reordering).
+    if (input.authFailed && !input.everOnboarded) {
         return OnboardingRoute.AUTH_PROGRESS
     }
 
@@ -199,9 +231,10 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
 
 /**
  * Returns the route for the stored stage when it is honored, or null when
- * there is no stage, the stage is inconsistent with actual progress, or
- * authorization already completed (the stage is ephemeral flow-control data —
- * it can never fabricate progress).
+ * there is no stage, the stage is inconsistent with actual progress, or the
+ * user has EVER completed onboarding (the stage is ephemeral flow-control
+ * data — it can never fabricate progress; the ever-onboarded marker outranks
+ * it, so an add-flow stage stays a dead letter after a remove-all).
  *
  * Stage consistency rules (spec): `auth_progress` requires
  * `linking_completed == true` OR `sandbox_environment == true` (authorization
@@ -218,9 +251,10 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
  * carries no triple by design).
  */
 private fun honoredStageRoute(input: OnboardingRouteInput): String? {
-    // A stale stage never beats real authorization (e.g. the authorization
-    // completed in another tab before the refresh).
-    if (input.authCompleted) return null
+    // A stale stage never beats completed onboarding (the marker is set once
+    // the user ever authorized — e.g. the authorization completed in another
+    // tab, or a deliberate remove-all left zero rows but the marker set).
+    if (input.everOnboarded) return null
 
     return when (input.onboardingStage) {
         OnboardingStage.AUTH_PROGRESS ->

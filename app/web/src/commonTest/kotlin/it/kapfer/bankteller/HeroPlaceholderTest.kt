@@ -79,4 +79,41 @@ class HeroPlaceholderTest {
             heroPlaceholderText(hasSuccessfulRun = false),
         )
     }
+
+    // ---------------------------------------------------------------
+    // Empty-state copy partition (task 11.7a — count-aware)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun zeroConnections_showsFirstRunCopy() {
+        assertEquals(
+            "No accounts connected yet. Connect your first bank to see your balances here.",
+            noAccountsEmptyStateText(),
+        )
+    }
+
+    @Test
+    fun connectedButZeroAccounts_singleBank_keepsSingularCopy() {
+        assertEquals(
+            "Your connected bank did not share any accounts yet. " +
+                    "You can connect another bank, or check the account selection in your bank's own authorization settings.",
+            zeroAccountsEmptyStateText(bankCount = 1),
+        )
+    }
+
+    @Test
+    fun connectedButZeroAccounts_multipleBanks_pluralizes() {
+        // Task 11.7a: a multi-bank all-zero-account state reads correctly
+        // pluralized — never the singular copy beside N banks.
+        assertEquals(
+            "Your connected banks did not share any accounts yet. " +
+                    "You can connect another bank, or check the account selection in your bank's own authorization settings.",
+            zeroAccountsEmptyStateText(bankCount = 2),
+        )
+        assertEquals(
+            "Your connected banks did not share any accounts yet. " +
+                    "You can connect another bank, or check the account selection in your bank's own authorization settings.",
+            zeroAccountsEmptyStateText(bankCount = 5),
+        )
+    }
 }

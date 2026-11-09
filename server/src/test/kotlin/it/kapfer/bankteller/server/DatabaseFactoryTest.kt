@@ -188,4 +188,112 @@ class DatabaseFactoryTest {
         // user_version now tracked, so a restart is a clean no-op.
         DatabaseFactory.init()
     }
+
+    @Test
+    fun `init migrates user_version 0 database in the prior v3-equivalent schema state`() {
+        val path = newTempDbPath()
+        // A pre-migration-4 database: all four tables exist (with the v3
+        // valid_until/logo columns on eb_sessions) but bic/in_consent do NOT,
+        // and user_version was never written. The inference ladder must NOT
+        // classify this as latest (all tables present is no longer enough) —
+        // it must resolve the PRIOR version so migration 4's ALTERs apply:
+        // eb_sessions gains bic, accounts gains in_consent NOT NULL DEFAULT 1,
+        // and pre-existing account rows carry in_consent = 1.
+        val driver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        driver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE eb_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                aspsp_name TEXT,
+                aspsp_country TEXT,
+                psu_type TEXT,
+                created_at INTEGER NOT NULL,
+                valid_until TEXT,
+                logo TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                iban TEXT,
+                uid TEXT,
+                currency TEXT,
+                name TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE balances (
+                account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+                balance_amount TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                balance_type TEXT NOT NULL,
+                reference_date TEXT,
+                fetched_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                sync_type TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                error_message TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(null, "INSERT INTO system_config (key, value) VALUES ('k', 'v')", 0)
+        driver.execute(
+            null,
+            "INSERT INTO eb_sessions (session_id, aspsp_name, aspsp_country, created_at, valid_until, logo) VALUES ('sess-1', 'Bank', 'DE', 1, '2026-01-01T00:00:00Z', 'https://logo')",
+            0,
+        )
+        driver.execute(null, "INSERT INTO accounts (session_id, iban) VALUES (1, 'DE1')", 0)
+        driver.execute(null, "INSERT INTO balances (account_id, balance_amount, currency, balance_type, fetched_at) VALUES (1, '10.00', 'EUR', 'CLBD', 1000)", 0)
+        driver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        // The new columns exist and are readable via the generated model.
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOneOrNull()
+        assertNotNull(session)
+        assertEquals(null, session.bic, "bic column must exist and be null for a pre-existing row")
+        // Pre-existing rows keep their values; the migration touches nothing.
+        assertEquals("https://logo", session.logo)
+        assertEquals("2026-01-01T00:00:00Z", session.valid_until)
+        // accounts.in_consent exists NOT NULL DEFAULT 1 — pre-existing rows carry 1.
+        val account = db.ebSessionsQueries.selectAccountById(1).executeAsOne()
+        assertEquals(1L, account.in_consent, "pre-existing account rows must carry in_consent = 1")
+        // accounts.identification_hash exists, nullable — pre-existing rows carry
+        // NULL (they degrade to IBAN-fallback matching).
+        assertEquals(null, account.identification_hash, "pre-existing account rows carry a NULL identification_hash")
+        // Existing balances survive.
+        assertEquals("10.00", db.balancesQueries.selectBalanceByAccountId(1).executeAsOne().balance_amount)
+        assertEquals("v", db.systemConfigQueries.selectValue("k").executeAsOneOrNull())
+        // user_version now tracked, so a restart is a clean no-op.
+        DatabaseFactory.init()
+    }
 }

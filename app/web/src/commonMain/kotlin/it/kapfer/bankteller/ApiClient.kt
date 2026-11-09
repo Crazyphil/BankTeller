@@ -329,6 +329,25 @@ open class ApiClient {
                 // environment branch — it never guesses sandbox itself.
                 val environment = extractJsonStringOrNull(body, "environment")
 
+                // Ever-onboarded marker (11.13/F7): server-side first-
+                // connection truth; absent on servers predating the
+                // change → null (unknown — the SPA's pre-change
+                // tolerance).
+                val everOnboarded = extractJsonBool(body, "ever_onboarded")
+
+                // One-shot first-connection signal (13.1, review F1):
+                // the merge flips the ever-onboarded marker to true
+                // INSIDE the transaction — by the time the redirect cold
+                // boot's state read arrives, the marker can never
+                // distinguish the genuine first connection from an
+                // ever-onboarded reconnect. The server therefore carries
+                // the first-connection truth as a one-shot signal
+                // (consumed-and-cleared by this very read, exactly the
+                // pending_initial_import pattern). Absent on servers
+                // predating the change → null (the detection falls back
+                // to the marker/mode-snapshot chain).
+                val firstConnectionImport = extractJsonBool(body, "first_connection_import")
+
                 return OnboardingState(
                     requiresRelogin = requiresRelogin,
                     linkingCompleted = linkingCompleted,
@@ -346,6 +365,8 @@ open class ApiClient {
                     linkedBanks = linkedBanks,
                     pendingInitialImport = pendingInitialImport,
                     environment = environment,
+                    everOnboarded = everOnboarded,
+                    firstConnectionImport = firstConnectionImport,
                 )
             }
             return null
@@ -532,6 +553,63 @@ open class ApiClient {
     }
 
     /**
+     * POST /api/connections/remove (bank-connection-management D7/D13):
+     * removes the connection for the bank identified by {aspsp_name,
+     * aspsp_country}. The server calls Enable Banking's DELETE /sessions
+     * FIRST, then the local cleanup transaction — [RemoveConnectionResult]
+     * reports honestly which parts happened.
+     */
+    open suspend fun removeConnection(aspspName: String, aspspCountry: String): RemoveConnectionResult {
+        return try {
+            val response = client.post("/api/connections/remove") {
+                contentType(ContentType.Application.Json)
+                setBody(
+                    """{"aspsp_name":"${escapeJsonString(aspspName)}","aspsp_country":"${escapeJsonString(aspspCountry)}"}""",
+                )
+            }
+            val body = response.bodyAsText()
+            when (response.status.value) {
+                200 -> RemoveConnectionResult.Ok(
+                    removed = extractJsonBool(body, "removed") ?: true,
+                    ebDeleted = extractJsonBool(body, "eb_deleted") ?: true,
+                    validUntil = extractJsonStringOrNull(body, "valid_until"),
+                )
+                404 -> RemoveConnectionResult.NotFound
+                else -> RemoveConnectionResult.Error(
+                    extractJsonString(body, "error").ifEmpty { "Server returned ${response.status.value}" },
+                )
+            }
+        } catch (e: Exception) {
+            RemoveConnectionResult.Error("Network error: ${e.message ?: "Unknown error"}")
+        }
+    }
+
+    /**
+     * POST /api/accounts/delete-local (bank-connection-management D14):
+     * deletes the given kept-as-local-copy accounts and their balances in
+     * one server-side transaction. Returns the ids the server actually
+     * deleted, or null on request failure (non-200 / network error).
+     */
+    open suspend fun deleteLocalAccounts(accountIds: List<Long>): List<Long>? {
+        return try {
+            val idsBody = accountIds.joinToString(",") { it.toString() }
+            val response = client.post("/api/accounts/delete-local") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"account_ids":[$idsBody]}""")
+            }
+            if (response.status.value == 200) {
+                val body = response.bodyAsText()
+                val arrayJson = extractJsonArray(body, "deleted_account_ids")
+                arrayJson?.mapNotNull { it.trim().toLongOrNull() } ?: emptyList()
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * Parses the /api/accounts payload. Hand-rolled JSON extraction like the
      * rest of this client (no kotlinx-serialization on the SPA side).
      *
@@ -557,6 +635,13 @@ open class ApiClient {
                         balanceType = extractJsonStringOrNull(accountJson, "balance_type"),
                         referenceDate = extractJsonStringOrNull(accountJson, "reference_date"),
                         fetchedAt = extractJsonLong(accountJson, "fetched_at"),
+                        // in_consent (bank-connection-management D9/D13): 1 =
+                        // synced within the authorization's account filter;
+                        // 0 = kept-as-local-copy. Absent on servers predating
+                        // the change → 1 (the historical all-accounts-are-
+                        // synced contract; the SPA never guesses a live
+                        // account is a local copy).
+                        inConsent = extractJsonLong(accountJson, "in_consent") ?: 1L,
                     ),
                 )
             }
@@ -572,10 +657,66 @@ open class ApiClient {
                     accounts = accounts,
                     consentBroken = extractJsonBool(bankJson, "consent_broken") ?: false,
                     psuType = extractJsonStringOrNull(bankJson, "psu_type"),
+                    // bic (D13): the ASPSP BIC persisted at authorization
+                    // time; nullable — NULL for sessions authorized before
+                    // the column existed, degrades gracefully (hidden).
+                    bic = extractJsonStringOrNull(bankJson, "bic"),
+                    // connected_at (D13): eb_sessions.created_at — the
+                    // connection's add date (epoch millis).
+                    connectedAt = extractJsonLong(bankJson, "connected_at"),
                 ),
             )
         }
-        return AccountsData(banks = banks, syncInProgress = syncInProgress)
+        return AccountsData(
+            banks = banks,
+            syncInProgress = syncInProgress,
+            missingAccounts = parseMissingAccounts(json),
+            missingAccountsBankName = parseMissingAccountsBankName(json),
+        )
+    }
+
+    /**
+     * Parses the one-shot top-level `missing_accounts` field
+     * (bank-connection-management D14): set at the auth callback when a
+     * re-authorization merge kept accounts of the previous same-bank session
+     * as local copies, carried — and cleared — by exactly ONE
+     * GET /api/accounts response (null afterwards). The signal is
+     * informational, not pending-choice state: the keep has already
+     * happened server-side; the SPA renders the missing-accounts dialog
+     * from the stashed payload. Absent/null on servers predating the
+     * change → empty list (no dialog).
+     */
+    internal fun parseMissingAccounts(json: String): List<MissingAccount> {
+        val arrayJson = extractJsonArray(json, "missing_accounts") ?: return emptyList()
+        return arrayJson.mapNotNull { entryJson ->
+            val id = extractJsonLong(entryJson, "id") ?: return@mapNotNull null
+            MissingAccount(
+                id = id,
+                name = extractJsonStringOrNull(entryJson, "name"),
+                iban = extractJsonStringOrNull(entryJson, "iban"),
+                newlyMissing = extractJsonBool(entryJson, "newly_missing") ?: true,
+            )
+        }
+    }
+
+    /**
+     * Parses the signal-level `bank_name` — the SIBLING of the top-level
+     * `missing_accounts` field (13.3, review F4), NOT the per-bank
+     * `bank_name` inside the banks array (which appears EARLIER in the
+     * wire, so a first-occurrence extraction would grab the wrong one).
+     * The anchor is the top-level `missing_accounts` key; the scan starts
+     * AFTER it — the signal-level sibling follows (the server emits them
+     * adjacently), and the entries themselves carry no `bank_name`.
+     *
+     * Degrades: `null` when the sibling is JsonNull (the callback lacked
+     * the name), absent (a server predating the change — the client
+     * stash remains the fallback), or when no `missing_accounts` field
+     * exists at all.
+     */
+    internal fun parseMissingAccountsBankName(json: String): String? {
+        val anchor = json.indexOf("\"missing_accounts\":")
+        if (anchor < 0) return null
+        return extractJsonStringOrNull(json.substring(anchor), "bank_name")
     }
 
     /**
@@ -984,6 +1125,31 @@ data class OnboardingState(
      * resolve it (lookup failure — the SPA never guesses sandbox).
      */
     val environment: String? = null,
+    /**
+     * Ever-onboarded marker (bank-connection-management 11.13, finding F7):
+     * TRUE once the first `eb_sessions` row was ever created (persisted at
+     * the auth-callback merge, cleared only by the re-registration purge);
+     * false when the user has NEVER completed onboarding. Nullable — a
+     * server predating the change omits the field → null = unknown (the
+     * SPA falls back to its pre-change client-side tolerance). The
+     * zero-account notice's first-connection detection keys on this
+     * SERVER truth (a remove-all-then-reconnect user is ever-onboarded
+     * and never sees the onboarding notice again).
+     */
+    val everOnboarded: Boolean? = null,
+    /**
+     * One-shot first-connection signal (bank-connection-management 13.1,
+     * review F1): TRUE only on the FIRST state read after a genuine
+     * first-connection merge (the server sets it in the auth-callback
+     * merge and consumes-and-clears it on the first GET
+     * /api/onboarding/state read — the pending_initial_import pattern).
+     * Absent on servers predating the change → null = unknown (the
+     * zero-account notice falls back to the ever-onboarded marker /
+     * mode-snapshot chain). This — never the ever-onboarded marker,
+     * which is already true by the time the redirect cold boot reads it —
+     * keys the zero-account notice's first-connection detection.
+     */
+    val firstConnectionImport: Boolean? = null,
 )
 
 /**
@@ -1107,6 +1273,40 @@ data class AccountsData(
     val banks: List<BankData>,
     /** Global in-flight flag — true while a sync run is executing. */
     val syncInProgress: Boolean,
+    /**
+     * One-shot missing-accounts signal (bank-connection-management D14):
+     * non-empty on exactly ONE fetch after a re-authorization whose merge
+     * kept accounts of the previous same-bank session as local copies;
+     * empty on every other fetch (the server clears the signal when it
+     * carries it). The SPA stashes the payload when seen and renders the
+     * missing-accounts dialog once, then drops it.
+     */
+    val missingAccounts: List<MissingAccount> = emptyList(),
+    /**
+     * The re-authorized bank's name riding the one-shot signal (13.3,
+     * review F4): the redirect cold boot wipes the client's reAuthBank
+     * stash before any fetch carries the signal, so the dialog's
+     * "at {bank}" copy can only come from HERE. Non-null only when the
+     * signal is carried (same one-shot lifetime); null otherwise and on
+     * servers predating the change (the client stash remains the
+     * null-fallback).
+     */
+    val missingAccountsBankName: String? = null,
+)
+
+/** A missing-accounts entry from the one-shot signal (D14). */
+data class MissingAccount(
+    /** Local account row id — the handle for the delete-local endpoint. */
+    val id: Long,
+    val name: String?,
+    val iban: String?,
+    /**
+     * True when the account went missing in THIS re-authorization; false
+     * when it was already kept as a local copy by an earlier one (the
+     * dialog's copy distinguishes the two — a repeated detection lists
+     * both, and the user is never left wondering which data is new).
+     */
+    val newlyMissing: Boolean,
 )
 
 /** A connected bank with its accounts and per-bank sync metadata. */
@@ -1137,6 +1337,19 @@ data class BankData(
      * not report one.
      */
     val psuType: String? = null,
+    /**
+     * The ASPSP BIC persisted at authorization time
+     * (bank-connection-management D13): nullable — NULL for sessions
+     * authorized before the column existed; consumers degrade gracefully
+     * (no BIC line rendered, no placeholder, no error).
+     */
+    val bic: String? = null,
+    /**
+     * The connection's add date (eb_sessions.created_at, epoch millis;
+     * bank-connection-management D13); null when the server does not
+     * report one (degrades gracefully like [bic]).
+     */
+    val connectedAt: Long? = null,
 )
 
 /** A single account with its last-known balance snapshot. */
@@ -1153,6 +1366,14 @@ data class AccountData(
     val referenceDate: String?,
     /** Epoch millis of the balance upsert. */
     val fetchedAt: Long?,
+    /**
+     * 1 = synced within the authorization's account filter;
+     * 0 = kept-as-local-copy (bank-connection-management D9) — outside the
+     * authorization, never re-fetched by the sync runner, excluded from
+     * the dashboard's hero total. Absent on servers predating the change →
+     * 1 (the historical all-accounts-are-synced contract).
+     */
+    val inConsent: Long = 1L,
 )
 
 /** POST /api/sync + /api/onboarding/import-balances trigger outcome. */
@@ -1164,3 +1385,29 @@ data class SyncTriggerResult(
     /** Seconds remaining in the manual cooldown; non-null only when started=false. */
     val cooldownRemainingSeconds: Long?,
 )
+
+/**
+ * POST /api/connections/remove outcome (bank-connection-management D7):
+ * the sequence runs EB-delete FIRST, then the local cleanup transaction —
+ * an EB failure never blocks the removal (the intent principle), and the
+ * result reports honestly which parts happened.
+ */
+sealed class RemoveConnectionResult {
+    /**
+     * The removal completed locally. [ebDeleted] = false means Enable
+     * Banking's DELETE failed (network/5xx) — the local cleanup still ran;
+     * [validUntil] then carries the stored consent expiry for the honest
+     * bank-side caveat line.
+     */
+    data class Ok(
+        val removed: Boolean,
+        val ebDeleted: Boolean,
+        val validUntil: String?,
+    ) : RemoveConnectionResult()
+
+    /** 404: no local session row for this bank (stale SPA state / double remove). */
+    data object NotFound : RemoveConnectionResult()
+
+    /** Request-level failure (network error, server 5xx) — honest error message. */
+    data class Error(val message: String) : RemoveConnectionResult()
+}

@@ -5,8 +5,16 @@ import io.ktor.server.plugins.origin
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.server.sessions.*
+import it.kapfer.bankteller.database.Accounts
 import it.kapfer.bankteller.enablebanking.PsuHeaders
+import it.kapfer.bankteller.server.MissingAccountSignalStore
+import it.kapfer.bankteller.server.MissingAccountSignalPayload
+import it.kapfer.bankteller.server.UserSession
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -54,7 +62,22 @@ fun Route.syncRoutes(
     }
 
     get("/api/accounts") {
-        call.respond(buildAccountsResponse(engine))
+        // One-shot missing-accounts signal (spec: onboarding — email-link
+        // callback route, modified): stored SERVER-SIDE, in-memory at the
+        // auth callback (review F6 ruling: session data stays out of the
+        // cookie — the set is server-computed anyway; the cookie was a
+        // needless roundtrip, a ~4KB size liability, and a client-trust
+        // boundary), carried — and cleared — by exactly ONE response here.
+        // The bank name rides the signal (review F4) and shares its one-shot
+        // lifetime.
+        val userSession = call.sessions.get<UserSession>()
+        val missingSignal = userSession?.let { MissingAccountSignalStore.take(it.username) }
+        call.respond(
+            buildAccountsResponse(
+                engine,
+                missingSignal?.takeIf { it.accounts.isNotEmpty() },
+            ),
+        )
     }
 
     post("/api/onboarding/import-balances") {
@@ -85,16 +108,65 @@ fun Route.syncRoutes(
  * last-known balances, sync state (fresh/stale/error/rate_limited/
  * never_synced with last-run-outcome precedence), consent expiry, and the
  * global in-flight flag.
+ *
+ * Per the connections data contract (spec: bank-connection-management):
+ * every connected bank is included — including banks whose authorization
+ * shares zero accounts (the old empty-bank skip is removed) — each bank
+ * carries `bic` (nullable) and `connected_at` (epoch milliseconds from
+ * `eb_sessions.created_at`), and each account carries `in_consent`
+ * (1 = synced, 0 = kept-as-local-copy).
+ *
+ * Deterministic ordering (spec: bank-connection-management — connections
+ * data contract, ordering scenarios): the bank groups are ordered by ASPSP
+ * name, then country (case-insensitive, stable — the same contract as the
+ * wizard bank list at AccountLinkingRoutes), NOT the source's
+ * `created_at DESC` arrival order; the account rows within each bank
+ * group are ordered by display name (case-insensitive; NULL names last),
+ * then IBAN as the tiebreaker (names can repeat or be generic within a
+ * bank — the IBAN makes the order fully deterministic regardless of the
+ * bank API's arrival order). Both consumers (the dashboard and the
+ * Settings connections section) render in exactly this order — the SPA
+ * needs no client-side sorting.
+ *
+ * @param missingAccounts one-shot signal from the auth callback (kept-as-local-
+ *   copy accounts of the last re-auth merge + the re-authorized bank's name,
+ *   sharing the signal's one-shot lifetime); null when none is pending.
+ *   Always emitted as the top-level `missing_accounts` field — JsonNull when
+ *   nothing is pending, the array otherwise — with its sibling `bank_name`
+ *   (JsonNull when absent, the same degrade contract as the per-entry fields;
+ *   non-null only when the signal is carried).
  */
-internal fun buildAccountsResponse(engine: BalanceSyncEngine): kotlinx.serialization.json.JsonObject {
+internal fun buildAccountsResponse(
+    engine: BalanceSyncEngine,
+    missingAccounts: MissingAccountSignalPayload? = null,
+): JsonObject {
     val database = engine.database
     val sessions = database.ebSessionsQueries.selectAllSessions().executeAsList()
-    val banks = kotlinx.serialization.json.buildJsonArray {
-        for (session in sessions) {
+    // Deterministic bank order: name, then country (case-insensitive,
+    // stable — compareBy keeps source order for full ties). Never
+    // `created_at DESC`: the payload order is a rendering contract shared
+    // by the dashboard and the connections section.
+    val orderedSessions = sessions.sortedWith(
+        compareBy({ it.aspsp_name?.lowercase() ?: "" }, { it.aspsp_country?.lowercase() ?: "" }),
+    )
+    val banks = buildJsonArray {
+        for (session in orderedSessions) {
             val accounts = database.ebSessionsQueries
                 .selectAccountsBySessionIds(listOf(session.id))
                 .executeAsList()
-            if (accounts.isEmpty()) continue
+                // Deterministic account order: display name
+                // (case-insensitive, NULL names LAST — the name is the
+                // user-facing identity), then IBAN as the tiebreaker.
+                // Key order matters: the null flag leads so a NULL name
+                // sorts after every non-null name regardless of its
+                // fallback key value.
+                .sortedWith(
+                    compareBy<Accounts>(
+                        { it.name == null },
+                        { it.name?.lowercase() ?: "" },
+                        { it.iban ?: "" },
+                    ),
+                )
 
             val accountIds = accounts.map { it.id }
             val balances = database.balancesQueries
@@ -135,12 +207,14 @@ internal fun buildAccountsResponse(engine: BalanceSyncEngine): kotlinx.serializa
                     session.aspsp_country?.let { put("bank_country", it) }
                     session.psu_type?.let { put("psu_type", it) }
                     session.logo?.let { put("logo", it) }
+                    put("bic", session.bic)
+                    put("connected_at", session.created_at)
                     session.valid_until?.let { put("valid_until", it) }
                     put("sync_state", syncState)
                     put("consent_broken", consentBroken)
                     latestLog?.completed_at?.let { put("last_sync_at", it) }
                     lastSuccessAt?.let { put("last_success_at", it) }
-                    put("accounts", kotlinx.serialization.json.buildJsonArray {
+                    put("accounts", buildJsonArray {
                         for (account in accounts) {
                             val balance = balances[account.id]
                             add(
@@ -149,6 +223,7 @@ internal fun buildAccountsResponse(engine: BalanceSyncEngine): kotlinx.serializa
                                     account.name?.let { put("name", it) }
                                     account.iban?.let { put("iban", it) }
                                     account.currency?.let { put("currency", it) }
+                                    put("in_consent", account.in_consent)
                                     balance?.balance_amount?.let { put("balance_amount", it) }
                                     balance?.currency?.let { put("balance_currency", it) }
                                     balance?.balance_type?.let { put("balance_type", it) }
@@ -166,5 +241,31 @@ internal fun buildAccountsResponse(engine: BalanceSyncEngine): kotlinx.serializa
     return buildJsonObject {
         put("banks", banks)
         put("sync_in_progress", engine.isSyncInProgress())
+        if (missingAccounts != null) {
+            put(
+                "missing_accounts",
+                buildJsonArray {
+                    for (m in missingAccounts.accounts) {
+                        add(
+                            buildJsonObject {
+                                put("id", m.id)
+                                put("name", m.name)
+                                put("iban", m.iban)
+                                put("newly_missing", m.newlyMissing)
+                            }
+                        )
+                    }
+                },
+            )
+            // The re-authorized bank's name rides the signal (review F4:
+            // the redirect cold boot wipes the client's stash — the dialog's
+            // "at {bank}" copy can only come from here). Same one-shot
+            // lifetime as the array; JsonNull-able when the callback lacked
+            // the name (the same degrade contract as the per-entry fields).
+            put("bank_name", missingAccounts.bankName)
+        } else {
+            put("missing_accounts", JsonNull)
+            put("bank_name", JsonNull)
+        }
     }
 }

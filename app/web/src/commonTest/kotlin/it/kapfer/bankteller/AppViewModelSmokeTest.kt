@@ -12,12 +12,18 @@ import kotlin.test.assertEquals
 class AppViewModelSmokeTest {
 
     @Test
-    fun screen_enum_has_four_values() {
-        assertEquals(4, Screen.entries.size)
+    fun screen_enum_has_five_values_with_settings_appended() {
+        // Settings APPENDS at the end (bank-connection-management 4.2):
+        // the pre-existing members' ordinal positions are part of this
+        // contract — the resolver, the tab bar, and the wizard-origin
+        // state all key on identity, never on ordinals, but the stable
+        // order keeps cold-boot routing diffs readable.
+        assertEquals(5, Screen.entries.size)
         assertEquals(Screen.Loading, Screen.entries[0])
         assertEquals(Screen.Login, Screen.entries[1])
         assertEquals(Screen.Onboarding, Screen.entries[2])
         assertEquals(Screen.Dashboard, Screen.entries[3])
+        assertEquals(Screen.Settings, Screen.entries[4])
     }
 
     @Test

@@ -11,6 +11,7 @@ import io.ktor.server.testing.*
 import it.kapfer.bankteller.enablebanking.*
 import it.kapfer.bankteller.module
 import it.kapfer.bankteller.server.DatabaseFactory
+import it.kapfer.bankteller.server.MissingAccountSignalStore
 import kotlinx.serialization.json.*
 import kotlin.test.*
 import java.time.Instant
@@ -60,6 +61,10 @@ class AccountLinkingRoutesTest {
         // state surviving across testApplication instances — clear it so poll
         // tests start cold.
         clearLinkingSessionConfirmCacheForTests()
+        // The in-memory missing-accounts signal store is top-level server
+        // state too (review F6) — clear it so the one-shot carry-then-clear
+        // tests start with no pending signal.
+        MissingAccountSignalStore.clear()
     }
 
     // -----------------------------------------------------------------------
@@ -84,9 +89,11 @@ class AccountLinkingRoutesTest {
         var aspspsResult: AspsspListResult = AspsspListResult.Ok(emptyList()),
         var startAuthResult: StartAuthResult = StartAuthResult.Error(null, null, "not configured"),
         var authorizeSessionResult: AuthorizeSessionResult = AuthorizeSessionResult.Error(null, null, "not configured"),
+        var deleteSessionResult: DeleteSessionResult = DeleteSessionResult.Ok,
     ) : EnableBankingClient(testCredentialProvider) {
         var lastStartAuth: StartAuthCall? = null
         val authorizeSessionCodes = mutableListOf<String>()
+        val deleteSessionCalls = mutableListOf<String>()
 
         /** Counts data-plane getAspsps calls (source-selection assertions). */
         var aspspsCalls = 0
@@ -111,6 +118,11 @@ class AccountLinkingRoutesTest {
         override suspend fun authorizeSession(code: String): AuthorizeSessionResult {
             authorizeSessionCodes.add(code)
             return authorizeSessionResult
+        }
+
+        override suspend fun deleteSession(sessionId: String): DeleteSessionResult {
+            deleteSessionCalls.add(sessionId)
+            return deleteSessionResult
         }
 
         // Best-effort activation check used by the onboarding completion flow's
@@ -2976,7 +2988,7 @@ class AccountLinkingRoutesTest {
     /** Seeds one eb_sessions row so the given bank counts as connected. */
     private fun seedConnectedSession(name: String, country: String) {
         DatabaseFactory.init().ebSessionsQueries
-            .insertSession("sess-$name-$country", name, country, "personal", 1_000L, null, null)
+            .insertSession("sess-$name-$country", name, country, "personal", 1_000L, null, null, null)
     }
 
     @Test
@@ -3036,5 +3048,629 @@ class AccountLinkingRoutesTest {
             .associateBy { it.jsonObject["name"]!!.jsonPrimitive.content }
         assertEquals(true, byName["Test Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
         assertEquals(false, byName["Other Bank"]!!.jsonObject["connected"]?.jsonPrimitive?.boolean)
+    }
+
+    // =====================================================================
+    // Bank-connection management routes (spec: bank-connection-management)
+    // =====================================================================
+
+    /** Seeds one session with accounts via the store (full merge machinery). */
+    private fun seedSessionWithStore(
+        sessionId: String,
+        name: String,
+        country: String,
+        accounts: List<EbSessionStore.MergedAccount> = emptyList(),
+        validUntil: String? = null,
+        bic: String? = null,
+    ) {
+        EbSessionStore(DatabaseFactory.init()).mergeSession(
+            sessionId = sessionId,
+            aspspName = name,
+            aspspCountry = country,
+            psuType = "personal",
+            accounts = accounts,
+            validUntil = validUntil,
+            bic = bic,
+        )
+    }
+
+    private suspend fun HttpClient.accountsJson(): JsonObject {
+        val response = get("/api/accounts")
+        assertEquals(HttpStatusCode.OK, response.status)
+        return Json.parseToJsonElement(response.bodyAsText()).jsonObject
+    }
+
+    private suspend fun HttpClient.removeConnection(aspspName: String, aspspCountry: String): JsonObject {
+        val response = post("/api/connections/remove") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"$aspspName","aspsp_country":"$aspspCountry"}""")
+        }
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        return body.also { assertEquals(HttpStatusCode.OK, response.status, "remove must answer 200, got: $body") }
+    }
+
+    @Test
+    fun `remove connection with EB success deletes everything derived and reports eb_deleted true`() = testApplication {
+        seedDb()
+        seedSessionWithStore(
+            "sess-1", "Test Bank", "DE",
+            accounts = listOf(EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+            validUntil = "2026-12-31T00:00:00Z",
+        )
+        val db = DatabaseFactory.init()
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        val account = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(session.id)).executeAsOne()
+        db.balancesQueries.upsertBalance(account.id, "100.00", "EUR", "CLBD", "2026-10-01", 1_000L)
+        db.balancesQueries.insertSyncLog(session.id, "manual", 1_000L, 2_000L, "success", null, null)
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val body = sessionClient.removeConnection("Test Bank", "DE")
+        assertEquals(true, body["removed"]?.jsonPrimitive?.boolean)
+        assertEquals(true, body["eb_deleted"]?.jsonPrimitive?.boolean)
+        assertEquals("2026-12-31T00:00:00Z", body["valid_until"]?.jsonPrimitive?.content)
+
+        // EB delete FIRST with the persisted session id.
+        assertEquals(listOf("sess-1"), fake.deleteSessionCalls)
+        // Local cleanup: session + accounts + balances + sync_log all gone.
+        assertEquals(0L, db.ebSessionsQueries.countSessions().executeAsOne())
+        assertEquals(0L, db.ebSessionsQueries.countAccounts().executeAsOne())
+        assertNull(db.balancesQueries.selectBalanceByAccountId(account.id).executeAsOneOrNull())
+        assertEquals(0L, db.balancesQueries.countSyncLogsBySessionId(session.id).executeAsOne())
+    }
+
+    @Test
+    fun `remove connection with EB failure still removes locally and reports eb_deleted false with valid_until`() = testApplication {
+        seedDb()
+        seedSessionWithStore(
+            "sess-1", "Test Bank", "DE",
+            accounts = listOf(EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+            validUntil = "2026-12-31T00:00:00Z",
+        )
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient(
+            deleteSessionResult = DeleteSessionResult.Error(500, null, "Internal Server Error"),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val body = sessionClient.removeConnection("Test Bank", "DE")
+        assertEquals(true, body["removed"]?.jsonPrimitive?.boolean, "EB failure never blocks removal")
+        assertEquals(false, body["eb_deleted"]?.jsonPrimitive?.boolean)
+        assertEquals("2026-12-31T00:00:00Z", body["valid_until"]?.jsonPrimitive?.content, "valid_until carries the stored consent expiry")
+        // Local cleanup STILL ran.
+        assertEquals(0L, db.ebSessionsQueries.countSessions().executeAsOne())
+        assertEquals(0L, db.ebSessionsQueries.countAccounts().executeAsOne())
+    }
+
+    @Test
+    fun `remove connection with EB 404 proceeds as already gone`() = testApplication {
+        seedDb()
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val db = DatabaseFactory.init()
+
+        // The client maps 404 → Ok (already gone); the route proceeds identically.
+        val fake = FakeEnableBankingClient(deleteSessionResult = DeleteSessionResult.Ok)
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val body = sessionClient.removeConnection("Test Bank", "DE")
+        assertEquals(true, body["removed"]?.jsonPrimitive?.boolean)
+        assertEquals(true, body["eb_deleted"]?.jsonPrimitive?.boolean)
+        assertEquals(listOf("sess-1"), fake.deleteSessionCalls)
+        assertEquals(0L, db.ebSessionsQueries.countSessions().executeAsOne())
+    }
+
+    @Test
+    fun `remove connection for a bank without a local session answers 404 with no EB call and no deletion`() = testApplication {
+        seedDb()
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val response = sessionClient.post("/api/connections/remove") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Never Bank","aspsp_country":"XX"}""")
+        }
+        assertEquals(HttpStatusCode.NotFound, response.status)
+        assertTrue(fake.deleteSessionCalls.isEmpty(), "no EB call for a bank with no local session row")
+        // No deletion: the existing bank's session survives.
+        assertEquals(1L, db.ebSessionsQueries.countSessions().executeAsOne())
+        assertEquals("sess-1", db.ebSessionsQueries.selectAllSessions().executeAsList().single().session_id)
+    }
+
+    @Test
+    fun `delete-local removes only kept local copies with their balances`() = testApplication {
+        seedDb()
+        seedSessionWithStore(
+            "sess-1", "Test Bank", "DE",
+            accounts = listOf(
+                EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+                EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Spar"),
+            ),
+        )
+        // Re-auth without DE2 → DE2 becomes a kept local copy (in_consent = 0).
+        seedSessionWithStore(
+            "sess-2", "Test Bank", "DE",
+            accounts = listOf(EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+        )
+        val db = DatabaseFactory.init()
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-2").executeAsOne()
+        val accounts = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(session.id)).executeAsList()
+        val live = accounts.single { it.iban == "DE1" }
+        val kept = accounts.single { it.iban == "DE2" }
+        assertEquals(0L, kept.in_consent)
+        db.balancesQueries.upsertBalance(live.id, "100.00", "EUR", "CLBD", "2026-10-01", 1_000L)
+        db.balancesQueries.upsertBalance(kept.id, "50.00", "EUR", "CLBD", "2026-09-01", 1_000L)
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // Ask for BOTH — the live account must be refused at the query level.
+        val response = sessionClient.post("/api/accounts/delete-local") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"account_ids":[${kept.id}, ${live.id}]}""")
+        }
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertEquals(listOf(kept.id), body["deleted_account_ids"]!!.jsonArray.map { it.jsonPrimitive.long })
+        // The kept account + its balances are gone; the live account + balance survive.
+        assertNull(db.ebSessionsQueries.selectAccountById(kept.id).executeAsOneOrNull())
+        assertNull(db.balancesQueries.selectBalanceByAccountId(kept.id).executeAsOneOrNull())
+        assertNotNull(db.ebSessionsQueries.selectAccountById(live.id).executeAsOneOrNull())
+        assertEquals("100.00", db.balancesQueries.selectBalanceByAccountId(live.id).executeAsOne().balance_amount)
+    }
+
+    @Test
+    fun `accounts payload carries bic connected_at in_consent and includes zero-account banks`() = testApplication {
+        seedDb()
+        seedSessionWithStore(
+            "sess-1", "Test Bank", "DE",
+            accounts = listOf(EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+            validUntil = "2026-12-31T00:00:00Z",
+            bic = "TESTDEFF",
+        )
+        // A connected bank whose authorization shares zero accounts.
+        seedSessionWithStore("sess-2", "Empty Bank", "FR")
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val body = sessionClient.accountsJson()
+        val banks = body["banks"]!!.jsonArray
+        assertEquals(2, banks.size, "zero-account banks are included in the payload")
+        val byName = banks.associateBy { it.jsonObject["bank_name"]!!.jsonPrimitive.content }
+
+        val testBank = byName["Test Bank"]!!.jsonObject
+        assertEquals("TESTDEFF", testBank["bic"]?.jsonPrimitive?.content)
+        val sessionRow = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        assertEquals(sessionRow.created_at, testBank["connected_at"]?.jsonPrimitive?.long, "connected_at = created_at (epoch ms)")
+        val account = testBank["accounts"]!!.jsonArray.single().jsonObject
+        assertEquals(1L, account["in_consent"]?.jsonPrimitive?.long)
+
+        val emptyBank = byName["Empty Bank"]!!.jsonObject
+        assertEquals(0, emptyBank["accounts"]!!.jsonArray.size)
+        assertEquals(null, emptyBank["bic"]?.jsonPrimitive?.contentOrNull, "bic is null for sessions without one")
+
+        // No signal pending → missing_accounts is null (present, not absent).
+        assertTrue(body["missing_accounts"] is JsonNull, "missing_accounts must be JsonNull when no signal is pending")
+    }
+
+    @Test
+    fun `missing_accounts one-shot signal is carried by exactly one accounts response`() = testApplication {
+        seedDb()
+        // Previous session of Test Bank/DE with one account; the new
+        // authorization (below) shares none → the account is kept locally.
+        seedSessionWithStore(
+            "old-sess", "Test Bank", "DE",
+            accounts = listOf(EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+        )
+        val db = DatabaseFactory.init()
+        val keptId = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(db.ebSessionsQueries.selectSessionBySessionId("old-sess").executeAsOne().id))
+            .executeAsOne().id
+
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", bic = "TESTDEFF", psuTypes = listOf("personal"), maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(url = "https://bank.example/auth", authorizationId = "auth-1", psuIdHash = "hash-1"),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "new-sess",
+                accounts = listOf(AccountResource(uid = "u2", iban = "DE2", currency = "EUR", name = "Giro")),
+                // The real EB authorize response carries the ASPSP identity —
+                // the merge needs it to find the superseded same-bank session.
+                aspsp = Aspssp(name = "Test Bank", country = "DE"),
+                psuType = null,
+                access = null,
+            ),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // Drive the auth callback so the merge runs and the signal is set.
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+        val callbackResponse = sessionClient.get("/enable-banking-callback") {
+            parameter("code", "the-code")
+            parameter("state", state)
+        }
+        assertEquals(HttpStatusCode.OK, callbackResponse.status)
+
+        // First fetch: the one-shot signal is carried — accounts AND the bank
+        // name together (review F4: the name rides the signal, same one-shot
+        // lifetime).
+        val first = sessionClient.accountsJson()
+        val missing = first["missing_accounts"]!!.jsonArray
+        assertEquals(1, missing.size)
+        val entry = missing.single().jsonObject
+        assertEquals(keptId, entry["id"]?.jsonPrimitive?.long)
+        assertEquals("DE1", entry["iban"]?.jsonPrimitive?.content)
+        assertEquals("Giro", entry["name"]?.jsonPrimitive?.content)
+        assertEquals(true, entry["newly_missing"]?.jsonPrimitive?.boolean)
+        assertEquals("Test Bank", first["bank_name"]?.jsonPrimitive?.content, "the re-authorized bank's name rides the signal")
+
+        // Second fetch: cleared — exactly one response carried it (both the
+        // array and the sibling bank_name).
+        val second = sessionClient.accountsJson()
+        assertTrue(second["missing_accounts"] is JsonNull, "the signal must be cleared after exactly one response")
+        assertTrue(second["bank_name"] is JsonNull, "the bank name shares the signal's one-shot lifetime")
+    }
+
+    @Test
+    fun `3_9 accounts payload orders banks by name then country and accounts by name then iban`() = testApplication {
+        seedDb()
+        // Seeded in DESCENDING name order (the DB's natural arrival order is
+        // created_at DESC — the payload must NOT inherit it).
+        seedSessionWithStore(
+            "sess-z", "zeta bank", "NL",
+            accounts = listOf(
+                EbSessionStore.MergedAccount("NL-Z", "uz", "EUR", "savings"),
+                EbSessionStore.MergedAccount("NL-A", "ua", "EUR", "Giro"),
+            ),
+        )
+        // Same name, different country — the country tiebreaker governs.
+        seedSessionWithStore("sess-b2", "alpha bank", "SE", accounts = listOf(EbSessionStore.MergedAccount("SE-A", "ub", "EUR", "Giro")))
+        seedSessionWithStore("sess-b1", "alpha bank", "DE", accounts = listOf(EbSessionStore.MergedAccount("DE-A", "ub", "EUR", "Giro")))
+        // Case-insensitive name order ("Alpha" < "zeta" despite the case).
+        seedSessionWithStore(
+            "sess-c", "Alpha bank", "FI",
+            accounts = listOf(
+                // NULL name sorts LAST within the bank group (name is the
+                // user-facing identity); generic names tie → IBAN tiebreaker.
+                EbSessionStore.MergedAccount("FI-C", "uc", "EUR", null),
+                EbSessionStore.MergedAccount("FI-B", "ub", "EUR", "salary account"),
+                EbSessionStore.MergedAccount("FI-A", "ua", "EUR", "Salary Account"),
+            ),
+        )
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val body = sessionClient.accountsJson()
+        val banks = body["banks"]!!.jsonArray
+        assertEquals(
+            listOf("alpha bank", "Alpha bank", "alpha bank", "zeta bank"),
+            banks.map { it.jsonObject["bank_name"]!!.jsonPrimitive.content },
+            "bank groups are ordered by name (case-insensitive), then country — never created_at DESC",
+        )
+        assertEquals(
+            listOf("DE", "FI", "SE", "NL"),
+            banks.map { it.jsonObject["bank_country"]!!.jsonPrimitive.content },
+            "a name tie (case-insensitive) falls back to the country tiebreaker",
+        )
+
+        val alphaFi = banks[1].jsonObject
+        assertEquals(
+            listOf("Salary Account", "salary account", null),
+            alphaFi["accounts"]!!.jsonArray.map { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull },
+            "accounts are ordered by display name case-insensitively, NULL names last",
+        )
+        assertEquals(
+            listOf("FI-A", "FI-B"),
+            alphaFi["accounts"]!!.jsonArray.take(2).map { it.jsonObject["iban"]!!.jsonPrimitive.content },
+            "a name tie falls back to the IBAN tiebreaker",
+        )
+        assertNull(
+            alphaFi["accounts"]!!.jsonArray[2].jsonObject["name"],
+            "the NULL-name account sorts last within its bank group",
+        )
+
+        val zeta = banks[3].jsonObject
+        assertEquals(
+            listOf("NL-A", "NL-Z"),
+            zeta["accounts"]!!.jsonArray.map { it.jsonObject["iban"]!!.jsonPrimitive.content },
+            "within-bank account order follows name (Giro before savings), case-insensitively",
+        )
+    }
+
+    // =====================================================================
+    // Ever-onboarded marker (design D18; spec: database — ever-onboarded
+    // marker; onboarding-view-position — server-resolved route)
+    // =====================================================================
+
+    @Test
+    fun `remove-last-connection keeps the dashboard route via the ever-onboarded marker`() = testApplication {
+        seedDb()
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // Connected: dashboard + marker set.
+        val connected = sessionClient.stateJson()
+        assertEquals("dashboard", connected.str("route"))
+        assertEquals(true, connected.bool("ever_onboarded"))
+
+        // Remove the last connection (the remove flow's local cleanup).
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        EbSessionStore(db).removeConnectionCleanup(session.id)
+
+        val afterRemove = sessionClient.stateJson()
+        assertEquals(false, afterRemove.bool("auth_completed"), "zero session rows remain")
+        assertEquals(true, afterRemove.bool("ever_onboarded"), "the marker survives removal")
+        assertEquals(
+            "dashboard",
+            afterRemove.str("route"),
+            "an ever-onboarded user never regresses to the wizard — the standing empty state",
+        )
+        assertEquals(false, afterRemove.bool("auth_failed"))
+    }
+
+    @Test
+    fun `stale auth_progress stage after remove-all is a dead letter (dashboard)`() = testApplication {
+        seedDb()
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", psuTypes = listOf("personal"), maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(url = "https://bank.example/auth", authorizationId = "auth-1", psuIdHash = "hash-1"),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // An add-flow leaves an auth_progress stage in the session cookie.
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        // Remove the last connection while the stale stage is still stored.
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        EbSessionStore(db).removeConnectionCleanup(session.id)
+
+        assertEquals(
+            "dashboard",
+            sessionClient.stateJson().str("route"),
+            "the marker outranks the stale stage — it must not become consumable again",
+        )
+    }
+
+    @Test
+    fun `stale bank_selection stage after remove-all is a dead letter (dashboard)`() = testApplication {
+        seedDb()
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val db = DatabaseFactory.init()
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // cancel-linking writes a bank_selection stage into the cookie.
+        sessionClient.post("/api/onboarding/cancel-linking")
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        EbSessionStore(db).removeConnectionCleanup(session.id)
+
+        assertEquals(
+            "dashboard",
+            sessionClient.stateJson().str("route"),
+            "a stale bank_selection stage stays a dead letter after remove-all",
+        )
+    }
+
+    @Test
+    fun `onboarding state reports ever_onboarded false fresh and true after authorization`() = testApplication {
+        seedDb()
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        val fresh = sessionClient.stateJson()
+        assertEquals(false, fresh.bool("ever_onboarded"), "a brand-new database is not onboarded")
+        assertEquals(false, fresh.bool("auth_completed"))
+
+        // First authorization (0 → 1), the same merge transaction the auth
+        // callback performs.
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+
+        val after = sessionClient.stateJson()
+        assertEquals(true, after.bool("ever_onboarded"))
+        assertEquals(true, after.bool("auth_completed"))
+        assertEquals("dashboard", after.str("route"))
+    }
+
+    // =====================================================================
+    // First-connection one-shot signal (review F1; spec: onboarding —
+    // zero-account notice, amended)
+    // =====================================================================
+
+    @Test
+    fun `first_connection_import one-shot is carried and cleared by the state route`() = testApplication {
+        seedDb()
+
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", psuTypes = listOf("personal"), maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(url = "https://bank.example/auth", authorizationId = "auth-1", psuIdHash = "hash-1"),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "sess-1",
+                accounts = listOf(AccountResource(uid = "u1", iban = "DE1", currency = "EUR", name = "Giro")),
+                aspsp = Aspssp(name = "Test Bank", country = "DE"),
+                psuType = "personal",
+                access = null,
+            ),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        // Drive the auth callback: the FIRST merge on an empty DB → the
+        // outcome says first-connection, the callback sets the one-shot.
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+        val callbackResponse = sessionClient.get("/enable-banking-callback") {
+            parameter("code", "the-code")
+            parameter("state", state)
+        }
+        assertEquals(HttpStatusCode.OK, callbackResponse.status)
+
+        // The FIRST state read carries the signal together with
+        // pending_initial_import (the redirect cold boot's first read).
+        val first = sessionClient.stateJson()
+        assertEquals(true, first.bool("first_connection_import"), "the genuine first connection reports the signal")
+        assertEquals(true, first.bool("pending_initial_import"))
+        assertEquals(true, first.bool("ever_onboarded"), "the marker flipped inside the merge — it cannot carry this truth")
+
+        // The SECOND read: consumed and cleared — never again.
+        val second = sessionClient.stateJson()
+        assertEquals(false, second.bool("first_connection_import"), "the one-shot is cleared by the first read")
+        assertEquals(false, second.bool("pending_initial_import"))
+    }
+
+    @Test
+    fun `reconnect of an ever-onboarded user reports no first-connection signal`() = testApplication {
+        seedDb()
+        // An existing connection makes the user ever-onboarded.
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", psuTypes = listOf("personal"), maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(url = "https://bank.example/auth", authorizationId = "auth-1", psuIdHash = "hash-1"),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "sess-2",
+                accounts = listOf(AccountResource(uid = "u2", iban = "DE2", currency = "EUR", name = "Giro")),
+                aspsp = Aspssp(name = "Test Bank", country = "DE"),
+                psuType = "personal",
+                access = null,
+            ),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+        sessionClient.get("/enable-banking-callback") {
+            parameter("code", "the-code")
+            parameter("state", state)
+        }
+
+        // The merge was 1 → 2 — no first-connection signal (reconnect with
+        // sessions present: no zero-account notice for an ever-onboarded
+        // user).
+        val stateJson = sessionClient.stateJson()
+        assertEquals(false, stateJson.bool("first_connection_import"))
+        assertEquals(true, stateJson.bool("pending_initial_import"), "the import signal is independent of the first-connection truth")
+    }
+
+    @Test
+    fun `remove-all-then-reconnect reports no first-connection signal (marker survives removal)`() = testApplication {
+        seedDb()
+        // The REAL remove-all shape (delta review F1-1): the user connected,
+        // removed ALL connections (the session rows are gone; the ever-onboarded
+        // marker SURVIVES by design), then reconnects — the merge IS a 0 → 1
+        // transition, and the bare-transition signal would re-fire the
+        // zero-account notice for an ever-onboarded user. The marker gates it.
+        seedSessionWithStore("sess-1", "Test Bank", "DE")
+        val store = EbSessionStore(DatabaseFactory.init())
+        val sessionRowId = DatabaseFactory.init().ebSessionsQueries
+            .selectSessionBySessionId("sess-1").executeAsOne().id
+        store.removeConnectionCleanup(sessionRowId)
+
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", psuTypes = listOf("personal"), maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(url = "https://bank.example/auth", authorizationId = "auth-2", psuIdHash = "hash-2"),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "sess-2",
+                accounts = listOf(AccountResource(uid = "u2", iban = "DE2", currency = "EUR", name = "Giro")),
+                aspsp = Aspssp(name = "Test Bank", country = "DE"),
+                psuType = "personal",
+                access = null,
+            ),
+        )
+        application {
+            module(controlPlaneClient = controlPlaneClient(), enableBankingClientFactory = { fake })
+        }
+        val sessionClient = loggedInClient()
+
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+        sessionClient.get("/enable-banking-callback") {
+            parameter("code", "the-code")
+            parameter("state", state)
+        }
+
+        // The merge was 0 → 1 WITH the marker present — no signal.
+        val stateJson = sessionClient.stateJson()
+        assertEquals(false, stateJson.bool("first_connection_import"), "the surviving marker gates the 0→1 signal (F1-1)")
+        assertEquals(true, stateJson.bool("pending_initial_import"), "the import signal is independent of the first-connection truth")
     }
 }

@@ -218,6 +218,14 @@ class BalanceSyncEngine(
         var fetchableCount = 0
         var successCount = 0
 
+        // Race guard (remove-during-sync): the session may have been removed
+        // between this run's snapshot and its sync — skip it entirely (no
+        // wasted EB call, no writes). A guarded no-op never fails the run.
+        if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
+            logger.info("Sync (type=$syncType): session $sessionRowId removed before its sync began — skipping")
+            return
+        }
+
         // 1. Session status refresh — non-fatal: on error the previously
         //    stored valid_until remains unchanged and balance fetching continues.
         //    A consent-dead error code here marks the session's consent broken
@@ -253,13 +261,28 @@ class BalanceSyncEngine(
             }
         }
 
-        // 2. Balance fetching per fetchable account (null-uid accounts skipped).
+        // 2. Balance fetching per fetchable account (non-null uid AND
+        //    in_consent = 1 — kept-as-local-copy accounts are never re-fetched).
         val accounts = database.ebSessionsQueries
             .selectAccountsBySessionIds(listOf(sessionRowId))
             .executeAsList()
 
         for (account in accounts) {
-            val uid = account.uid ?: continue // skip null-uid accounts
+            val uid = account.uid
+            if (uid == null || account.in_consent == 0L) continue // not fetchable
+            // Race guard (remove-during-sync): SQLite FK enforcement is off, so
+            // a write against a removed row would succeed as an invisible
+            // orphan. The session may have been removed since this run's
+            // snapshot — re-check existence before fetching; a guarded no-op
+            // never fails the run (the removal was the user's explicit act).
+            if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
+                logger.info("Sync (type=$syncType): session $sessionRowId removed mid-run — skipping its remaining accounts")
+                return
+            }
+            if (database.ebSessionsQueries.selectAccountById(account.id).executeAsOneOrNull() == null) {
+                logger.info("Sync (type=$syncType): account ${account.id} removed mid-run — skipping its fetch")
+                continue
+            }
             fetchableCount++
             when (val result = client.getBalances(uid, psuHeaders)) {
                 is BalancesResult.Ok -> {
@@ -279,6 +302,18 @@ class BalanceSyncEngine(
                                 "Sync (type=$syncType): balance entry for account $uid missing amount/currency"
                             )
                         } else {
+                            // Race guard re-check BEFORE the write (the EB call
+                            // above took time — the account/session may have been
+                            // removed in between). A skipped write is a no-op,
+                            // never a run failure.
+                            if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
+                                logger.info("Sync (type=$syncType): session $sessionRowId removed mid-run — skipping its remaining accounts")
+                                return
+                            }
+                            if (database.ebSessionsQueries.selectAccountById(account.id).executeAsOneOrNull() == null) {
+                                logger.info("Sync (type=$syncType): account ${account.id} removed mid-run — skipping its balance upsert")
+                                continue
+                            }
                             database.balancesQueries.upsertBalance(
                                 account_id = account.id,
                                 balance_amount = amount,
@@ -348,6 +383,14 @@ class BalanceSyncEngine(
             CONSENT_DEAD_ERROR_CODES.first()
         } else {
             sawErrorCode
+        }
+        // Race guard (remove-during-sync): the session may have been removed
+        // since this run's snapshot — a sync_log insert against a deleted
+        // session would be an invisible orphan (FK enforcement is off). A
+        // guarded no-op never fails the run.
+        if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
+            logger.info("Sync (type=$syncType): session $sessionRowId removed mid-run — sync-log write skipped")
+            return
         }
         database.balancesQueries.insertSyncLog(
             session_id = sessionRowId,

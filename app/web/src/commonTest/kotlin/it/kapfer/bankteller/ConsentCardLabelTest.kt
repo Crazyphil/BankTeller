@@ -6,10 +6,15 @@ import kotlin.test.assertTrue
 
 /**
  * Tests for the per-card consent label decision (task 8.9 "Bank-scoped
- * consent health"): a consent-dead bank ([BankData.consentBroken]) shows the
- * ended state in danger styling REGARDLESS of `valid_until` — a future or
- * NULL expiry timestamp must never yield a "Consent valid for N days"
- * countdown beside a consent-dead notice.
+ * consent health"; countdown REMOVED by bank-connection-management 11.12
+ * — user ruling: lifecycle info lives in bank management): a consent-dead
+ * bank ([BankData.consentBroken]) shows the ended state REGARDLESS of
+ * `valid_until` — a future or NULL expiry timestamp must never suppress
+ * the incident label. Every non-broken consent — healthy, expiring,
+ * expired, unparseable, absent — yields NO per-card label: the countdown
+ * lives solely on the Settings bank-connections section's consent-health
+ * badge (§6.1.8.1), and urgency is carried by the top-level expiring
+ * notice, never a quiet per-card countdown.
  *
  * Timestamps are relative to the real clock (the parsers use the Platform
  * seam's Date.now) — valid dates far in the future keep the test robust.
@@ -19,7 +24,7 @@ class ConsentCardLabelTest {
     @Test
     fun consentLabel_brokenBank_overridesFutureValidUntil() {
         // Premature expiry: consent-dead flag with a valid_until still in
-        // the future — the ended state wins, never a countdown.
+        // the future — the ended state wins.
         val farFuture = "2027-01-01T00:00:00Z"
         assertEquals(
             ConsentCardLabel.Broken,
@@ -45,16 +50,35 @@ class ConsentCardLabelTest {
     }
 
     @Test
-    fun consentLabel_healthyBank_yieldsValidDaysCountdown() {
+    fun consentLabel_healthyBank_yieldsNoLabel() {
+        // 11.12: the per-card countdown is GONE — a healthy far-future
+        // consent renders NO label at all. The countdown lives solely on
+        // the Settings connections-section badge.
         val farFuture = "2027-01-01T00:00:00Z"
-        val label = consentCardLabel(farFuture, consentBroken = false)
-        assertTrue(label is ConsentCardLabel.ValidDays)
-        assertTrue((label as ConsentCardLabel.ValidDays).days > 0)
+        assertEquals(
+            ConsentCardLabel.None,
+            consentCardLabel(farFuture, consentBroken = false),
+        )
     }
 
     @Test
-    fun consentLabel_expiredWithoutBrokenFlag_yieldsNoCountdown() {
-        // Expired consent (no broken flag): no negative countdown.
+    fun consentLabel_expiringWithinSevenDays_yieldsNoLabel() {
+        // 11.12: even within the urgency threshold the per-card label is
+        // NONE — the ≤7-day case is carried by the TOP-LEVEL expiring
+        // notice (its DecisionBox with the re-authorization action) and
+        // the connections-section badge's brass "Consent expiring", never
+        // a quiet per-card countdown.
+        val threeDaysOut = formatRfc3339Utc(getCurrentEpochMillis() + 3 * 24 * 3_600_000L)
+        assertEquals(
+            ConsentCardLabel.None,
+            consentCardLabel(threeDaysOut, consentBroken = false),
+        )
+    }
+
+    @Test
+    fun consentLabel_expiredWithoutBrokenFlag_yieldsNoLabel() {
+        // Expired consent (no broken flag): no per-card label (the
+        // top-level expired notice carries the incident).
         val past = "2020-01-01T00:00:00Z"
         assertEquals(
             ConsentCardLabel.None,
@@ -79,10 +103,10 @@ class ConsentCardLabelTest {
     }
 
     @Test
-    fun consentLabel_expiredWithinTheLastDay_yieldsNoneNotZeroDayCountdown() {
-        // Regression (review finding 2): truncating division kept a consent
-        // expired less than 24h ago at days=0 — a "ValidDays(0)" countdown —
-        // instead of -1/expired. Floor division must yield None.
+    fun consentLabel_expiredWithinTheLastDay_yieldsNone() {
+        // Regression (review finding 2, carried past the countdown's
+        // removal): floor division keeps a consent expired less than 24h
+        // in the expired bucket — never a "0 days" artifact.
         val oneHourAgo = formatRfc3339Utc(getCurrentEpochMillis() - 3_600_000L)
         assertEquals(
             ConsentCardLabel.None,

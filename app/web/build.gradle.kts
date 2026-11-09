@@ -50,6 +50,7 @@ kotlin {
             implementation(libs.compose.foundation)
             implementation(compose.material3)
             implementation(compose.materialIconsExtended) // Material Symbols for theme/status icons (task 5.4)
+            implementation(libs.material3WindowSizeClass) // viewport measurement for the Settings master-detail breakpoint (bank-connection-management 4.1)
             implementation(libs.compose.ui)
             implementation(compose.components.resources)
             implementation(libs.compose.uiToolingPreview)

@@ -702,9 +702,23 @@ class OnboardingService(
         // honest) AND overwrite the system_config credentials. The purge runs at
         // persist time — after registration success, before verifyFreshCredentials
         // (a best-effort activation check whose failure must not skip the purge).
+        //
+        // The purge is TOTAL (spec: database — consent expiry and logo columns,
+        // purge-totality clause): balances and sync_log rows go with their
+        // accounts/sessions — FK enforcement is off, so leaving them would
+        // accumulate invisible orphans. (The local-copy KEEP requirement is
+        // merge-path only; a re-registration deletes everything by design.)
+        //
+        // Re-registration is the ONE place that un-onboards: clearing the
+        // ever-onboarded marker restores wizard routing (spec: database —
+        // ever-onboarded marker, cleared only by the explicit re-registration
+        // purge). It rides the same transaction as the row purge.
         database.transaction {
             database.ebSessionsQueries.deleteAllAccounts()
             database.ebSessionsQueries.deleteAllSessions()
+            database.balancesQueries.deleteAllBalances()
+            database.balancesQueries.deleteAllSyncLogs()
+            database.systemConfigQueries.deleteValue(EbSessionStore.EVER_ONBOARDED_KEY)
             database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
             database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
             database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)

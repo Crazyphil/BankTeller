@@ -1857,6 +1857,35 @@ class OnboardingServiceTest {
             ),
         )
         assertTrue(db.ebSessionsQueries.hasAnySession().executeAsOne())
+        // The stale authorization also set the ever-onboarded marker (merge
+        // transaction 0 → 1); re-registration must clear it so onboarding
+        // routes again.
+        assertTrue(EbSessionStore(db).isEverOnboarded())
+        // Dependent rows from the old app's sync history: a balance snapshot
+        // and a sync_log run for the stale session's account. FK enforcement
+        // is off — leaving them behind would accumulate invisible orphans
+        // (review F2: the purge is TOTAL).
+        val staleSessionRow = db.ebSessionsQueries.selectSessionBySessionId("stale-session").executeAsOne()
+        val staleAccountRow = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(staleSessionRow.id))
+            .executeAsOne()
+        db.balancesQueries.upsertBalance(
+            account_id = staleAccountRow.id,
+            balance_amount = "100.00",
+            currency = "EUR",
+            balance_type = "CLBD",
+            reference_date = "2026-10-01",
+            fetched_at = 1_000L,
+        )
+        db.balancesQueries.insertSyncLog(
+            session_id = staleSessionRow.id,
+            sync_type = "manual",
+            started_at = 1_000L,
+            completed_at = 2_000L,
+            status = "success",
+            error_code = null,
+            error_message = null,
+        )
 
         val engine = MockEngine { request ->
             when {
@@ -1899,6 +1928,24 @@ class OnboardingServiceTest {
         // false so the login gate routes to onboarding, not Dashboard.
         assertFalse(db.ebSessionsQueries.hasAnySession().executeAsOne())
         assertEquals(0, db.ebSessionsQueries.countAccounts().executeAsOne())
+        // The ever-onboarded marker is cleared by the same purge — the only
+        // place that un-onboards (spec: database — ever-onboarded marker).
+        assertFalse(EbSessionStore(db).isEverOnboarded())
+        assertEquals(
+            null,
+            db.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
+        )
+        // The purge is TOTAL (review F2): balances and sync_log rows go with
+        // their accounts/sessions — all six row classes gone.
+        assertNull(
+            db.balancesQueries.selectBalanceByAccountId(staleAccountRow.id).executeAsOneOrNull(),
+            "the stale account's balance row must be purged",
+        )
+        assertEquals(
+            0L,
+            db.balancesQueries.countSyncLogsBySessionId(staleSessionRow.id).executeAsOne(),
+            "the stale session's sync_log rows must be purged",
+        )
     }
 
     @Test

@@ -66,4 +66,48 @@ class AmountFormattingTest {
         assertEquals(3, currencyFractionDigits("KWD"))
         assertEquals(2, currencyFractionDigits("XYZ")) // unknown → default 2
     }
+
+    // ---------------------------------------------------------------
+    // The amount/code split (task 13.7 — decimal-separator alignment)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun formatAmountNumberForLocale_rendersTheFigureWithoutTheCodeSuffix() {
+        // The amount-only half of the pair: identical formatting to
+        // formatAmountForLocale minus the " CODE" suffix — the aligned
+        // figure block renders this, the code renders as a separate
+        // trailing label.
+        assertEquals("1.234,50", formatAmountNumberForLocale("1234.5", "EUR", "de-DE"))
+        assertEquals("1,234.50", formatAmountNumberForLocale("1234.5", "EUR", "en-US"))
+        assertEquals("1.234", formatAmountNumberForLocale("1234", "JPY", "de-DE"))
+        assertEquals("1,234.567", formatAmountNumberForLocale("1234.567", "BHD", "en-US"))
+        assertEquals("-1.234,50", formatAmountNumberForLocale("-1234.5", "EUR", "de-DE"))
+    }
+
+    @Test
+    fun formatAmountNumberForLocale_fallsBackVerbatimWithoutTheCode() {
+        // Unparseable input: the verbatim number alone — the code suffix
+        // remains the composing caller's concern (formatAmountForLocale
+        // still appends it).
+        assertEquals("not-a-number", formatAmountNumberForLocale("not-a-number", "EUR", "de-DE"))
+        assertEquals("not-a-number EUR", formatAmountForLocale("not-a-number", "EUR", "de-DE"))
+    }
+
+    @Test
+    fun formatAmountNumberForLocale_composesBackIntoTheFullFigure() {
+        // The composition contract: number + " " + code == the
+        // formatAmountForLocale result for every existing caller.
+        for ((amount, currency) in listOf(
+            "1234.5" to "EUR",
+            "98765" to "USD",
+            "1234" to "JPY",
+            "1234.567" to "BHD",
+            "-0.2" to "EUR",
+            "not-a-number" to "EUR",
+        )) {
+            val number = formatAmountNumberForLocale(amount, currency, "de-DE")
+            val full = formatAmountForLocale(amount, currency, "de-DE")
+            assertEquals("$number $currency", full)
+        }
+    }
 }

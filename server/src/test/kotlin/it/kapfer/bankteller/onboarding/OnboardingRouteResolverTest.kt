@@ -19,7 +19,7 @@ class OnboardingRouteResolverTest {
         applicationIdPresent: Boolean = true,
         appState: EbApplicationState? = EbApplicationState.ACTIVE,
         linkingCompleted: Boolean = true,
-        authCompleted: Boolean = true,
+        everOnboarded: Boolean = true,
         authFailed: Boolean = false,
         onboardingStage: String? = null,
         stageBankKnown: Boolean = true,
@@ -31,7 +31,7 @@ class OnboardingRouteResolverTest {
         applicationIdPresent = applicationIdPresent,
         appState = appState,
         linkingCompleted = linkingCompleted,
-        authCompleted = authCompleted,
+        everOnboarded = everOnboarded,
         authFailed = authFailed,
         onboardingStage = onboardingStage,
         stageBankKnown = stageBankKnown,
@@ -86,7 +86,7 @@ class OnboardingRouteResolverTest {
     fun `marker cleared falls through to the normal ladder`() {
         assertEquals(
             OnboardingRoute.DASHBOARD,
-            resolveOnboardingRoute(input(registrationInProgress = false, authCompleted = true)),
+            resolveOnboardingRoute(input(registrationInProgress = false, everOnboarded = true)),
         )
         assertEquals(
             OnboardingRoute.EMAIL_ENTRY,
@@ -147,7 +147,7 @@ class OnboardingRouteResolverTest {
             resolveOnboardingRoute(
                 input(
                     appState = EbApplicationState.DELETED,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                 ),
             ),
@@ -166,7 +166,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                 ),
             ),
         )
@@ -180,7 +180,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = true, // eb_sessions row exists — still ActivationGuide
+                    everOnboarded = true, // eb_sessions row exists — still ActivationGuide
                 ),
             ),
         )
@@ -198,7 +198,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                 ),
             ),
@@ -218,7 +218,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                     stageBankLinked = true,
                 ),
@@ -238,7 +238,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                     stageBankLinked = false,
                 ),
@@ -257,7 +257,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                     stageBankLinked = false,
                 ),
@@ -273,7 +273,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                 ),
             ),
@@ -288,7 +288,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                 ),
             ),
@@ -303,7 +303,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = true, // e.g. the authorization completed in another tab
+                    everOnboarded = true, // e.g. the authorization completed in another tab
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                 ),
             ),
@@ -315,7 +315,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = true,
+                    everOnboarded = true,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                 ),
             ),
@@ -330,7 +330,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                     stageBankKnown = false,
                 ),
@@ -342,7 +342,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                     stageBankKnown = false,
                 ),
@@ -358,7 +358,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_NEVER_LINKED,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.BANK_SELECTION,
                     stageBankKnown = false, // carries no triple by design
                 ),
@@ -374,7 +374,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = "mystery_stage",
                 ),
             ),
@@ -382,20 +382,120 @@ class OnboardingRouteResolverTest {
     }
 
     // =====================================================================
-    // Rung 5 — eb_sessions → dashboard
+    // Rung 5 — ever-onboarded marker → dashboard (design D18)
     // =====================================================================
 
     @Test
-    fun `eb_sessions row routes to dashboard (expired or revoked consent does not regress)`() {
+    fun `ever-onboarded routes to dashboard (expired or revoked consent does not regress)`() {
         assertEquals(
             OnboardingRoute.DASHBOARD,
             resolveOnboardingRoute(
                 input(
                     appState = EbApplicationState.ACTIVE,
-                    linkingCompleted = false, // whitelist fetch degraded — eb_sessions still authoritative
-                    authCompleted = true,
+                    linkingCompleted = false, // whitelist fetch degraded — the marker still authoritative
+                    everOnboarded = true,
                 ),
             ),
+        )
+    }
+
+    @Test
+    fun `ever-onboarded user with zero session rows routes to dashboard (remove-all)`() {
+        // The remove-last-connection state: no eb_sessions row exists, but the
+        // marker survives (cleared only by the re-registration purge) — the
+        // standing empty state, never the wizard.
+        assertEquals(
+            OnboardingRoute.DASHBOARD,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    everOnboarded = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `stale auth_progress stage after remove-all is a dead letter (dashboard)`() {
+        assertEquals(
+            OnboardingRoute.DASHBOARD,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = true,
+                    everOnboarded = true,
+                    onboardingStage = OnboardingStage.AUTH_PROGRESS,
+                    stageBankKnown = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `stale bank_selection stage after remove-all is a dead letter (dashboard)`() {
+        assertEquals(
+            OnboardingRoute.DASHBOARD,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = false,
+                    everOnboarded = true,
+                    onboardingStage = OnboardingStage.BANK_SELECTION,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `ever-onboarded user's auth failure routes to the dashboard (auth_failed guard)`() {
+        assertEquals(
+            OnboardingRoute.DASHBOARD,
+            resolveOnboardingRoute(
+                input(
+                    appState = EbApplicationState.ACTIVE,
+                    linkingCompleted = true,
+                    everOnboarded = true,
+                    authFailed = true,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `never-onboarded routing is unchanged (no marker, no sessions)`() {
+        // Linked-but-never-authorized → the resume card.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(linkingCompleted = true, everOnboarded = false),
+            ),
+        )
+        // Nothing linked → fresh bank selection.
+        assertEquals(
+            OnboardingRoute.BANK_SELECTION,
+            resolveOnboardingRoute(
+                input(linkingCompleted = false, everOnboarded = false),
+            ),
+        )
+    }
+
+    @Test
+    fun `failsafe rungs are unchanged for an ever-onboarded user`() {
+        // Missing credentials → email entry.
+        assertEquals(
+            OnboardingRoute.EMAIL_ENTRY,
+            resolveOnboardingRoute(input(requiresRelogin = true, everOnboarded = true)),
+        )
+        // Deleted application → registration review.
+        assertEquals(
+            OnboardingRoute.REGISTRATION_REVIEW,
+            resolveOnboardingRoute(input(appState = EbApplicationState.DELETED, everOnboarded = true)),
+        )
+        // Registered but never linked → activation guide.
+        assertEquals(
+            OnboardingRoute.ACTIVATION_GUIDE,
+            resolveOnboardingRoute(input(appState = EbApplicationState.INACTIVE_NEVER_LINKED, everOnboarded = true)),
         )
     }
 
@@ -411,7 +511,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_BUT_LINKED,
                     linkingCompleted = true,
-                    authCompleted = true,
+                    everOnboarded = true,
                 ),
             ),
         )
@@ -425,7 +525,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.INACTIVE_BUT_LINKED,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     authFailed = false,
                 ),
             ),
@@ -444,7 +544,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     authFailed = true,
                 ),
             ),
@@ -470,7 +570,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     sandboxEnvironment = true,
                 ),
             ),
@@ -485,7 +585,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.BANK_SELECTION,
                     sandboxEnvironment = true,
                 ),
@@ -501,7 +601,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = true,
+                    everOnboarded = true,
                     sandboxEnvironment = true,
                 ),
             ),
@@ -516,7 +616,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                     authFailed = true,
                     sandboxEnvironment = true,
                 ),
@@ -534,7 +634,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     sandboxEnvironment = false,
                 ),
             ),
@@ -549,7 +649,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     sandboxEnvironment = false,
                 ),
             ),
@@ -572,7 +672,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                     stageBankKnown = true,
                     sandboxEnvironment = true,
@@ -591,7 +691,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     authFailed = true,
                     sandboxEnvironment = true,
                 ),
@@ -609,7 +709,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                     stageBankKnown = true,
                     sandboxEnvironment = false,
@@ -629,7 +729,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.AUTH_PROGRESS,
                     stageBankKnown = true,
                     sandboxEnvironment = false,
@@ -650,7 +750,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = true,
-                    authCompleted = false,
+                    everOnboarded = false,
                 ),
             ),
         )
@@ -664,7 +764,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = EbApplicationState.ACTIVE,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                 ),
             ),
         )
@@ -684,7 +784,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = null,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                 ),
             ),
         )
@@ -698,7 +798,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = null,
                     linkingCompleted = false,
-                    authCompleted = false,
+                    everOnboarded = false,
                     onboardingStage = OnboardingStage.LINKING_PROGRESS,
                 ),
             ),
@@ -713,7 +813,7 @@ class OnboardingRouteResolverTest {
                 input(
                     appState = null,
                     linkingCompleted = false,
-                    authCompleted = true,
+                    everOnboarded = true,
                 ),
             ),
         )

@@ -77,8 +77,45 @@ data class UserSession(
     val stageSessionBaseUrl: String? = null,
     /** ASPSP logo URL staged at POST /api/auth (from the already-fetched list — no extra EB call). */
     val stageAspspLogo: String? = null,
+    /** ASPSP BIC staged at POST /api/auth (from the already-fetched list — no extra EB call). */
+    val stageAspspBic: String? = null,
     /** One-shot signal: a freshly authorized session's initial balance import is pending (wizard import step). */
     val pendingInitialImport: Boolean? = null,
+    /**
+     * One-shot signal: the freshly authorized session was the user's FIRST
+     * connection ever (the merge transitioned `eb_sessions` 0 → 1 — the
+     * zero-account notice's "first connection ever" predicate). Set at the
+     * auth callback ONLY when the merge outcome says first-connection
+     * (an ever-onboarded user's reconnect is never a first connection);
+     * consumed-and-cleared by the FIRST `GET /api/onboarding/state` read —
+     * exactly the [pendingInitialImport] pattern (the redirect cold boot
+     * wipes client-side mode snapshots, so the SPA cannot derive this truth
+     * itself; the ever-onboarded marker flips to true inside the same merge
+     * transaction and can no longer distinguish the two cases).
+     */
+    val firstConnectionImport: Boolean? = null,
+    // The one-shot missing-accounts signal moved SERVER-SIDE (review F6
+    // ruling: the set is merge-computed server data — never a cookie
+    // payload; the old cookie field was a needless client roundtrip, a
+    // ~4KB size liability at scale, and a client-trust boundary). It lives
+    // in system_config via MissingAccountSignalStore, carried — and
+    // cleared — by exactly one GET /api/accounts response (design D14).
+)
+
+/**
+ * One account kept as a local copy by a same-bank re-auth merge (missing from
+ * the new authorization's account set). Stored SERVER-SIDE via
+ * [MissingAccountSignalStore] (review F6 ruling: server-computed data never
+ * rides the cookie); serialized into `GET /api/accounts` as
+ * `{id, name, iban, newly_missing}` (the wire name is written explicitly by
+ * the payload builder).
+ */
+@Serializable
+data class MissingAccountSignal(
+    val id: Long,
+    val name: String? = null,
+    val iban: String? = null,
+    val newlyMissing: Boolean,
 )
 
 @Serializable

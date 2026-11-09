@@ -1,6 +1,8 @@
 package it.kapfer.bankteller.onboarding
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -24,13 +26,11 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
@@ -44,6 +44,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import io.ktor.http.encodeURLParameter
@@ -53,6 +54,7 @@ import it.kapfer.bankteller.copyToClipboard
 import it.kapfer.bankteller.jetBrainsMonoFamily
 import it.kapfer.bankteller.openSandboxCredentialsPopup
 import it.kapfer.bankteller.openUrlInNewTab
+import it.kapfer.bankteller.ui.components.denseWash
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import kotlinx.coroutines.delay
@@ -371,14 +373,23 @@ private fun CopyFieldButton(value: String) {
         },
         state = rememberTooltipState(),
     ) {
+        // Shared dense wash (§6.1.1, task 11.2) instead of the IconButton's
+        // ripple — one mechanism for the whole dense tier.
+        val interactionSource = remember { MutableInteractionSource() }
         CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
-            IconButton(
-                onClick = {
-                    copyToClipboard(value)
-                    copied = true
-                },
-                modifier = Modifier.size(24.dp),
-                shape = MaterialTheme.shapes.small,
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .clickable(
+                        interactionSource = interactionSource,
+                        indication = null,
+                    ) {
+                        copyToClipboard(value)
+                        copied = true
+                    }
+                    .denseWash(interactionSource),
+                contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
@@ -413,14 +424,23 @@ private fun PopOutButton(bank: Aspssp) {
         },
         state = rememberTooltipState(),
     ) {
+        // Shared dense wash (§6.1.1, task 11.2) instead of the TextButton's
+        // ripple — one mechanism for the whole 28dp tier.
+        val interactionSource = remember { MutableInteractionSource() }
         CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
-            TextButton(
-                onClick = {
-                    openSandboxCredentialsPopup(buildSandboxCredentialsPopupUrl(bank.name, bank.country))
-                },
-                modifier = Modifier.height(28.dp),
-                shape = MaterialTheme.shapes.small,
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+            Row(
+                modifier = Modifier
+                    .height(28.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .clickable(
+                        interactionSource = interactionSource,
+                        indication = null,
+                    ) {
+                        openSandboxCredentialsPopup(buildSandboxCredentialsPopupUrl(bank.name, bank.country))
+                    }
+                    .denseWash(interactionSource)
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
                     imageVector = Icons.Filled.OpenInNew,
@@ -451,14 +471,26 @@ private fun PopOutButton(bank: Aspssp) {
  */
 @Composable
 private fun DocsLink() {
+    // Shared dense wash (§6.1.1, task 11.2) instead of the TextButton's
+    // ripple. The text must align flush with the credential rows above
+    // the divider, but a 0dp start padding makes the wash border on the
+    // text. Instead the control carries symmetric 8dp padding and is
+    // shifted left by 8dp via a negative offset — the text lands flush
+    // while the wash has equal padding on every side.
+    val interactionSource = remember { MutableInteractionSource() }
     CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
-        TextButton(
-            onClick = { openUrlInNewTab(SANDBOX_DOCS_URL) },
+        Row(
             modifier = Modifier
                 .offset(x = -8.dp)
-                .height(28.dp),
-            shape = MaterialTheme.shapes.small,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                .height(28.dp)
+                .clip(MaterialTheme.shapes.small)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                ) { openUrlInNewTab(SANDBOX_DOCS_URL) }
+                .denseWash(interactionSource)
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 text = "View Enable Banking sandbox documentation",

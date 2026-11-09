@@ -93,6 +93,7 @@ import it.kapfer.bankteller.ui.components.BankLogo
 import it.kapfer.bankteller.ui.components.QuietActionButton
 import it.kapfer.bankteller.ui.components.WaitingIndicator
 import it.kapfer.bankteller.ui.components.BrandedTopBar
+import it.kapfer.bankteller.ui.components.CropSignaledScroll
 import it.kapfer.bankteller.ui.components.DecisionBox
 import it.kapfer.bankteller.ui.components.LedgerScrollbar
 import it.kapfer.bankteller.ui.components.QuietButton
@@ -975,9 +976,11 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                 { viewModel.exitAddMode() }
             } else null,
             backLabel = if (viewModel.isAddMode) "Back to dashboard" else "Back",
-            // Shape B (§6.1.5): the LazyColumn below is the step's primary
-            // scrollable — the scaffold's zone stays non-scrolling and the
-            // dividers key on this list state.
+            // Shape B (§6.1.5, D19): the LazyColumn below is the step's
+            // primary scrollable — the scaffold's zone stays
+            // non-scrolling; the list is wrapped in CropSignaledScroll
+            // (below), which owns its crop-signal hairlines at the LIST'S
+            // own bounds — never over the pinned search field.
             listScrollState = bankListState,
             forward = {
                 val selected = viewModel.selectedAspsp
@@ -1047,41 +1050,64 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        // LedgerScrollbar wrap (task 8.22): hairline overlay
-                        // thumb per §6.1.4 — replaces the platform
-                        // VerticalScrollbar, which renders unstyled on
-                        // wasmJs. des-3: no height cap — the weighted list
-                        // takes the remaining content-zone height and the
-                        // thumb spans its full height. The LazyColumn keeps
-                        // its 12dp trailing padding so cards never slide
-                        // under the thumb.
-                        LedgerScrollbar(
+                        // CropSignaledScroll (task 11.14, D19): the
+                        // crop-signal hairlines render at the LIST'S own
+                        // bounds — top while scrolled past offset 0
+                        // (BELOW the pinned search field and orientation
+                        // line, never over them — the retired zone-edge
+                        // overlay rendered over the search field because
+                        // it assumed the whole zone was the scrollable),
+                        // bottom while more banks remain below the fold.
+                        // Composition order per D19: the wrapper's Box
+                        // hosts the LazyColumn; the LedgerScrollbar wraps
+                        // the same list state INSIDE the wrapper's
+                        // content slot (the thumb's trailing-edge inset
+                        // measures against the wrapper's bounds); the
+                        // hairlines are the wrapper's own overlays.
+                        // des-3: no height cap — the weighted wrapper
+                        // takes the remaining content-zone height. The
+                        // LazyColumn keeps its 12dp trailing padding so
+                        // cards never slide under the thumb.
+                        CropSignaledScroll(
                             listState = bankListState,
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxWidth(),
                         ) {
-                            LazyColumn(
-                                state = bankListState,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(end = 12.dp),
-                                verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+                            LedgerScrollbar(
+                                listState = bankListState,
+                                modifier = Modifier.matchParentSize(),
                             ) {
+                                LazyColumn(
+                                    state = bankListState,
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(end = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(Dimens.sm),
+                                ) {
                                 items(
                                     items = filtered,
                                     key = { bank -> "${bank.name}-${bank.country}" },
                                 ) { bank ->
                                     val isSelected = viewModel.selectedAspsp?.name == bank.name &&
                                             viewModel.selectedAspsp?.country == bank.country
-                                    // Task 9.2 — connected banks are BLOCKED: one
-                                    // bank holds exactly one authorization, so a
-                                    // connected entry is disabled (no click, dimmed
-                                    // identity) with a supporting explanation. Its
-                                    // account set can be extended by re-authorizing
-                                    // the bank once its consent expires or is
-                                    // revoked — no in-product affordance to
-                                    // refresh a live bank's authorization exists.
+                                    // bank-connection-management (onboarding
+                                    // spec, SPA BankSelection step — this
+                                    // change's modification of the archived
+                                    // add-account-overview ruling): connected
+                                    // banks are BLOCKED — one bank holds
+                                    // exactly one authorization, so a
+                                    // connected entry is disabled (no click,
+                                    // dimmed identity) with a supporting
+                                    // explanation. Its account set CAN be
+                                    // extended in-product: by refreshing the
+                                    // bank's authorization — the Settings
+                                    // bank connections section's per-bank
+                                    // "Refresh authorization" action (live
+                                    // consents). Dead/expired consents keep
+                                    // the dashboard's notice-driven
+                                    // re-authorization triggers — the same
+                                    // reason-agnostic direct-entry path.
                                     val connected = bank.connected
                                     OutlinedCard(
                                         modifier = Modifier
@@ -1226,15 +1252,19 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                             }
                                         }
                                         if (connected) {
-                                            // Supporting explanation (task 9.2) — full
-                                            // quiet contrast beside the dimmed identity:
-                                            // honest about WHEN the refresh becomes
-                                            // available (no in-product affordance to
-                                            // refresh a live bank's authorization
-                                            // exists yet).
+                                            // Supporting explanation (bank-connection-management
+                                            // — this change's onboarding spec modification): full
+                                            // quiet contrast beside the dimmed identity, honest
+                                            // about WHERE the refresh lives now that the in-product
+                                            // affordance exists — Settings, Bank connections, the
+                                            // bank's "Refresh authorization" action. Worded, never
+                                            // "Settings → Bank connections": the bundled text fonts
+                                            // carry no arrow codepoints (a literal arrow renders
+                                            // TOFU). Dead/expired consents keep the dashboard's
+                                            // notice-driven triggers for the same path.
                                             Text(
                                                 text = "Already connected — you can extend its account set by " +
-                                                        "re-authorizing this bank once its consent expires or is revoked.",
+                                                        "refreshing this bank's authorization under Settings, Bank connections.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 modifier = Modifier.padding(
@@ -1246,6 +1276,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }

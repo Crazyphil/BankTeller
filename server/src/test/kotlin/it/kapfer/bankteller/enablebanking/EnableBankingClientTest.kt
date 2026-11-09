@@ -4,6 +4,7 @@ import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.http.content.TextContent
@@ -231,6 +232,50 @@ class EnableBankingClientTest {
     }
 
     @Test
+    fun `authorizeSession parses identification_hash on accounts and tolerates unknown fields`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """
+                    {
+                        "session_id": "sess-1",
+                        "accounts": [
+                            {
+                                "uid": "acc-1",
+                                "iban": "DE89370400440532013000",
+                                "currency": "EUR",
+                                "name": "Giro",
+                                "identification_hash": "9b74c9897bac770ffc029102a200c5de",
+                                "some_future_field": "ignored"
+                            },
+                            {"uid": "acc-2", "name": "NoHash"}
+                        ],
+                        "aspsp": {"name": "Test Bank", "country": "DE"},
+                        "psu_type": "personal",
+                        "access": {"valid_until": "2027-01-01T00:00:00Z", "balances": true, "transactions": true}
+                    }
+                """.trimIndent(),
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.authorizeSession("the-code")
+        assertTrue(result is AuthorizeSessionResult.Ok, "Expected Ok but got: $result")
+        val accounts = result.accounts
+        assertEquals(2, accounts.size)
+        assertEquals(
+            "9b74c9897bac770ffc029102a200c5de",
+            accounts.first().identificationHash,
+            "identification_hash must be parsed, never dropped by the tolerant parser",
+        )
+        // An account without the field in the (malformed) response is null —
+        // BankTeller's type is nullable, but the parser must not lose present values.
+        assertEquals(null, accounts[1].identificationHash)
+        assertEquals("acc-2", accounts[1].uid)
+        client.close()
+    }
+
+    @Test
     fun `authorizeSession non-200 returns Error`() = runBlocking {
         val engine = MockEngine { request ->
             respond(
@@ -242,6 +287,76 @@ class EnableBankingClientTest {
         val result = client.authorizeSession("the-code")
         assertTrue(result is AuthorizeSessionResult.Error, "Expected Error but got: $result")
         assertEquals(400, result.statusCode)
+        client.close()
+    }
+
+    // =====================================================================
+    // deleteSession — DELETE /sessions/{id} (bank-connection-management)
+    // =====================================================================
+
+    @Test
+    fun `deleteSession sends DELETE with RS256 JWT auth and maps 200 to Ok`() = runBlocking {
+        var method: HttpMethod? = null
+        var urlPath: String? = null
+        val engine = MockEngine { request ->
+            method = request.method
+            urlPath = request.url.encodedPath
+            val auth = request.headers["Authorization"]
+            assertNotNull(auth, "deleteSession must send an Authorization header")
+            assertTrue(auth.startsWith("Bearer "), "Authorization must be a Bearer token, got: $auth")
+            respond(
+                content = """{"message":"OK"}""",
+                status = HttpStatusCode.OK,
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.deleteSession("sess-123")
+        assertEquals(HttpMethod.Delete, method, "deleteSession must DELETE")
+        assertEquals("/sessions/sess-123", urlPath)
+        assertTrue(result is DeleteSessionResult.Ok, "200 must map to Ok, got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `deleteSession maps 404 to Ok as already gone`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"error":"SESSION_DOES_NOT_EXIST","detail":"Session not found"}""",
+                status = HttpStatusCode.NotFound,
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.deleteSession("sess-gone")
+        assertTrue(result is DeleteSessionResult.Ok, "404 must map to Ok (already gone), got: $result")
+        client.close()
+    }
+
+    @Test
+    fun `deleteSession maps 5xx to honest Error`() = runBlocking {
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"error":"ASPSP_ERROR","detail":"bank unavailable"}""",
+                status = HttpStatusCode.BadGateway,
+            )
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.deleteSession("sess-123")
+        assertTrue(result is DeleteSessionResult.Error, "Expected Error but got: $result")
+        assertEquals(502, result.statusCode)
+        assertEquals("ASPSP_ERROR", result.errorCode)
+        assertEquals("bank unavailable", result.message)
+        client.close()
+    }
+
+    @Test
+    fun `deleteSession maps network failure to Error without retry`() = runBlocking {
+        val engine = MockEngine { request ->
+            throw java.io.IOException("connection reset")
+        }
+        val client = EnableBankingClient(credentialProvider, engine)
+        val result = client.deleteSession("sess-123")
+        assertTrue(result is DeleteSessionResult.Error, "Expected Error but got: $result")
+        assertEquals(null, result.statusCode)
         client.close()
     }
 }

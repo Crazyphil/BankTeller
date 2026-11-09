@@ -1,7 +1,5 @@
 package it.kapfer.bankteller.ui.components
 
-import androidx.compose.foundation.ScrollState
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,8 +17,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.derivedStateOf
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,29 +26,13 @@ import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 
 /**
- * Header-divider predicate (§6.1.5): the hairline beneath the fixed header
- * renders ONLY while the active scroll is past offset 0 — it dissolves at
- * rest and never renders when the content fits the zone (rangePx == 0).
- */
-internal fun showWizardHeaderDivider(rangePx: Int, offsetPx: Int): Boolean =
-    rangePx > 0 && offsetPx > 0
-
-/**
- * Footer-divider predicate (§6.1.5): the hairline above the pinned footer
- * renders ONLY while the container can still scroll forward (offset below
- * the range) — it dissolves at the end and never renders when the content
- * fits. Mirrors [showWizardHeaderDivider] symmetrically.
- */
-internal fun showWizardFooterDivider(rangePx: Int, offsetPx: Int): Boolean =
-    rangePx > 0 && offsetPx < rangePx
-
-/**
  * Multi-step flow scaffold implementing the three-zone wizard shell
- * (§6.1.5, des-3 ruling): a fixed header (eyebrow, progress, title,
- * one-liner), a flexible content zone that hosts the step's PRIMARY
- * scrollable, and a pinned footer (quiet back / extra actions left, loud
- * forward right) that never scrolls with content — identical position
- * across every step.
+ * (§6.1.5, des-3 ruling; crop-signal hairlines generalized by
+ * bank-connection-management 11.14 / design D19): a fixed header
+ * (eyebrow, progress, title, one-liner), a flexible content zone that
+ * hosts the step's PRIMARY scrollable, and a pinned footer (quiet back /
+ * extra actions left, loud forward right) that never scrolls with
+ * content — identical position across every step.
  *
  * The scaffold fills its parent's height and manages its own scroll; the
  * hosting screen must NOT double-wrap it in a scrolling shell (pass
@@ -60,17 +40,30 @@ internal fun showWizardFooterDivider(rangePx: Int, offsetPx: Int): Boolean =
  *
  * Two content shapes share the zone:
  *  - Default ([listScrollState] == null): the zone itself scrolls the
- *    content via a [ScrollState] with a [LedgerScrollbar] overlay; short
- *    steps leave intentional whitespace above the pinned footer.
- *  - [listScrollState] != null: the step manages its own scrollable (e.g.
- *    the bank-selection LazyColumn) inside a non-scrolling zone; the
- *    dividers key on that [LazyListState] instead. The step's weighted
- *    list fills the remaining zone height.
+ *    content via a [ScrollState]; short steps leave intentional
+ *    whitespace above the pinned footer.
+ *  - [listScrollState] != null: the step manages its own scrollable
+ *    (e.g. the bank-selection LazyColumn) inside a NON-scrolling zone —
+ *    the step composes the scrollable (wrapped in [CropSignaledScroll])
+ *    itself and the zone must not double-scroll it (a nested scrollable
+ *    would break the step's weighted layout). The parameter is now a
+ *    ZONE-SHAPE SWITCH ONLY: the crop-signal hairlines no longer live in
+ *    the scaffold (the step's wrapper owns them, keyed on the same state
+ *    it receives here).
  *
- * Dividers: symmetric 1dp hairlines (`outline` at 8% alpha) overlaid at
- * the zone's top/bottom edges — the header one while scrolled past 0, the
- * footer one while more content remains below the fold. Both dissolve at
- * rest/end and when the content fits.
+ * CROP-SIGNAL HAIRLINES (D19 — the wrapper truth): the scaffold renders
+ * NO zone-edge overlays. Each step's scrollable is wrapped in
+ * [CropSignaledScroll], which draws the 1dp theme-aware hairlines at the
+ * SCROLLABLE'S OWN bounds — top while scrolled past offset 0, bottom
+ * while content extends below the fold, dissolving at the ends, never
+ * at rest. The retired zone-edge overlays had assumed the whole zone
+ * was the scrollable — true only when a list fills the entire zone; on
+ * the bank-list step they rendered the header hairline over the pinned
+ * search field. The geometry truth: the hairlines belong to the bounds
+ * of the thing that scrolls. COMPOSITION ORDER (D19): the wrapper's Box
+ * hosts the scrollable; the [LedgerScrollbar] wraps the same scroll
+ * state INSIDE the wrapper's content slot; the hairlines are the
+ * wrapper's own overlays.
  *
  * [backServerAction] marks the back control as navigate-and-fire (it
  * triggers a server request, e.g. "Back to email" → POST reset): the back
@@ -90,35 +83,13 @@ fun WizardScaffold(
     backServerAction: Boolean = false,
     extraActions: (@Composable RowScope.() -> Unit)? = null,
     forward: (@Composable () -> Unit)? = null,
+    /** Zone-shape switch (D19): non-null → the zone does NOT scroll; the step's own scrollable (in a [CropSignaledScroll]) fills it. */
     listScrollState: LazyListState? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    // Shape A's scroll state — created unconditionally (cheap, and the
-    // divider derivations below read it in that shape).
+    // Shape A's scroll state — the zone-scrolled column below is wrapped
+    // in CropSignaledScroll (the hairlines key on it).
     val scrollState = rememberScrollState()
-
-    // derivedStateOf: dividers flip only when a predicate changes, not on
-    // every scroll frame. Both shapes reduce to (rangePx, offsetPx).
-    val headerDivider by remember(listScrollState) {
-        derivedStateOf {
-            if (listScrollState != null) {
-                val metrics = lazyListScrollbarMetrics(listScrollState.layoutInfo)
-                showWizardHeaderDivider(metrics.rangePx, metrics.offsetPx)
-            } else {
-                showWizardHeaderDivider(scrollState.maxValue, scrollState.value)
-            }
-        }
-    }
-    val footerDivider by remember(listScrollState) {
-        derivedStateOf {
-            if (listScrollState != null) {
-                val metrics = lazyListScrollbarMetrics(listScrollState.layoutInfo)
-                showWizardFooterDivider(metrics.rangePx, metrics.offsetPx)
-            } else {
-                showWizardFooterDivider(scrollState.maxValue, scrollState.value)
-            }
-        }
-    }
 
     Column(
         modifier = modifier
@@ -165,26 +136,38 @@ fun WizardScaffold(
         }
 
         // Zone 2 — flexible content, the step's primary scrollable.
+        // Shape A (listScrollState == null): the zone scrolls; content
+        // top-aligned so short steps leave whitespace above the pinned
+        // footer. The crop-signal hairlines render at the ZONE's bounds
+        // here (the zone IS the scrollable in this shape) — the bottom
+        // one lands just above the pinned footer when content extends
+        // below the fold. Composition order per D19: the wrapper's Box
+        // hosts the scrollable; the LedgerScrollbar wraps the same
+        // scroll state INSIDE the wrapper's content slot.
+        // Shape B (listScrollState != null): the step's own scrollable
+        // (wrapped in its own CropSignaledScroll) fills the non-scrolling
+        // zone — the hairlines key on the step's wrapper, not here.
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (listScrollState == null) {
-                // Shape A: the zone scrolls; content top-aligned so short
-                // steps leave whitespace above the pinned footer.
-                LedgerScrollbar(
+                CropSignaledScroll(
                     scrollState = scrollState,
                     modifier = Modifier.matchParentSize(),
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .verticalScroll(scrollState),
-                        verticalArrangement = Arrangement.spacedBy(Dimens.lg),
+                    LedgerScrollbar(
+                        scrollState = scrollState,
+                        modifier = Modifier.matchParentSize(),
                     ) {
-                        content()
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .verticalScroll(scrollState),
+                            verticalArrangement = Arrangement.spacedBy(Dimens.lg),
+                        ) {
+                            content()
+                        }
                     }
                 }
             } else {
-                // Shape B: the step's own scrollable (e.g. the bank list)
-                // fills the zone; only the dividers key on it here.
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -193,30 +176,6 @@ fun WizardScaffold(
                 ) {
                     content()
                 }
-            }
-
-            // Symmetric hairlines, overlaid at the zone edges so their
-            // appearance causes no layout shift.
-            if (headerDivider) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(1.dp)
-                        .background(
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.08f),
-                        ),
-                )
-            }
-            if (footerDivider) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(1.dp)
-                        .background(
-                            MaterialTheme.colorScheme.outline.copy(alpha = 0.08f),
-                        ),
-                )
             }
         }
 

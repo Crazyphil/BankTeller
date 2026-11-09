@@ -2,15 +2,19 @@
 
 ### Requirement: Top-level navigation structure
 
-The SPA SHALL introduce top-level navigation between authenticated feature screens via a tab bar (per the `design-system-theme` capability's tab bar component requirement) rendered on the dashboard and the settings screen. Navigation state SHALL remain enum-based (`Screen` values switched via `when` in `App.kt`) — no routing library, no back stack, no navigation component dependency. Tab switches are client-side state changes with no page reload and no server round-trip. The wizard remains a full-page overlay entered from any surface (the dashboard empty-state trigger, the bank connections section, the consent notices) and exits back to its origin surface. Public routes (`/privacy`, `/terms`, `/enable-banking-callback`), the login flow, and the onboarding gate are unchanged and remain chrome-free.
+The SPA SHALL introduce top-level navigation between authenticated feature screens via a tab bar (per the `design-system-theme` capability's tab bar component requirement) rendered on the dashboard and the settings screen. Navigation state SHALL remain enum-based (`Screen` values switched via `when` in `App.kt`) — no routing library, no back stack, no navigation component dependency. Tab switches are client-side state changes with no page reload and no server round-trip. The wizard's MID-FLOW steps remain a full-page chrome-free overlay entered from any surface (the dashboard empty-state trigger, the bank connections section, the consent notices) and exits back to its origin surface; the wizard's initial-import step (in-flight, failed, and the zero-account notice) is NOT a bar-suppressing state — it renders confined inside the dashboard's content zone with the tab bar visible (per the design-system-theme capability's tab bar component requirement: the import run is backgroundable, the user may edit settings or connect another bank mid-import, and the zero-account notice persists as a composed pending decision — no auto-continue on tab-away). Public routes (`/privacy`, `/terms`, `/enable-banking-callback`), the login flow, and the onboarding gate are unchanged and remain chrome-free.
 
 #### Scenario: Tab switch is client-side
 - **WHEN** the user switches between the dashboard and settings tabs
 - **THEN** the screen changes client-side (no reload, no server call) and the tab bar's active indicator moves
 
-#### Scenario: Wizard remains a full-page overlay
-- **WHEN** the user enters the wizard from any surface
+#### Scenario: Mid-flow wizard steps remain full-page overlays
+- **WHEN** the user enters the wizard's mid-flow steps (bank selection, linking progress, auth progress) from any surface
 - **THEN** no tab bar renders (the wizard is chrome-free) and exiting returns to the origin surface
+
+#### Scenario: Import step keeps navigation live
+- **WHEN** the initial-import step renders on the dashboard (in flight, failed, or the zero-account notice pending)
+- **THEN** the tab bar remains visible and functional, and the step renders confined to the dashboard's content zone — switching to Settings and back returns to the step still rendering (the notice still pending, never auto-continued)
 
 ### Requirement: Settings surface
 

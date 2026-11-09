@@ -38,4 +38,37 @@ class ScreenShellDividerTest {
         // touch the zone offset) keep it hidden.
         assertFalse(showTopBarDivider(hasTopBar = true, scrollable = false, scrollOffsetPx = 5_000))
     }
+
+    // ---------------------------------------------------------------
+    // Bottom-bar crop-signal hairline (task 11.10): borderless at rest,
+    // 1dp hairline only while content is cropped below the fold,
+    // dissolving at the scroll end — never permanent.
+    // ---------------------------------------------------------------
+
+    @Test
+    fun cropHairline_borderlessAtRest() {
+        // Nothing cropped (canScrollForward false — short content): no
+        // hairline. A permanent hairline is decoration, not a crop signal.
+        assertFalse(showBottomBarCropHairline(hasBottomBar = true, canScrollForward = false))
+    }
+
+    @Test
+    fun cropHairline_visibleWhileContentCroppedBelow() {
+        // Content below the fold → the crop is marked.
+        assertTrue(showBottomBarCropHairline(hasBottomBar = true, canScrollForward = true))
+    }
+
+    @Test
+    fun cropHairline_hiddenWithoutBottomBar() {
+        // Bar-less screens never render the hairline.
+        assertFalse(showBottomBarCropHairline(hasBottomBar = false, canScrollForward = true))
+    }
+
+    @Test
+    fun cropHairline_dissolvesAtScrollEnd() {
+        // Reaching the end exhausts the crop → the hairline dissolves —
+        // the same symmetric discipline as the wizard's pinned footer
+        // (§6.1.5) and the top-bar offset-0 seam.
+        assertFalse(showBottomBarCropHairline(hasBottomBar = true, canScrollForward = false))
+    }
 }

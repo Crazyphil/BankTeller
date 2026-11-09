@@ -91,10 +91,14 @@ actual fun consoleLog(msg: String) {
     consoleLogJs(msg)
 }
 
-@JsFun("() => Math.round(window.devicePixelRatio || 1)")
-private external fun getDevicePixelRatioJs(): Int
+// F3: the FRACTIONAL device pixel ratio, unrounded — Compose for Web
+// uses this exact value as the layout density, so every dp derivation
+// must follow it (a Math.round here misclassifies Windows 125%/150%
+// scaling: DPR 1.5 turns a 1200px window into 800dp, not 600dp).
+@JsFun("() => { try { return (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1.0; } catch (e) { return 1.0; } }")
+private external fun devicePixelRatioJs(): Double
 
-actual fun getDevicePixelRatio(): Int = getDevicePixelRatioJs()
+actual fun devicePixelRatio(): Double = devicePixelRatioJs()
 
 @JsFun("(key) => window.localStorage.getItem(key)")
 private external fun localStorageGetJs(key: String): String?
@@ -176,17 +180,35 @@ private external fun browserLocaleTagJs(): String
 
 actual fun browserLocaleTag(): String = browserLocaleTagJs()
 
+@JsFun("() => (typeof window !== 'undefined' && window.innerWidth) ? window.innerWidth : null")
+private external fun viewportWidthPxJs(): Int?
+
+actual fun viewportWidthPx(): Int? = viewportWidthPxJs()
+
 @JsFun("(value, localeTag, fractionDigits) => new Intl.NumberFormat(localeTag, { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits }).format(value)")
 private external fun numberFormatJs(value: Double, localeTag: String, fractionDigits: Int): String
 
 actual fun formatAmountForLocale(amount: String, currency: String, localeTag: String): String {
+    // The code suffix composes onto the amount-only half (task 13.7) —
+    // the two halves are also consumed separately by the mixed-currency
+    // hero subtotals' aligned figure block.
+    val number = formatAmountNumberForLocale(amount, currency, localeTag)
+    return "$number $currency"
+}
+
+actual fun formatAmountNumberForLocale(amount: String, currency: String, localeTag: String): String {
     val value = amount.toDoubleOrNull()
         // Unparseable input (defensive — the API contract is decimal strings):
         // render verbatim rather than masking the data with a wrong number.
-        ?: return "$amount $currency"
-    val formatted = numberFormatJs(value, localeTag, currencyFractionDigits(currency))
-    return "$formatted $currency"
+        ?: return amount
+    return numberFormatJs(value, localeTag, currencyFractionDigits(currency))
 }
+
+@JsFun("(epochMillis, localeTag) => { try { return new Intl.DateTimeFormat(localeTag, { dateStyle: 'short' }).format(new Date(epochMillis)); } catch (e) { return null; } }")
+private external fun dateFormatJs(epochMillis: Double, localeTag: String): String?
+
+actual fun formatDateForLocale(epochMillis: Long, localeTag: String): String? =
+    dateFormatJs(epochMillis.toDouble(), localeTag)
 
 /**
  * JS interop: takes a Uint8Array of PNG bytes, pre-scales the image using
