@@ -134,8 +134,10 @@ class HeroFreshnessTest {
     // ---------------------------------------------------------------
 
     @Test
-    fun errorContributingBank_broken() {
-        assertEquals(HeroFreshness.Broken, heroFreshness(listOf(bank(syncState = "error"))))
+    fun errorContributingBank_isBrassAttention() {
+        // 4.6a re-tier: a bank-level error (no outcome bins — class
+        // unknown) is retryable-class on the brass side, never danger.
+        assertEquals(HeroFreshness.Attention, heroFreshness(listOf(bank(syncState = "error"))))
     }
 
     @Test
@@ -153,9 +155,11 @@ class HeroFreshnessTest {
 
     @Test
     fun dangerOutranksBrass() {
+        // 4.6a re-based: danger is the consent class — it outranks brass
+        // when a consent-dead bank coexists with retryable failures.
         val stale = bank(name = "Stale Bank", syncState = "stale")
-        val error = bank(name = "Error Bank", syncState = "error")
-        assertEquals(HeroFreshness.Broken, heroFreshness(listOf(stale, error)))
+        val consentDead = bank(name = "Consent Bank", consentBroken = true)
+        assertEquals(HeroFreshness.Broken, heroFreshness(listOf(stale, consentDead)))
     }
 
     @Test
@@ -201,8 +205,9 @@ class HeroFreshnessTest {
                 account(balance = "200.00", currency = "USD"),
             ),
         )
-        assertEquals(HeroFreshness.Broken, heroFreshnessForCurrency(listOf(bank), "EUR"))
-        assertEquals(HeroFreshness.Broken, heroFreshnessForCurrency(listOf(bank), "USD"))
+        // 4.6a: bank-level error is retryable-class — brass attention.
+        assertEquals(HeroFreshness.Attention, heroFreshnessForCurrency(listOf(bank), "EUR"))
+        assertEquals(HeroFreshness.Attention, heroFreshnessForCurrency(listOf(bank), "USD"))
     }
 
     @Test

@@ -1,0 +1,92 @@
+-- Per-account sync outcomes: one row per account balance fetch per run
+-- (design D1 — outcomes as a linked table, not columns on `balances`).
+--
+-- `sync_log` remains the run header (status / error_code / error_message
+-- derivation there is UNCHANGED); this table adds the per-account truth the
+-- localized presentation reads (spec: balance-sync — per-account sync
+-- outcomes; sync-error-presentation — cause-binned error vocabulary).
+--
+-- status: 'success' | 'error' | 'rate_limited'. A consent-dead/expired
+-- session condition propagates to EVERY in-consent account's row for the run
+-- (the severed authorization is the state truth; the row's bin carries
+-- 'consent_dead' / 'consent_expired').
+-- error_bin: NULL for success; 'transient' | 'rate_limited' |
+-- 'consent_dead' | 'consent_expired' when failed.
+-- fetched_at: epoch milliseconds of the fetch. Outcome rows are audit-grade
+-- history — retention/cleanup is out of scope for this change (design D1).
+
+CREATE TABLE sync_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_log_id INTEGER NOT NULL REFERENCES sync_log(id),
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    status TEXT NOT NULL,
+    error_bin TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    fetched_at INTEGER NOT NULL
+);
+
+CREATE INDEX sync_outcomes_account_fetched_idx ON sync_outcomes(account_id, fetched_at);
+CREATE INDEX sync_outcomes_sync_log_idx ON sync_outcomes(sync_log_id);
+
+-- ---------------------------------------------------------------------------
+-- sync_outcomes queries
+-- ---------------------------------------------------------------------------
+
+insertSyncOutcome:
+INSERT INTO sync_outcomes(sync_log_id, account_id, status, error_bin, error_code, error_message, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- Latest outcome per account. Runs are serialized on the engine's run mutex,
+-- so a higher id is always a later run: id DESC is the "latest" order (the
+-- fetched_at DESC key keeps the contract honest for clock anomalies, with id
+-- as the deterministic tie-breaker).
+selectLatestOutcomeByAccountId:
+SELECT * FROM sync_outcomes
+WHERE account_id = ?
+ORDER BY fetched_at DESC, id DESC
+LIMIT 1;
+
+-- Latest outcome for each of a set of accounts (the GET /api/accounts read
+-- path). Ties within the same fetched_at resolve to the highest id — runs are
+-- serialized, so MAX(id) per account is the latest run's outcome; the join on
+-- the id (rather than on fetched_at) keeps one row per account even when two
+-- runs share a millisecond. The INNER JOIN through sync_log drops ORPHANED
+-- outcome rows (review finding 1): re-authorization and remove-connection
+-- delete the session's sync_log rows; outcomes keyed to a deleted run are
+-- unreachable history — the account falls back to its bank-level state
+-- (never-synced renders "Unconfirmed" after re-auth, per spec) instead of
+-- showing a superseded session's failure as current truth.
+selectLatestOutcomesByAccountIds:
+SELECT o.* FROM sync_outcomes AS o
+JOIN (
+    SELECT account_id, MAX(o2.id) AS max_id
+    FROM sync_outcomes AS o2
+    JOIN sync_log AS l ON l.id = o2.sync_log_id
+    WHERE o2.account_id IN ?
+    GROUP BY o2.account_id
+) latest ON o.id = latest.max_id;
+
+-- Per-session "any failed account" rollup: true when any of the session's
+-- in-consent accounts has a FAILED latest outcome (status 'error' or
+-- 'rate_limited' — the spec's "failed" = errored OR rate-limited). Kept-as-
+-- local-copy accounts (in_consent = 0) are excluded: they are never fetched.
+-- (No production consumer since the 5.1a has_issues removal — retained
+-- test-only as the rollup shape's documentation; delete with its tests if
+-- a future feature does not need it.)
+selectAnyFailedAccountBySessionId:
+SELECT COUNT(*) > 0 FROM sync_outcomes AS o
+JOIN accounts AS a ON a.id = o.account_id
+WHERE a.session_id = ? AND a.in_consent = 1
+    AND o.status IN ('error', 'rate_limited')
+    AND o.id = (SELECT MAX(o2.id) FROM sync_outcomes AS o2 WHERE o2.account_id = o.account_id);
+
+-- Delete a session's outcome rows (re-authorization merge + remove-connection
+-- cleanup — mirrors the sync_log cleanup: superseded sessions must not leave
+-- orphaned outcome history readable as current per-account truth).
+deleteOutcomesBySessionIds:
+DELETE FROM sync_outcomes WHERE sync_log_id IN (SELECT id FROM sync_log WHERE session_id IN ?);
+
+-- Test-support count: outcome rows belonging to one session's runs.
+countOutcomesBySessionId:
+SELECT COUNT(*) FROM sync_outcomes WHERE sync_log_id IN (SELECT id FROM sync_log WHERE session_id = ?);

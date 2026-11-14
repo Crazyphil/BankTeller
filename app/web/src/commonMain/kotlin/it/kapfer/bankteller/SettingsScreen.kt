@@ -1,5 +1,7 @@
 package it.kapfer.bankteller
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +30,7 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LocalMinimumInteractiveComponentSize
@@ -57,6 +60,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -838,7 +842,9 @@ private fun BankConnectionsSection(
  */
 internal sealed class ConsentBadgeHealth {
     data class Active(val days: Long?) : ConsentBadgeHealth()
-    data object Expiring : ConsentBadgeHealth()
+
+    /** Days until expiry (0 = expires today) — the count is the actionable part (task 6.7). */
+    data class Expiring(val days: Long) : ConsentBadgeHealth()
     data object Dead : ConsentBadgeHealth()
 }
 
@@ -846,7 +852,7 @@ internal fun consentBadgeHealth(validUntil: String?, consentBroken: Boolean): Co
     if (consentBroken) return ConsentBadgeHealth.Dead
     val days = daysUntil(validUntil) ?: return ConsentBadgeHealth.Active(null)
     if (days < 0) return ConsentBadgeHealth.Dead
-    if (days <= CONSENT_WARNING_DAYS) return ConsentBadgeHealth.Expiring
+    if (days <= CONSENT_WARNING_DAYS) return ConsentBadgeHealth.Expiring(days)
     return ConsentBadgeHealth.Active(days)
 }
 
@@ -856,7 +862,7 @@ internal fun consentBadgeText(health: ConsentBadgeHealth): String = when (health
         null -> "Consent active"
         else -> "Consent active · Valid for $d day${if (d == 1L) "" else "s"}"
     }
-    ConsentBadgeHealth.Expiring -> "Consent expiring"
+    is ConsentBadgeHealth.Expiring -> "Consent expiring · ${health.days} day${if (health.days == 1L) "" else "s"} left"
     ConsentBadgeHealth.Dead -> "Consent ended · Re-authorization required"
 }
 
@@ -871,15 +877,48 @@ internal fun consentBadgeText(health: ConsentBadgeHealth): String = when (health
  * "Remove" danger text button right). A zero-account bank renders the
  * info box with the actions still available; local-copy accounts render
  * tagged with the inline extra-small danger delete affordance.
+ *
+ * Tiered scan signal (localized-sync-errors 5.1, DESIGN-LANGUAGE §6.2.2):
+ * the same border+tint mechanism as dashboard account cards at connection
+ * granularity — danger for consent-dead/expired, brass for degraded-but-live,
+ * healthy unmarked — with ~200ms color transitions. The signal is the ONLY
+ * degradation expression here: never per-account status, counts, or rollups.
  */
 @Composable
 private fun ConnectionCard(viewModel: AppViewModel, bank: BankData) {
+    val tier = connectionDegradationTier(bank)
+
+    // Connection-granularity scan signal (task 5.1): theme tokens only.
+    val tierColor = when (tier) {
+        ConnectionDegradationTier.Danger -> MaterialTheme.colorScheme.error
+        ConnectionDegradationTier.Brass -> LocalBankTellerColors.current.brass
+        ConnectionDegradationTier.Healthy -> null
+    }
+    val tintAlpha = when (tier) {
+        ConnectionDegradationTier.Danger -> 0.06f
+        ConnectionDegradationTier.Brass -> 0.04f
+        ConnectionDegradationTier.Healthy -> 0f
+    }
+    val outline = MaterialTheme.colorScheme.outline
+    val surfaceContainer = MaterialTheme.colorScheme.surfaceContainer
+    val borderColor by animateColorAsState(
+        targetValue = tierColor ?: outline,
+        animationSpec = tween(durationMillis = 200),
+        label = "connection-card-status-border",
+    )
+    val containerColor by animateColorAsState(
+        targetValue = tierColor?.copy(alpha = tintAlpha)?.compositeOver(surfaceContainer) ?: surfaceContainer,
+        animationSpec = tween(durationMillis = 200),
+        label = "connection-card-status-tint",
+    )
+
     OutlinedCard(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        border = BorderStroke(1.dp, borderColor),
         colors = CardDefaults.outlinedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            containerColor = containerColor,
+            contentColor = MaterialTheme.colorScheme.onSurface,
         ),
     ) {
         Column(
@@ -914,7 +953,7 @@ private fun ConnectionCard(viewModel: AppViewModel, bank: BankData) {
             } else {
                 ConnectionAccountList(viewModel, bank)
             }
-            ConnectionFooter(viewModel, bank)
+            ConnectionFooter(viewModel, bank, tier)
         }
     }
 }
@@ -954,7 +993,7 @@ private fun ConnectionHeader(bank: BankData) {
             style = MaterialTheme.typography.labelSmall,
             color = when (health) {
                 is ConsentBadgeHealth.Active -> MaterialTheme.colorScheme.onSurfaceVariant
-                ConsentBadgeHealth.Expiring -> brass
+                is ConsentBadgeHealth.Expiring -> brass
                 ConsentBadgeHealth.Dead -> MaterialTheme.colorScheme.error
             },
         )
@@ -1465,9 +1504,15 @@ internal fun hasNewlyMissing(missing: List<MissingAccount>): Boolean =
  * concern of the dashboard, not of a per-bank connection card (naming
  * discipline — "refresh" never appears unlabeled next to "Refresh
  * authorization").
+ *
+ * Action elevation (localized-sync-errors 5.1, §6.1.8): on a danger-tier
+ * connection the "Refresh authorization" action renders as a prominent
+ * button (primary fill, explicit text, still the 14dp key glyph — never a
+ * circular-arrow glyph); healthy and brass cards keep the quiet Inline
+ * Text XS action.
  */
 @Composable
-private fun ConnectionFooter(viewModel: AppViewModel, bank: BankData) {
+private fun ConnectionFooter(viewModel: AppViewModel, bank: BankData, tier: ConnectionDegradationTier) {
     val lastSynced = bank.lastSyncAt
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1484,52 +1529,13 @@ private fun ConnectionFooter(viewModel: AppViewModel, bank: BankData) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.weight(1f),
         )
-        // "Refresh authorization" — Inline Text XS tier (task 5.6): 28dp
-        // dense opt-out, labelSmall, trimmed padding. Explicit text + the
-        // 14dp key glyph; busy-gated (fires POST /api/auth). The SHARED
-        // dense wash (§6.1.1, task 11.2) replaces the ripple: one
-        // mechanism for the whole tier. Renders for EVERY connected bank
-        // (11.14 — the reason-agnostic direct-entry path serves live,
-        // expiring, dead, and expired consents alike).
-        run {
-            val interactionSource = remember { MutableInteractionSource() }
-            val busy = LocalActionBusy.current
-            CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
-                Row(
-                    modifier = Modifier
-                        .height(28.dp)
-                        .clip(MaterialTheme.shapes.small)
-                        .clickable(
-                            interactionSource = interactionSource,
-                            indication = null,
-                            enabled = !busy,
-                        ) { viewModel.startReauthorizationFlow(bank) }
-                        .denseWash(interactionSource)
-                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Key,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = if (busy) {
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                    )
-                    Spacer(modifier = Modifier.width(Dimens.xs))
-                    Text(
-                        "Refresh authorization",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (busy) {
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                        } else {
-                            MaterialTheme.colorScheme.onSurface
-                        },
-                    )
-                }
-            }
+        // "Refresh authorization" — quiet Inline Text XS on healthy/brass
+        // connections; elevated to a prominent button on danger-tier
+        // connections (localized-sync-errors 5.1). Both render the explicit
+        // text + 14dp key glyph and fire the same direct-entry flow.
+        when (connectionRefreshActionTier(tier)) {
+            ConnectionRefreshActionTier.Quiet -> QuietRefreshAuthorizationAction(viewModel, bank)
+            ConnectionRefreshActionTier.Prominent -> ProminentRefreshAuthorizationAction(viewModel, bank)
         }
         // "Remove" — Inline Text XS (task 5.6): danger text + the 14dp
         // delete glyph; opens the confirmation dialog (the gate). Shared
@@ -1563,6 +1569,95 @@ private fun ConnectionFooter(viewModel: AppViewModel, bank: BankData) {
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * Quiet "Refresh authorization" (Inline Text XS, §6.1.1): 28dp dense
+ * opt-out, labelSmall, trimmed padding, explicit text + leading 14dp key
+ * glyph, busy-gated (fires POST /api/auth), shared dense wash.
+ */
+@Composable
+private fun QuietRefreshAuthorizationAction(viewModel: AppViewModel, bank: BankData) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val busy = LocalActionBusy.current
+    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
+        Row(
+            modifier = Modifier
+                .height(28.dp)
+                .clip(MaterialTheme.shapes.small)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    enabled = !busy,
+                ) { viewModel.startReauthorizationFlow(bank) }
+                .denseWash(interactionSource)
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Key,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = if (busy) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+            Spacer(modifier = Modifier.width(Dimens.xs))
+            Text(
+                "Refresh authorization",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (busy) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+            )
+        }
+    }
+}
+
+/**
+ * Prominent "Refresh authorization" (danger-tier connection, task 5.1):
+ * the SAME 28dp Inline Text XS footprint as the quiet action (user ruling,
+ * 8.4 manual pass: prominence comes from the filled primary treatment and
+ * its color, never from a larger bounding box — the row-height invariant
+ * bounds the action strip at a single quiet line on every card); the
+ * explicit text and the 14dp key glyph stay — the consent act stays
+ * labeled and never uses the circular-arrow sync glyph.
+ */
+@Composable
+private fun ProminentRefreshAuthorizationAction(viewModel: AppViewModel, bank: BankData) {
+    val busy = LocalActionBusy.current
+    CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
+        Row(
+            modifier = Modifier
+                .height(28.dp)
+                .clip(MaterialTheme.shapes.small)
+                .background(MaterialTheme.colorScheme.primary)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    enabled = !busy,
+                ) { viewModel.startReauthorizationFlow(bank) }
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Key,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onPrimary,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(Dimens.xs))
+            Text(
+                text = "Refresh authorization",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
         }
     }
 }

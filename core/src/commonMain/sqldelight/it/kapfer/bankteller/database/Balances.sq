@@ -63,6 +63,15 @@ insertSyncLog:
 INSERT INTO sync_log(session_id, sync_type, started_at, completed_at, status, error_code, error_message)
 VALUES (?, ?, ?, ?, ?, ?, ?);
 
+-- Id of the run header just inserted for a session. insertSyncLog itself
+-- returns only the affected-row count (like insertSession — see
+-- EbSessionStore), so the id is looked up right after the insert: runs are
+-- serialized on the engine's run mutex and the insert immediately precedes
+-- this query inside the same transaction, making the session's highest id
+-- unambiguously the just-inserted row.
+selectLatestSyncLogIdBySessionId:
+SELECT id FROM sync_log WHERE session_id = ? ORDER BY id DESC LIMIT 1;
+
 selectLastSuccessAtBySessionId:
 SELECT completed_at FROM sync_log
 WHERE session_id = ? AND status = 'success' AND completed_at IS NOT NULL

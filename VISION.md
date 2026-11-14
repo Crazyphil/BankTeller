@@ -188,7 +188,7 @@ Items NOT in .env (configured via onboarding or auto-generated):
 | Mode | PSU Headers | Frequency | Rate Limit |
 |------|------------|-----------|------------|
 | **Background sync** | None (offline mode) | ~4x/day (scheduled) | ASPSP rate limit (~4 fetches/day) |
-| **Login sync** | All required (online mode) | Once per login | No rate limit |
+| **Login sync** | All required (online mode) | Once per login | ASPSP background rate limits don't apply to PSU-header fetches |
 | **Initial sync** | All required (online mode) | Immediate after account connection | Captures 90-day history window |
 | **Manual sync** | All required (online mode) | User-initiated, debounced (max 1/min, one in-flight sync at a time) | Rare, for live-data needs |
 

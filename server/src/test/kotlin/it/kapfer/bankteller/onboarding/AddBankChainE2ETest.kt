@@ -320,38 +320,35 @@ class AddBankChainE2ETest {
             val body = Json.parseToJsonElement(importResponse.bodyAsText()).jsonObject
             assertEquals(true, body["started"]?.jsonPrimitive?.boolean, "import must start a real run: ${importResponse.bodyAsText()}")
 
-            // The engine run is async — poll until the initial sync_log rows
-            // for both live sessions exist, then assert on them.
+            // The engine run is async — poll until the initial sync_log row
+            // for the NEWEST session exists.
             val dbB = DatabaseFactory.init()
             waitUntil {
                 val a2 = dbB.ebSessionsQueries.selectSessionBySessionId("sess-alpha-2").executeAsOneOrNull()
-                val b = dbB.ebSessionsQueries.selectSessionBySessionId("sess-beta").executeAsOneOrNull()
-                a2 != null && b != null &&
-                    dbB.balancesQueries.selectLatestSyncLogBySessionId(a2.id).executeAsOneOrNull() != null &&
-                    dbB.balancesQueries.selectLatestSyncLogBySessionId(b.id).executeAsOneOrNull() != null
+                a2 != null &&
+                    dbB.balancesQueries.selectLatestSyncLogBySessionId(a2.id).executeAsOneOrNull() != null
             }
 
-            // The import run covered the new session's account (uid refreshed
-            // by the re-link) AND the other bank's account.
+            // The import run is SCOPED to the newest session (the re-linked
+            // Alpha session): it fetches that session's account and makes NO
+            // Enable Banking call against the other bank's connection.
             val newCalls = fake.balanceCalls.toList().drop(beforeBalanceCalls.size)
-            assertTrue("uid-a1-v2" in newCalls, "import must fetch balances for the re-linked session's account, got: $newCalls")
-            assertTrue("uid-b1" in newCalls, "import must fetch balances for the other bank's account, got: $newCalls")
+            assertTrue("uid-a1-v2" in newCalls, "import must fetch balances for the newly authorized session, got: $newCalls")
+            assertFalse("uid-b1" in newCalls, "import must not touch another bank's connection, got: $newCalls")
 
-            // Balances persisted for both sessions' accounts.
+            // Balance persisted for the new session's account…
             val a2RowB = dbB.ebSessionsQueries.selectSessionBySessionId("sess-alpha-2").executeAsOne()
             val a2AccountB = dbB.ebSessionsQueries.selectAccountsBySessionIds(listOf(a2RowB.id)).executeAsOne()
             assertEquals("222.22", dbB.balancesQueries.selectBalanceByAccountId(a2AccountB.id).executeAsOne().balance_amount)
+            // …and NOT for the other bank's account (untouched by this run).
             val bRowB = dbB.ebSessionsQueries.selectSessionBySessionId("sess-beta").executeAsOne()
             val bAccountB = dbB.ebSessionsQueries.selectAccountsBySessionIds(listOf(bRowB.id)).executeAsOne()
-            assertEquals("333.33", dbB.balancesQueries.selectBalanceByAccountId(bAccountB.id).executeAsOne().balance_amount)
+            assertNull(dbB.balancesQueries.selectBalanceByAccountId(bAccountB.id).executeAsOneOrNull())
 
-            // The initial run is logged as success for both sessions.
+            // The initial run is logged as success for the scoped session only.
             val logA2 = dbB.balancesQueries.selectLatestSyncLogBySessionId(a2RowB.id).executeAsOne()
             assertEquals("initial", logA2.sync_type)
             assertEquals("success", logA2.status)
-            val logB = dbB.balancesQueries.selectLatestSyncLogBySessionId(bRowB.id).executeAsOne()
-            assertEquals("initial", logB.sync_type)
-            assertEquals("success", logB.status)
 
             // GET /api/accounts serves both banks with their accounts.
             val accountsResponse = importClient.get("/api/accounts") {

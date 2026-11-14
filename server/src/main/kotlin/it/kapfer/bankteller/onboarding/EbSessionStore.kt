@@ -293,6 +293,14 @@ class EbSessionStore(private val database: BankTellerDatabase) {
                         )
                     }
                     database.balancesQueries.deleteSyncLogsBySessionIds(oldSessionIds)
+                    // Review finding 1: the superseded session's outcome
+                    // rows must go WITH its sync_log rows — or the
+                    // re-pointed accounts' latest outcomes would still read
+                    // the old session's failures (e.g. its consent-dead
+                    // error) as current truth, preempting the spec's
+                    // "Unconfirmed" never-synced presentation between the
+                    // merge and the new session's first completed run.
+                    database.syncOutcomesQueries.deleteOutcomesBySessionIds(oldSessionIds)
                     database.ebSessionsQueries.deleteSessionByIds(oldSessionIds)
                 }
             }
@@ -318,6 +326,9 @@ class EbSessionStore(private val database: BankTellerDatabase) {
             }
             database.ebSessionsQueries.deleteAccountsBySessionId(sessionRowId)
             database.balancesQueries.deleteSyncLogsBySessionIds(listOf(sessionRowId))
+            // Same orphan rationale as the merge cleanup (review finding 1):
+            // outcome rows keyed to this session's runs leave with them.
+            database.syncOutcomesQueries.deleteOutcomesBySessionIds(listOf(sessionRowId))
             database.ebSessionsQueries.deleteSessionByIds(listOf(sessionRowId))
         }
     }

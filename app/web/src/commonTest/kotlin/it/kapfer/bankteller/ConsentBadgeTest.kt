@@ -31,9 +31,47 @@ class ConsentBadgeTest {
         // future date derived from now.
         val near = javaLikeNowPlusDays(3)
         val expiring = consentBadgeHealth(near, consentBroken = false)
-        assertEquals(ConsentBadgeHealth.Expiring, expiring)
-        assertEquals("Consent expiring", consentBadgeText(expiring))
+        // The day count floors from the same now-derived timestamp — allow
+        // the floor to shave a day (the count copy test below pins exact
+        // wording on the derived value, not a hardcoded number).
+        val days = (expiring as ConsentBadgeHealth.Expiring).days
+        assertTrue(days in 2..3, "floored day count near the 3-day timestamp, was $days")
+        assertEquals(
+            "Consent expiring · $days day${if (days == 1L) "" else "s"} left",
+            consentBadgeText(expiring),
+        )
         assertTrue(health is ConsentBadgeHealth.Dead)
+    }
+
+    @Test
+    fun expiringBadge_oneDayIsSingular() {
+        // A timestamp 1 day + 1 hour out always floors to exactly 1 day —
+        // no race with the test clock.
+        val near = javaLikeNowPlusDays(1, extraHours = 1)
+        val expiring = consentBadgeHealth(near, consentBroken = false)
+        assertEquals(ConsentBadgeHealth.Expiring(1), expiring)
+        assertEquals("Consent expiring · 1 day left", consentBadgeText(expiring))
+    }
+
+    @Test
+    fun daysUntil_expiredUnder24hAgo_floorsToMinus1_neverZero() {
+        // The <24h edge (the daysUntil floor-division contract): a consent
+        // that expired an hour ago yields -1 (Dead), not 0 (Expiring) —
+        // truncating division would keep a dead consent in the brass
+        // "expires soon" bucket for up to a day past its end.
+        val oneHourAgo = javaLikeNowPlusDays(-1, extraHours = 23)
+        assertEquals(-1L, daysUntil(oneHourAgo))
+        assertEquals(ConsentBadgeHealth.Dead, consentBadgeHealth(oneHourAgo, consentBroken = false))
+    }
+
+    @Test
+    fun daysUntil_expiringToday_floorsToZero_notMinus1() {
+        // The mirror edge: a consent expiring later today yields 0
+        // (Expiring, "expires today"), never -1.
+        val inOneHour = javaLikeNowPlusDays(0, extraHours = 1)
+        assertEquals(0L, daysUntil(inOneHour))
+        assertEquals(ConsentBadgeHealth.Expiring(0), consentBadgeHealth(inOneHour, consentBroken = false))
+        assertEquals("Consent expiring · 0 days left", consentBadgeText(consentBadgeHealth(inOneHour, false)))
     }
 
     @Test
@@ -60,9 +98,9 @@ class ConsentBadgeTest {
     }
 
     /** RFC3339 three days from now (compute via the epoch helper, no Date deps). */
-    private fun javaLikeNowPlusDays(days: Long): String {
+    private fun javaLikeNowPlusDays(days: Long, extraHours: Long = 0): String {
         val now = getCurrentEpochMillis()
-        val target = now + days * 24 * 60 * 60 * 1000L
+        val target = now + days * 24 * 60 * 60 * 1000L + extraHours * 3600 * 1000L
         // Format as YYYY-MM-DDThh:mm:ssZ from epoch millis (pure arithmetic).
         val seconds = target / 1000
         val daysSinceEpoch = seconds / 86400

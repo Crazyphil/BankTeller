@@ -1,12 +1,17 @@
 package it.kapfer.bankteller
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
 import it.kapfer.bankteller.onboarding.OnboardingScreen
+import it.kapfer.bankteller.ui.components.DiagnosticTooltipDim
 import it.kapfer.bankteller.ui.components.LocalActionBusy
 import it.kapfer.bankteller.ui.components.LoadingSplash
+import it.kapfer.bankteller.ui.components.observeTouchInput
 import it.kapfer.bankteller.ui.theme.BankTellerTheme
 /**
  * Root composable for the BankTeller SPA.
@@ -55,16 +60,30 @@ fun App() {
         CompositionLocalProvider(
             LocalActionBusy provides (viewModel.isLoading || viewModel.linkStatusChecking),
         ) {
-            when (viewModel.currentScreen) {
-                Screen.Loading -> LoadingSplash()
-                Screen.Login -> LoginScreen(viewModel)
-                Screen.Onboarding -> OnboardingScreen(viewModel)
-                Screen.Dashboard -> DashboardScreen(viewModel)
-                // Settings (bank-connection-management D2/D3): the second
-                // authenticated top-level surface — reachable only via the
-                // client-side tab bar (the resolver never routes here), and
-                // chrome-sharing with the dashboard through the same shell.
-                Screen.Settings -> SettingsScreen(viewModel)
+            // Touch-input observation (task 6.5) on the ANCESTOR box: a
+            // parent is always in the hit-test chain, so this sees every
+            // pointer event (a stacked sibling overlay would not — the
+            // two 8.x regressions). Initial pass, never consumes.
+            Box(Modifier.fillMaxSize().observeTouchInput()) {
+                // Touch-input detection (task 6.5): observation lives on the
+                // ancestor box above — see observeTouchInput.
+                when (viewModel.currentScreen) {
+                    Screen.Loading -> LoadingSplash()
+                    Screen.Login -> LoginScreen(viewModel)
+                    Screen.Onboarding -> OnboardingScreen(viewModel)
+                    Screen.Dashboard -> DashboardScreen(viewModel)
+                    // Settings (bank-connection-management D2/D3): the second
+                    // authenticated top-level surface — reachable only via the
+                    // client-side tab bar (the resolver never routes here), and
+                    // chrome-sharing with the dashboard through the same shell.
+                    Screen.Settings -> SettingsScreen(viewModel)
+                }
+                // Touch dim for persistent diagnostic tooltips (task 6.5,
+                // spec: sync-error-presentation): rendered above the interface,
+                // below the tooltip popup (popups own the top layer). Only
+                // composed while visible (AnimatedVisibility), so it never
+                // blocks clicks when no tooltip is open.
+                DiagnosticTooltipDim()
             }
         }
     }

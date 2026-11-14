@@ -4,6 +4,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import it.kapfer.bankteller.database.BankTellerDatabase
 import java.nio.file.Files
@@ -29,9 +30,17 @@ class DatabaseFactoryTest {
     fun `init on fresh database creates schema and is idempotent`() {
         val path = newTempDbPath()
         System.setProperty("database.path", path)
-        DatabaseFactory.init()
-        // Second init on the same file must not fail (repeat init / restart).
         val db = DatabaseFactory.init()
+        // Migration 5's objects are part of the fresh schema too.
+        assertNull(db.syncOutcomesQueries.selectLatestOutcomeByAccountId(1L).executeAsOneOrNull())
+        db.ebSessionsQueries.insertSession("sess-fresh", "Bank", "DE", "personal", 1_000L, null, null, null)
+        assertEquals(
+            0L,
+            db.ebSessionsQueries.selectSessionBySessionId("sess-fresh").executeAsOne().rate_limit_skip,
+            "fresh schema must carry eb_sessions.rate_limit_skip NOT NULL DEFAULT 0",
+        )
+        // Second init on the same file must not fail (repeat init / restart).
+        val again = DatabaseFactory.init()
     }
 
     @Test
@@ -293,6 +302,124 @@ class DatabaseFactoryTest {
         // Existing balances survive.
         assertEquals("10.00", db.balancesQueries.selectBalanceByAccountId(1).executeAsOne().balance_amount)
         assertEquals("v", db.systemConfigQueries.selectValue("k").executeAsOneOrNull())
+        // user_version now tracked, so a restart is a clean no-op.
+        DatabaseFactory.init()
+    }
+
+    @Test
+    fun `init migrates user_version 0 database in the prior v5-equivalent schema state`() {
+        val path = newTempDbPath()
+        // A pre-migration-5 database: all four legacy tables exist WITH the
+        // migration-4 columns (bic / in_consent / identification_hash), but
+        // sync_outcomes and eb_sessions.rate_limit_skip do NOT (and
+        // user_version was never written). The inference ladder must resolve
+        // the PRIOR version — not "assume latest" — so migration 5 applies:
+        // the sync_outcomes table (with its indexes) and the
+        // rate_limit_skip column (NOT NULL DEFAULT 0) are added without
+        // touching existing rows.
+        val driver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        driver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE eb_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                aspsp_name TEXT,
+                aspsp_country TEXT,
+                psu_type TEXT,
+                created_at INTEGER NOT NULL,
+                valid_until TEXT,
+                logo TEXT,
+                bic TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                iban TEXT,
+                uid TEXT,
+                currency TEXT,
+                name TEXT,
+                in_consent INTEGER NOT NULL DEFAULT 1,
+                identification_hash TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE balances (
+                account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+                balance_amount TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                balance_type TEXT NOT NULL,
+                reference_date TEXT,
+                fetched_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                sync_type TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                error_message TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(null, "INSERT INTO system_config (key, value) VALUES ('k', 'v')", 0)
+        driver.execute(
+            null,
+            "INSERT INTO eb_sessions (session_id, aspsp_name, aspsp_country, created_at, valid_until, logo) VALUES ('sess-1', 'Bank', 'DE', 1, '2026-01-01T00:00:00Z', 'https://logo')",
+            0,
+        )
+        driver.execute(null, "INSERT INTO accounts (session_id, iban) VALUES (1, 'DE1')", 0)
+        driver.execute(null, "INSERT INTO balances (account_id, balance_amount, currency, balance_type, fetched_at) VALUES (1, '10.00', 'EUR', 'CLBD', 1000)", 0)
+        driver.execute(null, "INSERT INTO sync_log (session_id, sync_type, started_at, completed_at, status) VALUES (1, 'manual', 1, 2, 'success')", 0)
+        driver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        // Migration 5 applied: sync_outcomes is queryable…
+        assertNull(db.syncOutcomesQueries.selectLatestOutcomeByAccountId(1L).executeAsOneOrNull())
+        db.syncOutcomesQueries.insertSyncOutcome(
+            sync_log_id = 1,
+            account_id = 1,
+            status = "success",
+            error_bin = null,
+            error_code = null,
+            error_message = null,
+            fetched_at = 1000,
+        )
+        assertEquals("success", db.syncOutcomesQueries.selectLatestOutcomeByAccountId(1L).executeAsOne().status)
+        // …and rate_limit_skip exists NOT NULL DEFAULT 0: pre-existing rows are not skipped.
+        val session = db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne()
+        assertEquals(0L, session.rate_limit_skip, "pre-existing session rows must carry rate_limit_skip = 0")
+        // Existing data survived the migration.
+        assertEquals("v", db.systemConfigQueries.selectValue("k").executeAsOneOrNull())
+        assertEquals("2026-01-01T00:00:00Z", session.valid_until)
+        assertEquals("https://logo", session.logo)
+        assertEquals("10.00", db.balancesQueries.selectBalanceByAccountId(1).executeAsOne().balance_amount)
+        assertEquals("success", db.balancesQueries.selectLatestSyncLogBySessionId(1).executeAsOne().status)
         // user_version now tracked, so a restart is a clean no-op.
         DatabaseFactory.init()
     }

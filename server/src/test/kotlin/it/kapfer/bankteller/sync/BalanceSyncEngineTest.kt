@@ -218,7 +218,7 @@ class BalanceSyncEngineTest {
     }
 
     @Test
-    fun `initial import while a run is in flight queues a follow-up pass for the new session`() {
+    fun `initial import executes independently of an in-flight global run and covers only the new session`() {
         val db = freshDb()
         val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
         seedSession(db, store, "s1", it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"))
@@ -240,23 +240,28 @@ class BalanceSyncEngineTest {
         waitUntil { client.sessionCalls.isNotEmpty() }
         seedSession(db, store, "s2", it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Giro"))
 
-        // The import reports coalesced — but unlike a plain coalesce, a
-        // follow-up pass is queued so the new session is covered.
+        // New semantics (localized-sync-errors design D2): the initial import
+        // is a SESSION-SCOPED run — it is neither queued behind nor coalesced
+        // into the in-flight all-sessions run. It is admitted independently
+        // (coalesced = false) and waits on the run mutex like any other run.
         val import = engine.triggerInitialImport(PsuHeaders("1.2.3.4", "UA"))
-        assertTrue(import.coalesced)
+        assertFalse(import.coalesced, "a scoped import must not coalesce into a global run")
+        assertTrue(engine.isSyncInProgress(), "the scoped run is in flight (waiting on the mutex)")
 
         gate.countDown()
-        // The follow-up pass must reach the new session's account.
+        // The scoped run reaches the NEW session's account only.
         waitUntil { client.balanceCalls.any { it.first == "u2" } }
         waitUntil { !engine.isSyncInProgress() }
 
-        // Run 1 covered u1 (gated, snapshotted before s2 existed); the
-        // follow-up is engine-scoped over BOTH sessions. Its s1/s2 order is
-        // not deterministic (created_at DESC ties within the same
-        // millisecond), so assert the covered set, not the sequence.
-        assertEquals(3, client.balanceCalls.size)
+        // Run 1 covered u1 (gated, snapshotted before s2 existed); the scoped
+        // import covers s2 ONLY — no second pass over s1 and no other bank.
+        assertEquals(2, client.balanceCalls.size)
         assertEquals("u1", client.balanceCalls.first().first)
-        assertEquals(setOf("u1", "u2"), client.balanceCalls.drop(1).map { it.first }.toSet())
+        assertEquals("u2", client.balanceCalls[1].first)
+        val s2Row = db.ebSessionsQueries.selectSessionBySessionId("s2").executeAsOne()
+        val s2Log = db.balancesQueries.selectLatestSyncLogBySessionId(s2Row.id).executeAsOne()
+        assertEquals("initial", s2Log.sync_type)
+        assertEquals(1L, db.balancesQueries.countSyncLogsBySessionId(s2Row.id).executeAsOne())
     }
 
     // =====================================================================
@@ -871,6 +876,452 @@ class BalanceSyncEngineTest {
         assertEquals(listOf("u1"), client.balanceCalls.map { it.first })
         assertNull(db.balancesQueries.selectBalanceByAccountId(accountId).executeAsOneOrNull(), "no orphaned balance row")
         assertEquals(0L, db.balancesQueries.countSyncLogsBySessionId(s1Row.id).executeAsOne(), "no orphaned sync-log row")
+    }
+
+    // =====================================================================
+    // localized-sync-errors — run scope + per-bank rate-limit skip
+    // (spec: balance-sync — per-bank rate-limit skip; design D2)
+    // =====================================================================
+
+    @Test
+    fun `manual and login runs skip a rate-limited session while other sessions are fetched`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val s1 = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        val s2 = seedSession(
+            db, store, "s2",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Giro"),
+        )
+        // Session s2 is rate-limited by the ASPSP (the Sabadell 429 incident).
+        val client = FakeClient().apply {
+            balanceResults["u2"] = FakeBalanceOutcome.Error(429, "Too Many Requests")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+
+        // 1. Login run: no flag yet, so BOTH sessions are fetched; s2's 429
+        //    arms the per-session skip.
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "login", nowMillis = 1_000_000L)
+        waitUntil { !engine.isSyncInProgress() }
+        assertEquals(setOf("u1", "u2"), client.balanceCalls.map { it.first }.toSet())
+        assertEquals(1L, db.ebSessionsQueries.selectSessionById(s2).executeAsOne().rate_limit_skip)
+
+        // 2. Manual run after the cooldown: s2 is skipped ENTIRELY — no
+        //    getSession call and no balance call — while s1 is refreshed.
+        client.balanceCalls.clear()
+        client.sessionCalls.clear()
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual", nowMillis = 1_130_000L)
+        waitUntil { !engine.isSyncInProgress() }
+        assertEquals(listOf("u1"), client.balanceCalls.map { it.first })
+        assertEquals(setOf("s1"), client.sessionCalls.toSet(), "the skipped session must receive no EB call at all")
+        assertEquals(1L, db.balancesQueries.countSyncLogsBySessionId(s2).executeAsOne(), "no new run for the skipped session")
+        assertEquals(2L, db.balancesQueries.countSyncLogsBySessionId(s1).executeAsOne())
+
+        // 3. Restart persistence: a NEW engine instance on the SAME DB honors
+        //    the stored skip (the flag is DB-backed, not in-memory).
+        val restartedClient = FakeClient().apply {
+            balanceResults["u2"] = FakeBalanceOutcome.Error(429, "Too Many Requests")
+        }
+        val restartedEngine = BalanceSyncEngine(db) { restartedClient }
+        restartedEngine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !restartedEngine.isSyncInProgress() }
+        assertEquals(listOf("u1"), restartedClient.balanceCalls.map { it.first })
+
+        // 4. Background run: ALWAYS includes all live sessions and clears the
+        //    skip REGARDLESS of that run's outcome — s2 is visited (and 429s
+        //    again), yet the flag ends cleared (the next background run is the
+        //    only honest horizon).
+        restartedEngine.triggerBackgroundRun()
+        waitUntil { !restartedEngine.isSyncInProgress() }
+        assertEquals(setOf("u1", "u2"), restartedClient.balanceCalls.map { it.first }.toSet())
+        assertEquals(0L, db.ebSessionsQueries.selectSessionById(s2).executeAsOne().rate_limit_skip)
+    }
+
+    @Test
+    fun `a background 429 does not arm the skip`() {
+        // Spec scenario (balance-sync — per-bank rate-limit skip, amended):
+        // a rate-limited outcome on a BACKGROUND run does not arm the skip —
+        // the background run is itself the retry horizon; the next manual
+        // run may attempt the session once more, and only ITS 429 arms it.
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val s1 = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        val s2 = seedSession(
+            db, store, "s2",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Giro"),
+        )
+        val client = FakeClient().apply {
+            balanceResults["u2"] = FakeBalanceOutcome.Error(429, "Too Many Requests")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+
+        // Background run: s2 is 429'd, but the skip is NOT armed by it.
+        engine.triggerBackgroundRun()
+        waitUntil { !engine.isSyncInProgress() }
+        assertEquals(0L, db.ebSessionsQueries.selectSessionById(s2).executeAsOne().rate_limit_skip)
+
+        // The next manual run therefore attempts s2 once more (a PSU'd
+        // fetch is a legitimate retry) — and ITS 429 arms the skip.
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+        assertEquals(setOf("u1", "u2"), client.balanceCalls.map { it.first }.toSet())
+        assertEquals(1L, db.ebSessionsQueries.selectSessionById(s2).executeAsOne().rate_limit_skip)
+    }
+
+    @Test
+    fun `initial import runs only the newest session`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val s1 = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        val s2 = seedSession(
+            db, store, "s2",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Giro"),
+        )
+        val client = FakeClient()
+        val engine = BalanceSyncEngine(db) { client }
+
+        val result = engine.triggerInitialImport(PsuHeaders("1.2.3.4", "UA"))
+        assertFalse(result.coalesced)
+        waitUntil { !engine.isSyncInProgress() }
+
+        // Only the newest (s2) session is visited — connecting a bank makes no
+        // Enable Banking call against any other bank's connection.
+        assertEquals(listOf("s2"), client.sessionCalls)
+        assertEquals(listOf("u2"), client.balanceCalls.map { it.first })
+        assertEquals(0L, db.balancesQueries.countSyncLogsBySessionId(s1).executeAsOne())
+        val s2Log = db.balancesQueries.selectLatestSyncLogBySessionId(s2).executeAsOne()
+        assertEquals("initial", s2Log.sync_type)
+        assertEquals("success", s2Log.status)
+    }
+
+    @Test
+    fun `initial import bypasses the rate-limit skip on the newest session`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val s1 = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        db.ebSessionsQueries.setSessionRateLimitSkip(1L, s1)
+
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerInitialImport(PsuHeaders("1.2.3.4", "UA"))
+        waitUntil { !engine.isSyncInProgress() }
+
+        // The scoped run is a NEW authorization, not a manual refresh: it
+        // fetches the session regardless of a stale skip flag.
+        assertEquals(listOf("u1"), client.balanceCalls.map { it.first })
+    }
+
+    // =====================================================================
+    // localized-sync-errors — per-account outcome recording
+    // (spec: balance-sync — per-account sync outcomes, tasks 2.3 / 2.5)
+    // =====================================================================
+
+    @Test
+    fun `per-account outcomes record four successes and the single transient timeout`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val sessionRow = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "A"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "B"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE3", "u3", "EUR", "C"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE4", "u4", "EUR", "D"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE5", "u5", "EUR", "E"),
+        )
+        val accounts = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(sessionRow))
+            .executeAsList()
+            .associateBy { it.uid ?: "" }
+        val client = FakeClient().apply {
+            for (i in 1..5) {
+                balanceResults["u$i"] = FakeBalanceOutcome.Ok(listOf(balanceEntry(amount = "${i}00.00")))
+            }
+            balanceResults["u3"] = FakeBalanceOutcome.Error(504, "Gateway Timeout")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        val log = db.balancesQueries.selectLatestSyncLogBySessionId(sessionRow).executeAsOne()
+        assertEquals("error", log.status)
+        for (uid in listOf("u1", "u2", "u4", "u5")) {
+            val outcome = db.syncOutcomesQueries
+                .selectLatestOutcomeByAccountId(accounts.getValue(uid).id)
+                .executeAsOne()
+            assertEquals("success", outcome.status, "account $uid")
+            assertNull(outcome.error_bin, "account $uid")
+        }
+        val failed = db.syncOutcomesQueries
+            .selectLatestOutcomeByAccountId(accounts.getValue("u3").id)
+            .executeAsOne()
+        assertEquals("error", failed.status)
+        assertEquals("transient", failed.error_bin)
+        assertEquals("Gateway Timeout", failed.error_message)
+        assertTrue(failed.fetched_at > 0)
+    }
+
+    @Test
+    fun `malformed balance entry records a transient error outcome`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val sessionRow = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        val account = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(sessionRow))
+            .executeAsOne()
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(
+                listOf(
+                    BalanceEntry(
+                        balanceType = "CLBD",
+                        balanceAmount = null,
+                        referenceDate = "2026-10-01",
+                        lastChangeDateTime = null,
+                    )
+                )
+            )
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        val outcome = db.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOne()
+        assertEquals("error", outcome.status)
+        assertEquals("transient", outcome.error_bin)
+        val message = assertNotNull(outcome.error_message)
+        assertTrue("u1" in message, "the malformed-entry message must name the account, was: $message")
+        assertTrue("amount/currency" in message, "was: $message")
+    }
+
+    @Test
+    fun `rate-limited outcome carries the rate_limited bin never transient`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val sessionRow = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+        )
+        val account = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(sessionRow))
+            .executeAsOne()
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Error(429, "Too Many Requests")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        val outcome = db.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOne()
+        assertEquals("rate_limited", outcome.status)
+        assertEquals("rate_limited", outcome.error_bin)
+        assertEquals("Too Many Requests", outcome.error_message)
+    }
+
+    @Test
+    fun `consent-dead propagates to every in-consent account outcome and overwrites success`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val sessionRow = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Spar"),
+        )
+        val accounts = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(sessionRow))
+            .executeAsList()
+            .associateBy { it.uid ?: "" }
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+            balanceResults["u2"] = FakeBalanceOutcome.Error(403, "Session expired", "EXPIRED_SESSION")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        // Consent-dead outranks the successful sibling fetch: EVERY in-consent
+        // account's outcome row carries the bin, even the account that fetched fine.
+        for (uid in listOf("u1", "u2")) {
+            val outcome = db.syncOutcomesQueries
+                .selectLatestOutcomeByAccountId(accounts.getValue(uid).id)
+                .executeAsOne()
+            assertEquals("error", outcome.status, "account $uid")
+            assertEquals("consent_dead", outcome.error_bin, "account $uid")
+            assertEquals("EXPIRED_SESSION", outcome.error_code, "account $uid")
+        }
+        // The successful balance data upserted before the propagation is retained
+        // (rendered as a frozen figure).
+        val balance = db.balancesQueries.selectBalanceByAccountId(accounts.getValue("u1").id).executeAsOneOrNull()
+        assertNotNull(balance)
+        assertEquals("100.00", balance.balance_amount)
+
+        val log = db.balancesQueries.selectLatestSyncLogBySessionId(sessionRow).executeAsOne()
+        assertEquals("error", log.status)
+        assertEquals("EXPIRED_SESSION", log.error_code)
+    }
+
+    @Test
+    fun `consent-dead from getSession only propagates to every account`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        val sessionRow = seedSession(
+            db, store, "s1",
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+            it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Spar"),
+        )
+        val accounts = db.ebSessionsQueries
+            .selectAccountsBySessionIds(listOf(sessionRow))
+            .executeAsList()
+        // Both balance fetches succeed, but the consent check is dead.
+        val client = FakeClient().apply {
+            sessionResults["s1"] = SessionResult.Error(403, "EXPIRED_SESSION", "Session expired")
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+            balanceResults["u2"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        for (account in accounts) {
+            val outcome = db.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOne()
+            assertEquals("error", outcome.status)
+            assertEquals("consent_dead", outcome.error_bin)
+            assertEquals("EXPIRED_SESSION", outcome.error_code)
+        }
+    }
+
+    @Test
+    fun `stored consent expiry in the past propagates consent_expired to every account`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        store.mergeSession(
+            "s1", "Bank s1", "DE", "personal",
+            listOf(
+                it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro"),
+                it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE2", "u2", "EUR", "Spar"),
+            ),
+            validUntil = "2020-01-01T00:00:00Z",
+        )
+        val sessionRow = db.ebSessionsQueries.selectSessionBySessionId("s1").executeAsOne().id
+        val accounts = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(sessionRow)).executeAsList()
+        val client = FakeClient().apply {
+            // getSession returns no new expiry (null) — the STORED past value stands.
+            balanceResults["u1"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+            balanceResults["u2"] = FakeBalanceOutcome.Ok(listOf(balanceEntry()))
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        for (account in accounts) {
+            val outcome = db.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOne()
+            assertEquals("error", outcome.status)
+            assertEquals("consent_expired", outcome.error_bin)
+        }
+    }
+
+    @Test
+    fun `consent-dead outranks consent-expired when both match`() {
+        val db = freshDb()
+        val store = it.kapfer.bankteller.onboarding.EbSessionStore(db)
+        store.mergeSession(
+            "s1", "Bank s1", "DE", "personal",
+            listOf(it.kapfer.bankteller.onboarding.EbSessionStore.MergedAccount("DE1", "u1", "EUR", "Giro")),
+            validUntil = "2020-01-01T00:00:00Z",
+        )
+        val sessionRow = db.ebSessionsQueries.selectSessionBySessionId("s1").executeAsOne().id
+        val account = db.ebSessionsQueries.selectAccountsBySessionIds(listOf(sessionRow)).executeAsOne()
+        val client = FakeClient().apply {
+            balanceResults["u1"] = FakeBalanceOutcome.Error(403, "Session expired", "EXPIRED_SESSION")
+        }
+        val engine = BalanceSyncEngine(db) { client }
+        engine.triggerUserRun(PsuHeaders("1.2.3.4", "UA"), "manual")
+        waitUntil { !engine.isSyncInProgress() }
+
+        val outcome = db.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOne()
+        assertEquals("error", outcome.status)
+        assertEquals("consent_dead", outcome.error_bin, "the parsed code is the more specific evidence")
+    }
+
+    // =====================================================================
+    // localized-sync-errors — bin classification (task 2.5)
+    // =====================================================================
+
+    @Test
+    fun `classifyEbError covers every bin and code precedence over status`() {
+        assertEquals(ErrorClass.TRANSIENT, classifyEbError(null, 500))
+        assertEquals(ErrorClass.TRANSIENT, classifyEbError("ASPSP_ERROR", 502))
+        assertEquals(ErrorClass.TRANSIENT, classifyEbError("SOME_NEW_CODE", 200))
+
+        // A bare 429 is rate limited…
+        assertEquals(ErrorClass.RATE_LIMITED, classifyEbError(null, 429))
+        // …and the documented code wins over a non-429 status.
+        assertEquals(ErrorClass.RATE_LIMITED, classifyEbError(RATE_LIMIT_ERROR_CODE, 400))
+        assertEquals(ErrorClass.RATE_LIMITED, classifyEbError(RATE_LIMIT_ERROR_CODE, null))
+        // A PARSED-but-unknown code wins over the status too: 429 without the
+        // documented code is not a parsed rate limit → transient (code precedence).
+        assertEquals(ErrorClass.TRANSIENT, classifyEbError("SOME_NEW_CODE", 429))
+
+        for (code in CONSENT_DEAD_ERROR_CODES) {
+            // The code wins over the status (even a 200/429).
+            assertEquals(ErrorClass.CONSENT_DEAD, classifyEbError(code, 200), code)
+            assertEquals(ErrorClass.CONSENT_DEAD, classifyEbError(code, 429), code)
+        }
+    }
+
+    @Test
+    fun `classifyErrorBin covers every bin with code and expiry precedence`() {
+        // Transient: unknown/absent code and no expiry.
+        assertEquals(ErrorBin.TRANSIENT, classifyErrorBin(null, 500, consentExpired = false))
+        assertEquals(ErrorBin.TRANSIENT, classifyErrorBin("ASPSP_ERROR", 502, consentExpired = false))
+        assertEquals(ErrorBin.TRANSIENT, classifyErrorBin("UNKNOWN", 200, consentExpired = false))
+
+        // Rate limited: the code or a code-less 429; never transient.
+        assertEquals(ErrorBin.RATE_LIMITED, classifyErrorBin(RATE_LIMIT_ERROR_CODE, 200, consentExpired = false))
+        assertEquals(ErrorBin.RATE_LIMITED, classifyErrorBin(null, 429, consentExpired = false))
+        // An unknown parsed code wins over the 429 status → transient.
+        assertEquals(ErrorBin.TRANSIENT, classifyErrorBin("SOME_NEW_CODE", 429, consentExpired = false))
+        // A rate-limited outcome carries rate_limited even when the stored
+        // expiry is also in the past (the 429 is the active evidence).
+        assertEquals(ErrorBin.RATE_LIMITED, classifyErrorBin(null, 429, consentExpired = true))
+
+        // Consent dead: the parsed code wins over status and expiry.
+        for (code in CONSENT_DEAD_ERROR_CODES) {
+            assertEquals(ErrorBin.CONSENT_DEAD, classifyErrorBin(code, 200, consentExpired = false), code)
+            assertEquals(ErrorBin.CONSENT_DEAD, classifyErrorBin(code, 200, consentExpired = true), code)
+        }
+
+        // Consent expired: no consent-dead code, stored expiry in the past.
+        assertEquals(ErrorBin.CONSENT_EXPIRED, classifyErrorBin("ASPSP_ERROR", 502, consentExpired = true))
+        assertEquals(ErrorBin.CONSENT_EXPIRED, classifyErrorBin(null, 500, consentExpired = true))
+    }
+
+    @Test
+    fun `isConsentExpired parses RFC3339 and treats absent or malformed as not expired`() {
+        assertFalse(isConsentExpired(null, nowMillis = 1_000_000L))
+        assertFalse(isConsentExpired("", nowMillis = 1_000_000L))
+        assertFalse(isConsentExpired("not-a-date", nowMillis = 1_000_000L))
+        // 1970-01-01T00:00:00Z = 0 ms.
+        assertTrue(isConsentExpired("1970-01-01T00:00:00Z", nowMillis = 1_000_000L))
+        assertFalse(isConsentExpired("1970-01-02T00:00:00Z", nowMillis = 1_000_000L))
+        // Millisecond precision (EB's wire shape) parses too.
+        assertTrue(isConsentExpired("1970-01-01T00:00:00.000Z", nowMillis = 1_000_000L))
+        // An explicit offset is honoured (00:30+02:00 is 1969-12-31T22:30Z).
+        assertTrue(isConsentExpired("1970-01-01T00:30:00+02:00", nowMillis = 1_000_000L))
     }
 
     // =====================================================================

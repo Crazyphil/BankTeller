@@ -8,7 +8,7 @@ Sync truth is per bank connection today: one `sync_log` row per session-run coll
 
 Goals: per-account outcome truth; cause-binned actionable copy; localized presentation on dashboard cards and connection cards; refresh never hostage to one bank; initial imports scoped to the new session.
 
-Non-Goals: per-account *runs* (the engine's unit stays the session; account-level outcomes are recorded, not scheduled); trusted-total hero re-computation (parked — hero stays danger on any failure); outcome-table retention/cleanup (deferred; audit-grade by design); per-bank/per-account retry endpoints (global refresh remains the single manual remedy; the skip set is honored server-side); transaction-sync scope (out of scope).
+Non-Goals: per-account *runs* (the engine's unit stays the session; account-level outcomes are recorded, not scheduled); trusted-total hero re-computation (parked; the hero's tier now follows the remedy class per the full re-tier ruling — brass for retryable failures, danger consent-only — superseding the earlier any-failure-danger plan); outcome-table retention/cleanup (deferred; audit-grade by design); per-bank/per-account retry endpoints (global refresh remains the single manual remedy; the skip set is honored server-side); transaction-sync scope (out of scope).
 
 ## Decisions
 
@@ -22,7 +22,7 @@ New table `sync_outcomes` (id, sync_log_id FK, account_id FK, status, error_bin,
 
 ### D3 — Bank `sync_state` vocabulary untouched; additive flag + per-account fields
 
-The five-value `sync_state` and its derivation stay as-is (specs pin them; the dashboard matrix depends on them). `GET /api/accounts` adds per-account `sync_status`/`error_bin`/`last_fetch_at` and per-bank `has_issues` (any account failed or consent-dead/expired). The UI's per-card degradation switches its driver from bank `sync_state` to per-account outcomes; bank `sync_state` remains for the global line's summary and operational surfaces. Alternative — redefining `sync_state` as a rollup — rejected: it would ripple through the state matrix, hero conditions, and DESIGN-LANGUAGE §6.1.2 for no behavioral gain.
+The five-value `sync_state` and its derivation stay as-is (specs pin them; the dashboard matrix depends on them). `GET /api/accounts` adds per-account `sync_status`/`error_bin`/`last_fetch_at`. The UI's per-card degradation switches its driver from bank `sync_state` to per-account outcomes; bank `sync_state` remains for the global line's summary and operational surfaces. (A per-bank `has_issues` rollup was originally planned for the connections section but removed by the solvability ruling: the connection card keys on consent states only — sync-domain states render no signal there — so the flag had no consumer.) Alternative — redefining `sync_state` as a rollup — rejected: it would ripple through the state matrix, hero conditions, and DESIGN-LANGUAGE §6.1.2 for no behavioral gain.
 
 ### D4 — D7 formally overturned: no global disable on degradation
 
@@ -30,7 +30,7 @@ Archived `add-account-overview` D7 accepted "refresh disabled on rate_limited ev
 
 ### D5 — Presentation: left-column status slot + border/tint signal (designer-ruled)
 
-Per the designer consultation (verified against DESIGN-LANGUAGE's tokens): one canonical status slot per card in the left column below the metadata line — multi-word remedy copy would wrap under right-aligned mono figures, and the left column natively hosts the 28dp Inline Text XS action tier for the remedy affordance. This amends DESIGN-LANGUAGE §6.2.2 (sublabel moves from beneath the balance to the left-column slot; consent-dead's doubled "Consent ended" + "Sync paused" labels merge into one line). Scan signal: 1px tier-colored border (danger `#B4403C`/`#E0706B`, brass `#A67C2E`/`#D4A94E` per theme) + 4–6% tier tint; danger stronger than brass; ~200ms `animateColorAsState`/`AnimatedVisibility` transitions. Selection/hover use state-layer washes and card lift — never colored borders — so the signal can't read as interaction. Connection cards in settings reuse the identical treatment at connection granularity; danger-tier connection cards elevate "Refresh authorization" to a prominent button.
+Per the designer consultation (verified against DESIGN-LANGUAGE's tokens): one canonical status slot per card in the left column below the metadata line — multi-word remedy copy would wrap under right-aligned mono figures, and the left column natively hosts the 28dp Inline Text XS action tier for the remedy affordance. This amends DESIGN-LANGUAGE §6.2.2 (sublabel moves from beneath the balance to the left-column slot; consent-dead's doubled "Consent ended" + "Sync paused" labels merge into one line). Scan signal: 1px tier-colored border (danger `#B4403C`/`#E0706B`, brass `#A67C2E`/`#D4A94E` per theme) + 4–6% tier tint; danger stronger than brass; ~200ms `animateColorAsState`/`AnimatedVisibility` transitions. Selection/hover use state-layer washes and card lift — never colored borders — so the signal can't read as interaction. Connection cards in settings reuse the identical border+tint *mechanism* at connection granularity — tier mapping there keys on authorization states only (see D3's solvability note); danger-tier connection cards elevate "Refresh authorization" to a prominent button.
 
 ### D6 — Copy bins and the rate-limited honesty rule
 

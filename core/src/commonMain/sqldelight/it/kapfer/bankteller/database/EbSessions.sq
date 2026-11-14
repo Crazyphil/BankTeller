@@ -28,7 +28,13 @@ CREATE TABLE eb_sessions (
     created_at INTEGER NOT NULL,
     valid_until TEXT,
     logo TEXT,
-    bic TEXT
+    bic TEXT,
+    -- Per-session rate-limit skip state (spec: balance-sync — per-bank
+    -- rate-limit skip). 1 = the session's last (non-background) run recorded
+    -- a rate-limited outcome; manual/login runs skip it entirely (no EB
+    -- calls) until the next background run includes it and clears the flag.
+    -- Persisted, so the skip survives a server restart.
+    rate_limit_skip INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE accounts (
@@ -65,11 +71,27 @@ SELECT * FROM eb_sessions WHERE aspsp_name = ? AND aspsp_country = ?;
 selectAllSessions:
 SELECT * FROM eb_sessions ORDER BY created_at DESC;
 
+-- The newest session row — the wizard's initial import runs scoped to it
+-- (spec: balance-sync — initial import touches only the new bank). The auth
+-- callback merges (inserts) the session before the wizard calls
+-- POST /api/onboarding/import-balances, so the row is present at trigger time.
+-- id DESC breaks created_at ties (merges within the same millisecond), making
+-- "newest" the most recently inserted row deterministically.
+selectNewestSession:
+SELECT * FROM eb_sessions ORDER BY created_at DESC, id DESC LIMIT 1;
+
 deleteSessionByIds:
 DELETE FROM eb_sessions WHERE id IN ?;
 
 countSessions:
 SELECT COUNT(*) FROM eb_sessions;
+
+-- Set/clear the per-session rate-limit skip flag (spec: balance-sync — per-bank
+-- rate-limit skip). Set to 1 when a manual/login/initial run records a
+-- rate-limited outcome; cleared to 0 by a background run's inclusion of the
+-- session (regardless of that run's outcome for it).
+setSessionRateLimitSkip:
+UPDATE eb_sessions SET rate_limit_skip = ? WHERE id = ?;
 
 deleteAllSessions:
 DELETE FROM eb_sessions;

@@ -118,17 +118,17 @@ class LocalCopyDashboardTest {
         // record convention (onSurfaceVariant), not brass — the wording
         // carries the state, not the color.
         val brokenBank = bank(consentBroken = true, accounts = listOf(account(inConsent = 0L)))
-        val sublabel = balanceSublabel(brokenBank, account(inConsent = 0L))
-        assertEquals("Local copy — not synchronized", sublabel?.text)
-        assertEquals(BalanceSublabelTier.Archived, sublabel?.tier)
+        val presentation = accountSyncPresentation(brokenBank, account(inConsent = 0L))
+        assertEquals("Local copy — not synchronized", presentation?.text)
+        assertEquals(SyncPresentationTier.Archived, presentation?.tier)
     }
 
     @Test
     fun liveAccount_keepsTheExistingSublabelVocabulary() {
         val staleBank = bank(syncState = "stale")
-        assertEquals("Stale balance", balanceSublabel(staleBank, account(inConsent = 1L))?.text)
+        assertEquals("Stale balance", accountSyncPresentation(staleBank, account(inConsent = 1L))?.text)
         val freshBank = bank()
-        assertEquals(null, balanceSublabel(freshBank, account(inConsent = 1L)))
+        assertEquals(null, accountSyncPresentation(freshBank, account(inConsent = 1L)))
     }
 
     // ---------------------------------------------------------------

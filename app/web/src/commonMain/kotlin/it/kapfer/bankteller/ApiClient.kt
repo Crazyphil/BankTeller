@@ -642,6 +642,16 @@ open class ApiClient {
                         // synced contract; the SPA never guesses a live
                         // account is a local copy).
                         inConsent = extractJsonLong(accountJson, "in_consent") ?: 1L,
+                        // Per-account sync outcomes (localized-sync-errors
+                        // D3/task 3.2): additive and nullable — absent when
+                        // the account has no outcome row yet (or on a server
+                        // predating the change). The SPA keeps the bank-level
+                        // render path for absent values; a present success/
+                        // error/rate_limited marks only THIS account.
+                        syncStatus = extractJsonStringOrNull(accountJson, "sync_status"),
+                        errorBin = extractJsonStringOrNull(accountJson, "error_bin"),
+                        errorMessage = extractJsonStringOrNull(accountJson, "error_message"),
+                        lastFetchAt = extractJsonLong(accountJson, "last_fetch_at"),
                     ),
                 )
             }
@@ -1374,6 +1384,20 @@ data class AccountData(
      * 1 (the historical all-accounts-are-synced contract).
      */
     val inConsent: Long = 1L,
+    /**
+     * Latest per-account outcome: "success" | "error" | "rate_limited"
+     * (localized-sync-errors D3). Null when no outcome row exists (the
+     * account predates the outcome table's first run, or has a NULL uid)
+     * and on servers predating the change — consumers fall back to the
+     * bank-level state, never a degraded default.
+     */
+    val syncStatus: String? = null,
+    /** Cause bin of a failed outcome: "transient" | "rate_limited" | "consent_dead" | "consent_expired". */
+    val errorBin: String? = null,
+    /** The failed outcome's raw recorded error message (the tooltip's on-demand detail). */
+    val errorMessage: String? = null,
+    /** Epoch millis of the latest outcome's fetch. */
+    val lastFetchAt: Long? = null,
 )
 
 /** POST /api/sync + /api/onboarding/import-balances trigger outcome. */

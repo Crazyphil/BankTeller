@@ -1,0 +1,35 @@
+-- Migration 5 -> 6: per-account sync outcomes + the per-session rate-limit
+-- skip state (localized-sync-errors, design D1/D2).
+--
+-- `sync_outcomes` is a NEW additive table (one row per account fetch per run,
+-- linked to the run's sync_log row and the account); no existing table is
+-- altered by it. `eb_sessions.rate_limit_skip` is a new NOT NULL DEFAULT 0
+-- column — 1 marks a session in the rate-limit skip state (manual/login runs
+-- fetch nothing for it; the next background run clears it). Existing rows
+-- default to 0 (not skipped), which is correct for every pre-existing session.
+--
+-- Idempotent where possible: CREATE TABLE/INDEX IF NOT EXISTS make re-running
+-- the table-creation part safe on databases where the objects already exist
+-- (same rationale as 2.sqm/3.sqm — DatabaseFactory.init() may re-run
+-- migrations on user_version = 0 databases with partially present schemas).
+-- SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS; this migration only
+-- runs when user_version < Schema.version, and the DatabaseFactory inference
+-- ladder only classifies a database as being AT or AFTER this version when
+-- BOTH the sync_outcomes table and the rate_limit_skip column are present (see
+-- DatabaseFactory.kt) — so the ALTER never re-runs on an already-migrated
+-- database.
+CREATE TABLE IF NOT EXISTS sync_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_log_id INTEGER NOT NULL REFERENCES sync_log(id),
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    status TEXT NOT NULL,
+    error_bin TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    fetched_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sync_outcomes_account_fetched_idx ON sync_outcomes(account_id, fetched_at);
+CREATE INDEX IF NOT EXISTS sync_outcomes_sync_log_idx ON sync_outcomes(sync_log_id);
+
+ALTER TABLE eb_sessions ADD COLUMN rate_limit_skip INTEGER NOT NULL DEFAULT 0;

@@ -18,13 +18,28 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.outlined.Archive
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Card
 import androidx.compose.material3.ButtonDefaults
@@ -45,13 +60,17 @@ import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -71,13 +90,19 @@ import it.kapfer.bankteller.ui.components.settingsTab
 import it.kapfer.bankteller.ui.components.BankAvatar
 import it.kapfer.bankteller.ui.components.BankLogo
 import it.kapfer.bankteller.ui.components.CropSignaledScroll
+import it.kapfer.bankteller.ui.components.LedgerScrollbar
+import it.kapfer.bankteller.ui.components.denseWash
+import it.kapfer.bankteller.ui.components.WashScale
+import it.kapfer.bankteller.ui.components.diagnosticTooltipOpenState
 import it.kapfer.bankteller.ui.components.QuietButton
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.WaitingIndicator
 import it.kapfer.bankteller.ui.components.BrandedTopBar
 import it.kapfer.bankteller.ui.components.ThemeToggle
 import it.kapfer.bankteller.ui.components.ActionButton
+import it.kapfer.bankteller.ui.components.LocalActionBusy
 import it.kapfer.bankteller.ui.components.QuietActionButton
+import it.kapfer.bankteller.ui.theme.BankTellerColors
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import kotlin.math.abs
@@ -93,7 +118,8 @@ import kotlin.math.roundToLong
  *
  * Degraded states use brass for stale/expiring and danger for broken — no
  * emerald on healthy banks (the healthy state is the absence of color).
- * No animations (design language §8.4).
+ * Motion is limited to the §6.2.2 degradation transitions (~200ms); no
+ * decorative animation (design language §8.4).
  */
 @Composable
 fun DashboardScreen(viewModel: AppViewModel) {
@@ -237,7 +263,10 @@ fun DashboardScreen(viewModel: AppViewModel) {
             return@ScreenShell
         }
 
-        HeroTotal(banks)
+        HeroTotal(
+            banks,
+            syncing = viewModel.refreshRequested || viewModel.accountsData?.syncInProgress == true,
+        )
 
         Spacer(modifier = Modifier.height(Dimens.md))
 
@@ -250,7 +279,7 @@ fun DashboardScreen(viewModel: AppViewModel) {
 
         Spacer(modifier = Modifier.height(Dimens.lg))
 
-        AccountCards(banks)
+        AccountCards(viewModel, banks)
 
         // Missing-accounts dialog (bank-connection-management D8/D14,
         // spec: bank-connection-management — missing-accounts dialog): the
@@ -637,7 +666,7 @@ private fun Greeting(username: String) {
  * verified as current — per subtotal in mixed-currency views.
  */
 @Composable
-private fun HeroTotal(banks: List<BankData>) {
+private fun HeroTotal(banks: List<BankData>, syncing: Boolean = false) {
     // Live accounts only (D15): kept-as-local-copy accounts never enter
     // the hero numbers.
     val synced = banks.flatMap { it.accounts }.filter { it.inConsent == 1L && it.balanceAmount != null }
@@ -684,7 +713,7 @@ private fun HeroTotal(banks: List<BankData>) {
                     fontFeatureSettings = "tnum",
                 ),
             )
-            HeroFreshnessGlyph(heroFreshness(banks))
+            HeroFreshnessGlyph(heroFreshness(banks, syncInProgress = syncing))
         }
     } else {
         // Mixed currencies: grouped subtotals, EUR first. The freshness
@@ -736,7 +765,9 @@ private fun HeroTotal(banks: List<BankData>) {
                             ),
                             modifier = Modifier.padding(start = Dimens.sm),
                         )
-                        HeroFreshnessGlyph(heroFreshnessForCurrency(banks, currency))
+                        HeroFreshnessGlyph(
+                            heroFreshnessForCurrency(banks, currency, syncInProgress = syncing),
+                        )
                     }
                 }
             }
@@ -901,15 +932,21 @@ private fun MetadataStrip(viewModel: AppViewModel, banks: List<BankData>) {
     BoxWithConstraints {
         val mobile = maxWidth < 480.dp
         if (mobile) {
-            // Mobile (<480dp): the strip wraps into two rows — the global
-            // sync line, then the controls cluster — with expanded touch
-            // targets (the dense §6.1.1/§6.1.2 opt-out is lifted; the
-            // platform's minimum interactive component size governs).
-            Column(verticalArrangement = Arrangement.spacedBy(Dimens.xs)) {
-                GlobalSyncLine(viewModel, banks)
-                Row(horizontalArrangement = Arrangement.spacedBy(Dimens.sm)) {
-                    RefreshControl(viewModel, compact = false)
+            // Mobile (<480dp): ONE row — the global sync line takes the
+            // available width and the touch-sized refresh control sits
+            // bottom-aligned beside it (expanded touch target: the dense
+            // §6.1.1/§6.1.2 opt-out is lifted; the platform's minimum
+            // interactive component size governs). The line itself wraps
+            // internally (FlowRow), so the strip never needs a second row.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+            ) {
+                Box(modifier = Modifier.weight(1f)) {
+                    GlobalSyncLine(viewModel, banks)
                 }
+                RefreshControl(viewModel, compact = false)
             }
         } else {
             // Single row at 28dp control-tier height: the global sync line
@@ -944,33 +981,39 @@ private fun MetadataStrip(viewModel: AppViewModel, banks: List<BankData>) {
  * stacks per bank. Per-bank failure detail lives where the user reads it
  * — consent notices beneath the strip, per-card freshness sublabels.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun GlobalSyncLine(viewModel: AppViewModel, banks: List<BankData>) {
     val colors = LocalBankTellerColors.current
     val syncing = viewModel.refreshRequested || viewModel.accountsData?.syncInProgress == true
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
-    ) {
-        if (syncing) {
+    if (syncing) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
             WaitingIndicator.Inline()
             Text(
                 text = "Updating balances…",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-        } else {
-            val summary = globalSyncSummary(banks)
+        }
+    } else {
+        // Non-syncing branch: the timestamp and the appended summary FLOW
+        // (wrap) rather than clipping at narrow widths — the mobile strip
+        // is a single row, so the line must break internally.
+        val summary = globalSyncSummary(banks)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(Dimens.xs)) {
             Text(
                 text = globalSyncLineText(latestSuccessAt(banks), getCurrentEpochMillis()),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            summary?.let {
+            summary.forEach { segment ->
                 Text(
-                    text = "· ${it.text}",
+                    text = "· ${segment.text}",
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (it.tier == GlobalSyncSummaryTier.Danger) {
+                    color = if (segment.tier == GlobalSyncSummaryTier.Danger) {
                         MaterialTheme.colorScheme.error
                     } else {
                         colors.brass
@@ -982,50 +1025,41 @@ private fun GlobalSyncLine(viewModel: AppViewModel, banks: List<BankData>) {
 }
 
 /**
- * Global refresh control (spec: refresh affordance — task 8.15): a 28×28dp
- * icon button (16dp Refresh icon, onSurfaceVariant, dense-container opt-out
- * per DESIGN-LANGUAGE §6.1.1/§6.1.2) with a FIXED footprint across all four
- * states — zero layout shift, the icon is never replaced with text:
- * idle → enabled, tooltip "Refresh balances"; syncing → disabled, the brass
- * inline waiting indicator replaces the icon in place, tooltip "Syncing
- * balances…"; cooldown → disabled, icon dimmed to 38% opacity, tooltip
- * "Balances recently updated. Refresh available shortly."; rate-limited →
- * disabled, icon dimmed to 38% opacity in brass, tooltip "Bank rate limit
- * reached. Next automatic sync in ~2 hours." Explanatory copy lives in
- * tooltips and the global sync line, never in the button itself.
+ * Global refresh control (spec: refresh affordance — task 8.15, revised by
+ * localized-sync-errors 4.4): a 28×28dp icon button (16dp Refresh icon,
+ * onSurfaceVariant, dense-container opt-out per DESIGN-LANGUAGE
+ * §6.1.1/§6.1.2) with a FIXED footprint across all states — zero layout
+ * shift, the icon is never replaced with text. ONLY two states disable it:
+ * syncing (a run in flight: the brass inline waiting indicator replaces the
+ * icon in place, tooltip "Syncing balances…") and cooldown (the ~60s
+ * server debounce window: the icon dims to 38% opacity, tooltip "Balances
+ * recently updated. Refresh available shortly."). There is NO rate-limited
+ * state — a degraded bank never blocks refreshing the others (design D4;
+ * the per-bank skip lives in the sync engine). Explanatory copy lives in
+ * tooltips and the global sync line, never in the button itself. States and
+ * tooltips are derived by [refreshControlState]/[refreshControlTooltip].
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RefreshControl(viewModel: AppViewModel, compact: Boolean) {
     val syncing = viewModel.refreshRequested || viewModel.accountsData?.syncInProgress == true
-    val cooldown = viewModel.refreshCooldownSeconds != null
-    val rateLimited = viewModel.accountsData?.banks?.any { it.syncState == "rate_limited" } == true
-    val brass = LocalBankTellerColors.current.brass
-
-    val tooltip = when {
-        syncing -> "Syncing balances…"
-        rateLimited -> "Bank rate limit reached. Next automatic sync in ~2 hours."
-        cooldown -> "Balances recently updated. Refresh available shortly."
-        else -> "Refresh balances"
-    }
+    val state = refreshControlState(syncing, viewModel.refreshCooldownSeconds)
+    val tooltip = refreshControlTooltip(state)
 
     TooltipBox(
         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
         tooltip = { PlainTooltip { Text(tooltip) } },
         state = rememberTooltipState(),
     ) {
-        val icon: @Composable () -> Unit = when {
-            syncing -> {
+        val icon: @Composable () -> Unit = when (state) {
+            RefreshControlState.Syncing -> {
                 // The brass inline spinner replaces the icon in place.
                 { WaitingIndicator.Inline() }
             }
-            rateLimited -> {
-                { Icon(Icons.Default.Refresh, contentDescription = null, tint = brass.copy(alpha = 0.38f), modifier = Modifier.size(16.dp)) }
-            }
-            cooldown -> {
+            RefreshControlState.Cooldown -> {
                 { Icon(Icons.Default.Refresh, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f), modifier = Modifier.size(16.dp)) }
             }
-            else -> {
+            RefreshControlState.Idle -> {
                 { Icon(Icons.Default.Refresh, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp)) }
             }
         }
@@ -1033,7 +1067,7 @@ private fun RefreshControl(viewModel: AppViewModel, compact: Boolean) {
             CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
                 IconButton(
                     onClick = { viewModel.triggerRefresh() },
-                    enabled = !syncing && !cooldown && !rateLimited,
+                    enabled = refreshControlEnabled(state),
                     modifier = Modifier.size(28.dp),
                 ) { icon() }
             }
@@ -1042,7 +1076,7 @@ private fun RefreshControl(viewModel: AppViewModel, compact: Boolean) {
             // interactive component size governs the hit box.
             IconButton(
                 onClick = { viewModel.triggerRefresh() },
-                enabled = !syncing && !cooldown && !rateLimited,
+                enabled = refreshControlEnabled(state),
             ) { icon() }
         }
     }
@@ -1075,65 +1109,190 @@ internal const val CONSENT_WARNING_DAYS = 7L
 @Composable
 private fun ConsentNotice(viewModel: AppViewModel, banks: List<BankData>) {
     val colors = LocalBankTellerColors.current
-    val expiring = banks.filter { val d = daysUntil(it.validUntil); d != null && d in 0..CONSENT_WARNING_DAYS }
-    val expired = banks.filter { val d = daysUntil(it.validUntil); d != null && d < 0 }
-    val broken = banks.filter { it.consentBroken }
 
-    if (broken.isNotEmpty() || expired.isNotEmpty()) {
-        Spacer(modifier = Modifier.height(Dimens.sm))
-        DecisionBox(
-            tint = MaterialTheme.colorScheme.error,
-            borderColor = MaterialTheme.colorScheme.error,
+    // One panel per affected bank (task 6.7): each panel carries its own
+    // copy, day count, and WIRED action — the re-authorization workflow is
+    // bank-specific, so a merged sentence with a single button could only
+    // ever reach the first bank's flow.
+    val panels = banks.mapNotNull(::consentPanelFor)
+    if (panels.isEmpty()) return
+
+    // Panel order (spec: account-overview — bank-scoped consent health):
+    // danger (dead/expired) first, then brass (expiring), each tier sorted
+    // by proximity to its expiration date (soonest first).
+    val ordered = panels.sortedWith(
+        compareBy<ConsentPanelData> { it.severity == PanelSeverity.Expiring }
+            .thenBy { it.days ?: Long.MAX_VALUE },
+    )
+
+    Spacer(modifier = Modifier.height(Dimens.sm))
+    if (panels.size == 1) {
+        // N=1: the full panel renders directly (Hero-First — one bank's
+        // notice never needs consolidation).
+        ConsentPanelBody(viewModel, ordered.single(), colors)
+    } else {
+        // N>1: the adaptive container — ONE consolidated summary card
+        // (the count, tinted with the highest severity present — danger
+        // outranks brass), collapsed by default; the expand/collapse
+        // control reveals the per-bank panels beneath it (each with its
+        // own copy, day count, and wired action). The summary header
+        // STAYS visible when expanded (the count is the scanning level).
+        ConsentAccordion(viewModel, ordered, colors)
+    }
+}
+
+/** Consent panel severity: the danger class (dead/expired) outranks brass (expiring). */
+internal enum class PanelSeverity { Dead, Expired, Expiring }
+
+/** The expiring notice's copy names the days left (task 6.7) — never a bare "soon". */
+internal fun expiringPanelCopy(bankName: String, days: Long): String =
+    if (days == 0L) {
+        "Bank consent for $bankName expires today. Re-connect now to keep balances current."
+    } else {
+        "Bank consent for $bankName expires in $days day${if (days == 1L) "" else "s"}. Re-connect soon to keep balances current."
+    }
+
+/** The dead/expired notice copy names its bank — never a merged multi-bank sentence. */
+internal fun deadPanelCopy(bankName: String, severity: PanelSeverity): String = when (severity) {
+    PanelSeverity.Dead ->
+        "Bank consent for $bankName ended. The bank revoked or ended the connection, so balances can no longer update. " +
+            "Stored balances remain visible below. Re-connect the bank to resume updates."
+    PanelSeverity.Expired ->
+        "Bank consent for $bankName expired. Re-connect the bank to resume balance updates."
+    PanelSeverity.Expiring -> error("unreachable — expiring uses expiringPanelCopy")
+}
+
+/** One bank's consent panel: its own copy, day count, and wired action (task 6.7). */
+@Composable
+private fun ConsentPanelBody(viewModel: AppViewModel, panel: ConsentPanelData, colors: BankTellerColors) {
+    val danger = panel.severity != PanelSeverity.Expiring
+    val tint = if (danger) MaterialTheme.colorScheme.error else colors.brass
+    DecisionBox(tint = tint, borderColor = tint) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
         ) {
-            if (broken.isNotEmpty()) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Error,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Text(
-                        text = "Bank consent ended for ${broken.joinToString(" and ") { it.bankName }}",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                Spacer(modifier = Modifier.height(Dimens.xs))
+            if (danger) {
+                Icon(
+                    imageVector = Icons.Filled.Error,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(18.dp),
+                )
             }
             Text(
-                text = if (broken.isNotEmpty()) {
-                    "The bank revoked or ended the connection, so balances can no longer update. " +
-                            "Stored balances remain visible below. Re-connect the bank to resume updates."
+                text = if (panel.severity == PanelSeverity.Expiring) {
+                    expiringPanelCopy(panel.bank.bankName, panel.days ?: 0L)
                 } else {
-                    "Bank consent expired for ${expired.joinToString(" and ") { it.bankName }}. Re-connect the bank to resume balance updates."
+                    deadPanelCopy(panel.bank.bankName, panel.severity)
                 },
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.titleMedium,
+                color = tint,
             )
-            Spacer(modifier = Modifier.height(Dimens.sm))
-            Row(horizontalArrangement = Arrangement.spacedBy(Dimens.sm)) {
-                QuietActionButton(
-                    onClick = { viewModel.startReauthorizationFlow((broken.ifEmpty { expired }).first()) },
-                    label = "Re-connect bank",
-                )
-            }
         }
-    } else if (expiring.isNotEmpty()) {
         Spacer(modifier = Modifier.height(Dimens.sm))
-        DecisionBox(tint = colors.brass, borderColor = colors.brass) {
-            Text(
-                text = "Bank consent for ${expiring.joinToString(" and ") { it.bankName }} expires soon. Re-connect soon to keep balances current.",
-                style = MaterialTheme.typography.bodyMedium,
+        Row(horizontalArrangement = Arrangement.spacedBy(Dimens.sm)) {
+            QuietActionButton(
+                onClick = { viewModel.startReauthorizationFlow(panel.bank) },
+                label = "Re-connect bank",
             )
-            Spacer(modifier = Modifier.height(Dimens.sm))
-            Row(horizontalArrangement = Arrangement.spacedBy(Dimens.sm)) {
-                QuietActionButton(
-                    onClick = { viewModel.startReauthorizationFlow(expiring.first()) },
-                    label = "Re-connect bank",
-                )
+        }
+    }
+}
+
+/**
+ * One affected bank's consent panel data (task 6.7): the bank itself (the
+ * re-authorization action is wired per bank), its severity, and its days
+ * count (null only for a broken consent with an unparseable expiry — the
+ * dead/expired copy never shows a count).
+ */
+internal data class ConsentPanelData(val bank: BankData, val severity: PanelSeverity, val days: Long?)
+
+/**
+ * Panel construction (task 6.7), pure so the partition is unit-testable:
+ * consentBroken wins over any expiry (a recorded consent-dead code is the
+ * authoritative signal even when valid_until is still in the future —
+ * premature expiry is exactly what the flag expresses); then expired
+ * (days < 0); then expiring within the urgency threshold; a healthy or
+ * unparseable-expiry bank renders NO panel.
+ */
+internal fun consentPanelFor(bank: BankData): ConsentPanelData? {
+    val days = daysUntil(bank.validUntil)
+    return when {
+        bank.consentBroken -> ConsentPanelData(bank, PanelSeverity.Dead, days)
+        days != null && days < 0 -> ConsentPanelData(bank, PanelSeverity.Expired, days)
+        days != null && days in 0..CONSENT_WARNING_DAYS -> ConsentPanelData(bank, PanelSeverity.Expiring, days)
+        else -> null
+    }
+}
+
+/**
+ * The N>1 consolidated summary card (task 6.7, Hero-First): the count in
+ * the highest severity's tint, collapsed by default; the expand/collapse
+ * control carries a persistent non-color affordance (a trailing chevron)
+ * plus underline-on-hover (§6.1.1's dense-control affordance rules — color
+ * alone is insufficient in the light theme) and reveals the per-bank
+ * panels beneath; the summary header STAYS visible when expanded.
+ */
+@Composable
+private fun ConsentAccordion(
+    viewModel: AppViewModel,
+    panels: List<ConsentPanelData>,
+    colors: BankTellerColors,
+) {
+    val anyDanger = panels.any { it.severity != PanelSeverity.Expiring }
+    val tint = if (anyDanger) MaterialTheme.colorScheme.error else colors.brass
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val interactionSource = remember { MutableInteractionSource() }
+
+    DecisionBox(tint = tint, borderColor = tint) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(MaterialTheme.shapes.small)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                ) { expanded = !expanded }
+                .denseWash(interactionSource)
+                .padding(vertical = Dimens.xs, horizontal = Dimens.xs),
+            horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Error,
+                contentDescription = null,
+                tint = tint,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = "${panels.size} bank connections need re-authorization",
+                style = MaterialTheme.typography.titleMedium,
+                color = tint,
+                modifier = Modifier.weight(1f),
+            )
+            // Persistent non-color affordance: the trailing chevron rotates
+            // with the expanded state (color alone is insufficient in the
+            // light theme — §6.1.1's affordance rules).
+            Icon(
+                imageVector = if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "Collapse" else "Expand",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(14.dp),
+            )
+        }
+        // The per-bank panels reveal beneath the summary header (which
+        // STAYS visible) with a quiet expand/collapse; each panel's button
+        // is wired to its own bank.
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(tween(durationMillis = 200)) + expandVertically(tween(durationMillis = 200)),
+            exit = fadeOut(tween(durationMillis = 200)) + shrinkVertically(tween(durationMillis = 200)),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(Dimens.xs)) {
+                panels.forEach { panel ->
+                    ConsentPanelBody(viewModel, panel, colors)
+                }
             }
         }
     }
@@ -1217,26 +1376,30 @@ internal fun heroPlaceholderText(hasSuccessfulRun: Boolean): String =
 
 /**
  * Hero freshness severity (task 8.17, DESIGN-LANGUAGE §6.1.3;
- * bank-connection-management D15) — derivation: a bank is CONTRIBUTING
+ * bank-connection-management D15; re-derived per account by
+ * localized-sync-errors 4.6) — derivation: a bank is CONTRIBUTING
  * when at least one of its LIVE (`in_consent = 1`) accounts carries
  * displayed balance data — kept-as-local-copy accounts never make a bank
  * contributing (their staleness is by design and carried by the
  * "Local copy" tag; a permanent indicator for a by-design condition
  * would be chronic noise); a placeholder hero (no live balances
- * displayed) never carries an indicator. [Broken] (danger) when any
- * contributing bank is in the error state or its consent is
- * dead/expired; [Attention] (brass) when any contributing bank is
- * stale, rate-limited, or never_synced WITH displayed figures
- * (unconfirmed cached/surviving data). Broken outranks Attention.
- * Never for: fresh banks, in-flight syncs (ambient activity, not a
- * bank state), no-balance (em-dash) accounts, or consent that is
- * merely expiring within the threshold (still valid — only expired/dead
- * counts).
+ * displayed) never carries an indicator, and neither does an in-flight
+ * sync (ambient activity, not a bank state).
+ *
+ * [Broken] (danger) when any contributing account's latest outcome is
+ * errored (status `error` — transient or consent bins), or its bank's
+ * consent is dead/expired. A single errored account keeps the hero
+ * danger: the total cannot be fully trusted while any constituent figure
+ * is outdated. [Attention] (brass) when any contributing account's
+ * figures are unconfirmed — a rate-limited latest outcome, its bank
+ * stale, or never_synced with surviving figures (unconfirmed cached data). Broken outranks Attention. Banks with no per-account
+ * outcome rows (old server / pre-first-run) fall back to their bank-level
+ * `sync_state`, so the pre-change truth is preserved rather than guessed.
  */
 internal enum class HeroFreshness { None, Attention, Broken }
 
-/** Sync states that make a contributing bank's figures unconfirmed (brass tier). */
-private val HeroFreshnessAttentionStates = setOf("stale", "rate_limited", "never_synced")
+/** Sync states that make a contributing bank's figures unconfirmed (brass tier) when no per-account outcomes exist. Task 4.6a: bank-level `error` joins — retryable-class, never danger. */
+private val HeroFreshnessAttentionStates = setOf("stale", "rate_limited", "never_synced", "error")
 
 /**
  * Whether the bank counts as CONTRIBUTING to the hero freshness
@@ -1248,19 +1411,48 @@ internal fun bankIsFreshnessContributing(bank: BankData): Boolean =
 
 /**
  * Derives the hero freshness severity for a set of banks (task 8.17,
- * D15): only CONTRIBUTING banks (at least one live account with
- * displayed balance data) are considered — local-copy-only banks, dash
- * accounts, and non-contributing banks never compromise the total's
- * freshness.
+ * D15; per-account re-derivation 4.6): only CONTRIBUTING banks (at least
+ * one live account with displayed balance data) are considered —
+ * local-copy-only banks, dash accounts, and non-contributing banks never
+ * compromise the total's freshness. [syncInProgress] suppresses the
+ * indicator entirely.
  */
-internal fun heroFreshness(banks: List<BankData>): HeroFreshness {
+internal fun heroFreshness(banks: List<BankData>, syncInProgress: Boolean = false): HeroFreshness {
+    if (syncInProgress) return HeroFreshness.None
     val contributing = banks.filter(::bankIsFreshnessContributing)
     if (contributing.isEmpty()) return HeroFreshness.None
+
+    // Task 4.6a re-tier: danger is reserved for the severed-connection
+    // class — a consent-dead/expired bank (incl. the expiry window: expired
+    // consent with latest outcomes still success, the hero stays danger
+    // between runs). RETRYABLE failures (transient/rate-limited/stale/
+    // unconfirmed) are brass: "Some balances may be outdated" — the remedy
+    // class, not the failure, picks the tier.
     val broken = contributing.any { bank ->
-        bank.syncState == "error" || bank.consentBroken || isConsentExpired(bank.validUntil)
+        bank.consentBroken || isConsentExpired(bank.validUntil)
     }
     if (broken) return HeroFreshness.Broken
-    val attention = contributing.any { it.syncState in HeroFreshnessAttentionStates }
+
+    val attention = contributing.any { bank ->
+        val consentGone = bank.consentBroken || isConsentExpired(bank.validUntil)
+        !consentGone && if (bankHasOutcomeData(bank)) {
+            // Bank-level stale/never-synced are the two exceptions that
+            // still mark figures unconfirmed regardless of per-account
+            // outcomes; transient and rate-limited are per-account
+            // outcomes — all retryable, all brass.
+            bank.syncState == "stale" ||
+                bank.syncState == "never_synced" ||
+                bank.accounts.any {
+                    it.inConsent == 1L && it.balanceAmount != null &&
+                        (it.syncStatus == "error" || it.syncStatus == "rate_limited")
+                }
+        } else {
+            // No-outcome fallback (4.6a): bank-level error/rate-limited
+            // are retryable-class — brass, never danger without
+            // severed-connection evidence.
+            bank.syncState in HeroFreshnessAttentionStates
+        }
+    }
     return if (attention) HeroFreshness.Attention else HeroFreshness.None
 }
 
@@ -1270,15 +1462,21 @@ internal fun heroFreshness(banks: List<BankData>): HeroFreshness {
  * balance-carrying account in it) are considered, so the glyph attaches
  * to the affected subtotal rows only — never to fresh subtotals.
  */
-internal fun heroFreshnessForCurrency(banks: List<BankData>, currency: String): HeroFreshness =
-    heroFreshness(
-        banks.filter { bank ->
-            bank.accounts.any { account ->
-                account.inConsent == 1L && account.balanceAmount != null &&
-                        (account.balanceCurrency ?: account.currency) == currency
-            }
-        },
+internal fun heroFreshnessForCurrency(
+    banks: List<BankData>,
+    currency: String,
+    syncInProgress: Boolean = false,
+): HeroFreshness {
+    fun matches(account: AccountData): Boolean =
+        (account.balanceCurrency ?: account.currency) == currency
+
+    return heroFreshness(
+        banks
+            .filter { bank -> bank.accounts.any { it.inConsent == 1L && it.balanceAmount != null && matches(it) } }
+            .map { bank -> bank.copy(accounts = bank.accounts.filter(::matches)) },
+        syncInProgress = syncInProgress,
     )
+}
 
 /**
  * Expired consent (task 8.17/8.18): a parseable `valid_until` in the past.
@@ -1301,46 +1499,11 @@ internal fun isConsentExpired(validUntil: String?): Boolean {
 internal fun localCopiesNoteLine(count: Int): String =
     "$count accounts are kept as local copies — reconnect a bank to restore the live view"
 
-/**
- * Per-card freshness sublabel (task 8.18, DESIGN-LANGUAGE §6.2.2;
- * bank-connection-management D15) — the text alternative that keeps every
- * status readable without color (WCAG 1.4.1), rendered right beneath the
- * balance figure. LOCAL-COPY OVERRIDE (D15; re-tiered 13.6/F6 — user-
- * ruled): a kept-as-local-copy account renders "Local copy — not
- * synchronized" INSTEAD of any bank-state sublabel, in the ARCHIVED
- * record convention (onSurfaceVariant) — the account's staleness is by
- * design and must never read as a degraded bank; the wording carries the
- * state, not the color (brass is reserved for conditions needing
- * attention; a permanent attention tint on a by-design state is chronic
- * noise, the same reasoning as the hero-indicator exclusion). Danger
- * tier: consent-dead/expired → "Sync paused" (accompanies the left
- * column's "Consent ended" label; severed connection — a data retry
- * cannot help), error → "Sync error". Brass tier: stale → "Stale
- * balance", rate_limited → "Rate limited", never_synced with surviving
- * balances → "Unconfirmed" (the re-authorization case). Healthy (fresh)
- * banks, and any state not listed, omit the sublabel; in-flight syncs
- * and dash accounts omit it by construction (in-flight is not a bank
- * state; the caller renders the sublabel only beneath a displayed
- * figure).
- */
-internal enum class BalanceSublabelTier { Brass, Danger, Archived }
-
-internal data class BalanceSublabel(val text: String, val tier: BalanceSublabelTier)
-
-internal fun balanceSublabel(bank: BankData, account: AccountData): BalanceSublabel? {
-    if (account.inConsent == 0L) {
-        return BalanceSublabel("Local copy — not synchronized", BalanceSublabelTier.Archived)
-    }
-    return when {
-        bank.consentBroken || isConsentExpired(bank.validUntil) ->
-            BalanceSublabel("Sync paused", BalanceSublabelTier.Danger)
-        bank.syncState == "error" -> BalanceSublabel("Sync error", BalanceSublabelTier.Danger)
-        bank.syncState == "stale" -> BalanceSublabel("Stale balance", BalanceSublabelTier.Brass)
-        bank.syncState == "rate_limited" -> BalanceSublabel("Rate limited", BalanceSublabelTier.Brass)
-        bank.syncState == "never_synced" -> BalanceSublabel("Unconfirmed", BalanceSublabelTier.Brass)
-        else -> null
-    }
-}
+// The former per-card freshness sublabel derivation (`BalanceSublabel`/
+// `balanceSublabel`) was removed by localized-sync-errors 5.2: the status
+// now renders in the canonical left-column slot, whose content derives
+// from `accountSyncPresentation`/`accountStatusSlotContent`
+// (SyncStatusPresentation.kt, §6.2.2).
 
 // ---------------------------------------------------------------
 // Global sync line derivations (pure, testable)
@@ -1353,26 +1516,41 @@ internal fun balanceSublabel(bank: BankData, account: AccountData): BalanceSubla
  */
 internal enum class GlobalSyncSummaryTier { Brass, Danger }
 
-internal data class GlobalSyncSummary(val text: String, val tier: GlobalSyncSummaryTier)
+/**
+ * One rendered summary segment of the global sync line (task 4.5a): the
+ * line appends segments after the middle dot, danger first, then brass —
+ * both classes render side by side when both are present (the classes are
+ * disjoint per bank, both statements are simultaneously true; the old
+ * single-override suppressed an active condition).
+ */
+internal data class GlobalSyncSummarySegment(val text: String, val tier: GlobalSyncSummaryTier)
 
 /**
- * Sync states that make a bank OUTDATED (brass tier) for the global sync
- * line's summary: stale, rate-limited, or never-synced — mirroring the
- * hero freshness attention tier (task 8.17): a never-synced bank with
- * surviving data is unconfirmed, a stale/limited one is not current.
+ * The global sync line's summary: BOTH classes side by side (task 4.5a) —
+ * the danger segment first, then the brass; an absent class omits its
+ * segment entirely (never "0 banks"). Empty when every bank is healthy,
+ * and when no sync run has ever completed and none succeeded (the
+ * never-synced quiet case).
  */
-private val GlobalSyncOutdatedStates = setOf("stale", "rate_limited", "never_synced")
+internal fun globalSyncSummary(banks: List<BankData>): List<GlobalSyncSummarySegment> {
+    val anyRunCompleted = banks.any { it.lastSyncAt != null }
+    val anySuccess = banks.any { it.lastSuccessAt != null }
+    if (!anyRunCompleted && !anySuccess) return emptyList()
+    val segments = mutableListOf<GlobalSyncSummarySegment>()
+    val attention = banks.count(::bankNeedsAttention)
+    if (attention > 0) {
+        val noun = if (attention == 1) "bank" else "banks"
+        val verb = if (attention == 1) "needs" else "need"
+        segments.add(GlobalSyncSummarySegment("$attention $noun $verb attention", GlobalSyncSummaryTier.Danger))
+    }
+    val outdated = banks.count(::bankIsOutdated)
+    if (outdated > 0) {
+        val noun = if (outdated == 1) "bank" else "banks"
+        segments.add(GlobalSyncSummarySegment("$outdated $noun outdated", GlobalSyncSummaryTier.Brass))
+    }
+    return segments
+}
 
-/**
- * Whether a bank counts as NEEDING ATTENTION (danger tier) for the global
- * sync line's summary: the `error` state or dead/expired consent — the
- * same broken definition as the hero freshness (task 8.17) and the
- * consent notice: an expired consent renders the danger-tier notice and
- * "Sync paused" sublabels, so counting it as brass-outdated would
- * contradict the rest of the degradation language.
- */
-internal fun bankNeedsAttention(bank: BankData): Boolean =
-    bank.syncState == "error" || bank.consentBroken || isConsentExpired(bank.validUntil)
 
 /**
  * The most recent successful sync run across ALL banks (the latest
@@ -1413,69 +1591,28 @@ internal fun globalSyncLineText(latestSuccess: Long?, nowMillis: Long): String =
 /**
  * Aggregate degradation summary appended to the global sync line after a
  * middle dot (spec: task 8.19), a pure function so the counting,
- * precedence, and pluralization are testable. Danger when any bank is in
- * the `error` state or consent-dead/expired ("N banks need attention",
- * singular "1 bank needs attention"); otherwise brass for
- * stale/rate-limited/never-synced banks ("N banks outdated", singular
- * "1 bank outdated"). Danger outranks brass when both are present — a
- * bank counted as needing attention is never also counted outdated. Null
+ * precedence, and pluralization are testable (localized-sync-errors 4.5:
+ * the count is per-bank but keyed on the banks' ACCOUNT outcomes, not the
+ * bank-level state). Danger when any bank has an errored latest account
+ * outcome or consent-dead/expired consent ("N banks need attention",
+ * singular "1 bank needs attention"); otherwise brass for banks whose
+ * accounts are rate-limited, or that are stale/unconfirmed ("N banks
+ * outdated", singular "1 bank outdated"). Danger outranks brass when both
+ * are present — a bank counted as needing attention is never also counted
+ * outdated. Null
  * (no summary) when every bank is healthy, and when no sync run has ever
  * completed and none succeeded (the never-synced quiet case: the line
  * reads "No sync yet" alone); when runs occurred but all failed the
  * danger summary carries the failure.
  */
-internal fun globalSyncSummary(banks: List<BankData>): GlobalSyncSummary? {
-    val anyRunCompleted = banks.any { it.lastSyncAt != null }
-    val anySuccess = banks.any { it.lastSuccessAt != null }
-    if (!anyRunCompleted && !anySuccess) return null
-    val attention = banks.count(::bankNeedsAttention)
-    if (attention > 0) {
-        val noun = if (attention == 1) "bank" else "banks"
-        val verb = if (attention == 1) "needs" else "need"
-        return GlobalSyncSummary("$attention $noun $verb attention", GlobalSyncSummaryTier.Danger)
-    }
-    val outdated = banks.count { bank ->
-        bank.syncState in GlobalSyncOutdatedStates && !bankNeedsAttention(bank)
-    }
-    if (outdated > 0) {
-        val noun = if (outdated == 1) "bank" else "banks"
-        return GlobalSyncSummary("$outdated $noun outdated", GlobalSyncSummaryTier.Brass)
-    }
-    return null
-}
+// (The old single-GlobalSyncSummary override was replaced by the segment
+// list above — task 4.5a: both classes render side by side.)
 
-/**
- * Per-card consent label decision (task 8.9 "Bank-scoped consent health";
- * countdown REMOVED by bank-connection-management 11.12 — user ruling:
- * lifecycle info lives in bank management) — extracted as a pure function
- * so the override logic is testable.
- *
- * ONLY the incident state renders a per-card label: a consent-dead bank
- * ([BankData.consentBroken] — the sync engine recorded a consent-dead EB
- * error code) shows "Consent ended" in danger styling REGARDLESS of
- * `valid_until` (a future or absent expiry timestamp never suppresses the
- * ended state — premature expiry is exactly what the flag exists to
- * express), paired with the "Sync paused" sublabel.
- *
- * Everything else is [ConsentCardLabel.None] — a healthy card renders NO
- * consent label at all: the countdown (including the ≤7-day urgency
- * presentation) lives SOLELY on the Settings bank-connections section's
- * consent-health badge (§6.1.8.1), and urgency is carried by the
- * top-level expiring notice (its DecisionBox with the re-authorization
- * action), never a quiet per-card countdown.
- */
-internal sealed class ConsentCardLabel {
-    /** Consent-dead: the ended state, danger styling. */
-    object Broken : ConsentCardLabel()
-
-    /** No label — healthy, expiring, expired, unparseable, or absent `valid_until`, not broken. */
-    object None : ConsentCardLabel()
-}
-
-internal fun consentCardLabel(validUntil: String?, consentBroken: Boolean): ConsentCardLabel {
-    if (consentBroken) return ConsentCardLabel.Broken
-    return ConsentCardLabel.None
-}
+// The former per-card consent label derivation (`ConsentCardLabel`/
+// `consentCardLabel`, the top-right "Consent ended" incident) was removed
+// by localized-sync-errors 5.2: the consent-dead incident lives in the
+// canonical left-column status slot (§6.2.2), so a second label elsewhere
+// on the card must not exist.
 
 // ---------------------------------------------------------------
 // Add-flow auth-failure notice (task 7.5)
@@ -1556,11 +1693,12 @@ private fun AuthFailureNotice(viewModel: AppViewModel) {
 // ---------------------------------------------------------------
 
 @Composable
-private fun AccountCards(banks: List<BankData>) {
+private fun AccountCards(viewModel: AppViewModel, banks: List<BankData>) {
+    val syncInProgress = viewModel.refreshRequested || viewModel.accountsData?.syncInProgress == true
     Column(verticalArrangement = Arrangement.spacedBy(Dimens.md)) {
         banks.forEach { bank ->
             bank.accounts.forEach { account ->
-                AccountCard(bank, account)
+                AccountCard(bank, account, syncInProgress)
             }
         }
     }
@@ -1578,28 +1716,40 @@ private fun AccountCards(banks: List<BankData>) {
  * IBAN-less accounts leave no cross-check). The two-line block aligns
  * with the 40dp logo, no vertical overhang.
  *
- * Top-right header slot (opposite the headline): RESERVED — empty when
- * healthy; the "Consent ended" danger incident (11.12) renders there;
- * future per-account actions live there in the Inline Text XS tier. The
- * slot never inflates row height or shifts layout (the balance column
- * below owns the figure row's height).
+ * Top-right header slot (opposite the headline): RESERVED — empty in the
+ * healthy AND degraded states (localized-sync-errors 4.2: the former
+ * "Consent ended" incident label merged into the canonical left-column
+ * status slot, §6.2.2); future per-account actions live there in the
+ * Inline Text XS tier. The slot never inflates row height or shifts
+ * layout (the balance column below owns the figure row's height).
  *
- * Balance column (tasks 8.16/8.18, DESIGN-LANGUAGE §6.2.1/§6.2.2): figures
+ * Balance column (tasks 8.16/8.18, DESIGN-LANGUAGE §6.2.1): figures
  * are never tinted (a red figure means a negative balance in financial UI
  * — a stored figure is a valid frozen record); accounts without stored
  * balances render the em-dash with the figures' exact typographic metrics
  * in a tooltip — GATED on the bank having a successful run (the dash
- * asserts a report; never-synced/failed-runs-only banks omit the line);
- * degraded states render a quiet sublabel beneath the figure instead of
- * tinting it.
+ * asserts a report; never-synced/failed-runs-only banks omit the line).
+ * Degradation status no longer lives beneath the figure: it renders in the
+ * canonical left-column slot (localized-sync-errors 4.2, §6.2.2).
+ *
+ * Canonical status slot + scan signal (localized-sync-errors 4.2/4.3,
+ * DESIGN-LANGUAGE §6.2.2, design D5): one slot below the metadata subline,
+ * pairing a tier-colored icon with the binned copy; the card carries a 1px
+ * tier-colored border plus a 4–6% tier tint (danger stronger than brass)
+ * while degraded, and neither signal while healthy. Color transitions use
+ * ~200ms `animateColorAsState`; the slot uses `AnimatedVisibility` so it
+ * appears/disappears without a snap. The signal is container-only — it
+ * never reuses the interaction vocabulary's state-layer or lift.
  *
  * Local-copy treatment (bank-connection-management D15, spec:
  * account-overview — local-copy dashboard treatment): a
  * kept-as-local-copy account (`in_consent = 0`) renders as a visibly
  * ARCHIVED record — the card content in onSurfaceVariant (the same
  * dimmed convention as the no-balance em-dash, never a state color
- * tint), a "Local copy" tag in the left column, and the "Local copy —
- * not synchronized" sublabel beneath the balance figure. The figure is
+ * tint), and the "Local copy — not synchronized" status in the canonical
+ * status slot as its single marker (no scan signal — by-design state,
+ * wording-carried; the former bare "Local copy" tag is retired, 5.2). The
+ * figure is
  * excluded from the hero total by construction (HeroTotal filters live
  * accounts only). The connections card (§6.1.8) and the wizard bank
  * list stay bank-first deliberately — this account-first hierarchy is
@@ -1607,15 +1757,50 @@ private fun AccountCards(banks: List<BankData>) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AccountCard(bank: BankData, account: AccountData) {
+private fun AccountCard(
+    bank: BankData,
+    account: AccountData,
+    syncInProgress: Boolean,
+) {
     val colors = LocalBankTellerColors.current
     val isLocalCopy = account.inConsent == 0L
+
+    // Canonical slot content (task 4.2): null => healthy card, no slot.
+    val presentation = accountSyncPresentation(bank, account, syncInProgress)
+    val slot = accountStatusSlotContent(presentation)
+
+    // Tiered scan signal (task 4.3, §6.2.2): 1px tier border + quiet tint.
+    // The archived/local-copy tier carries NO signal — its staleness is by
+    // design and the wording carries it. Colors derive from theme tokens
+    // (danger = colorScheme.error, brass = the ledger token).
+    val tierColor = when (presentation?.tier) {
+        SyncPresentationTier.Danger -> MaterialTheme.colorScheme.error
+        SyncPresentationTier.Brass -> colors.brass
+        SyncPresentationTier.Archived, null -> null
+    }
+    val tintAlpha = when (presentation?.tier) {
+        SyncPresentationTier.Danger -> 0.06f
+        SyncPresentationTier.Brass -> 0.04f
+        SyncPresentationTier.Archived, null -> 0f
+    }
+    val surface = MaterialTheme.colorScheme.surface
+    val borderColor by animateColorAsState(
+        targetValue = tierColor ?: Color.Transparent,
+        animationSpec = tween(durationMillis = 200),
+        label = "account-card-status-border",
+    )
+    val containerColor by animateColorAsState(
+        targetValue = tierColor?.copy(alpha = tintAlpha)?.compositeOver(surface) ?: surface,
+        animationSpec = tween(durationMillis = 200),
+        label = "account-card-status-tint",
+    )
 
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
+        border = BorderStroke(1.dp, borderColor),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
+            containerColor = containerColor,
             contentColor = if (isLocalCopy) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
         ),
     ) {
@@ -1656,23 +1841,11 @@ private fun AccountCard(bank: BankData, account: AccountData) {
                         color = if (isLocalCopy) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
                         modifier = Modifier.weight(1f),
                     )
-                    // Reserved top-right header slot (11.13): empty when
-                    // healthy; the consent incident moves here (11.12);
-                    // future per-account actions in the Inline Text XS
-                    // tier. The slot is leading-aligned after the weighted
-                    // headline — it never inflates row height.
-                    if (!isLocalCopy) {
-                        when (consentCardLabel(bank.validUntil, bank.consentBroken)) {
-                            ConsentCardLabel.Broken -> {
-                                Text(
-                                    text = "Consent ended",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                )
-                            }
-                            ConsentCardLabel.None -> Unit
-                        }
-                    }
+                    // Reserved top-right header slot (11.13; 4.2): empty in
+                    // both healthy and degraded states — the consent-dead
+                    // incident merged into the canonical left-column slot.
+                    // Future per-account actions fill it in the Inline Text
+                    // XS tier; it never inflates row height.
                 }
                 // Combined metadata subline (11.13): `Bank Name · Masked
                 // IBAN` — Inter bodySmall bank name + 4dp-margined middle
@@ -1716,13 +1889,23 @@ private fun AccountCard(bank: BankData, account: AccountData) {
                         }
                     }
                 }
-                if (isLocalCopy) {
-                    // "Local copy" tag (D15): the archived-record marker.
-                    Text(
-                        text = "Local copy",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                // Canonical left-column status slot (task 4.2, §6.2.2):
+                // directly below the metadata subline, never beneath the
+                // balance. AnimatedVisibility keeps the appear/disappear
+                // quiet (~200ms, no snap); the slot itself is one line plus
+                // the remedy affordance, wrapping naturally at narrow widths.
+                AnimatedVisibility(
+                    visible = slot != null,
+                    enter = fadeIn(tween(durationMillis = 200)) + expandVertically(tween(durationMillis = 200)),
+                    exit = fadeOut(tween(durationMillis = 200)) + shrinkVertically(tween(durationMillis = 200)),
+                ) {
+                    slot?.let { content ->
+                        AccountStatusSlot(
+                            slot = content,
+                            lastFetchAt = account.lastFetchAt,
+                            errorMessage = account.errorMessage,
+                        )
+                    }
                 }
             }
 
@@ -1740,26 +1923,6 @@ private fun AccountCard(bank: BankData, account: AccountData) {
                         ),
                         color = if (isLocalCopy) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified,
                     )
-                    // Freshness sublabel (task 8.18; local-copy override
-                    // D15): right beneath the figure, right-aligned (the
-                    // column aligns end), labelSmall STANDARD font (not
-                    // mono) — the text alternative that keeps every status
-                    // readable without relying on color (WCAG 1.4.1).
-                    balanceSublabel(bank, account)?.let { sublabel ->
-                        Text(
-                            text = sublabel.text,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = when (sublabel.tier) {
-                                BalanceSublabelTier.Brass -> colors.brass
-                                BalanceSublabelTier.Danger -> MaterialTheme.colorScheme.error
-                                // Archived (13.6/F6): the archived-record
-                                // convention — the same quiet tier as the
-                                // card's other greyed treatments (figure,
-                                // tag); the wording carries the state.
-                                BalanceSublabelTier.Archived -> MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
-                    }
                 } else if (!isLocalCopy && bankHasSuccessfulRun(bank)) {
                     // Em-dash gated on a successful run (task 8.16,
                     // §6.2.1): the dash ASSERTS a report — never-synced and
@@ -1792,6 +1955,103 @@ private fun AccountCard(bank: BankData, account: AccountData) {
         }
     }
 }
+
+/**
+ * One canonical account-card status slot (localized-sync-errors 4.2/6.5,
+ * DESIGN-LANGUAGE §6.2.2): tier-colored icon + binned copy, plus the
+ * remedy affordance when the state has one. The icon is the WCAG 1.4.1
+ * anchor — status is never color alone.
+ *
+ * The icon is wrapped in a PERSISTENT tooltip: the full diagnostic detail
+ * (the raw recorded [errorMessage] when the server exposes it, plus the
+ * last fetch time) is available on demand, never in the scanning-level
+ * line. The tooltip's open state is published to the shell's touch dim
+ * ([diagnosticTooltipOpenState]) so a touch reader gets the reading-mode
+ * signal and a tap-away dismissal.
+ *
+ * Remedy mapping (task 4.8, the solvability principle — remedies live at
+ * their proper scope; the slot is a PURE STATUS LINE for every state):
+ * - [SyncRemedy.Reauthorize] — NO per-card action (a dead-consent bank's
+ *   action exists exactly once: the top-level consent notice and the
+ *   settings connection card; a per-card button would multiply one
+ *   action by every affected account). The slot copy itself names
+ *   re-authorization as the remedy.
+ * - [SyncRemedy.Refresh] — a non-clickable hint naming the metadata
+ *   strip's global refresh (no per-account sync endpoint exists);
+ * - [SyncRemedy.NextAutomaticSync], [SyncRemedy.None] — no affordance.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AccountStatusSlot(
+    slot: AccountStatusSlotContent,
+    lastFetchAt: Long?,
+    errorMessage: String?,
+) {
+    val tint = when (slot.tier) {
+        SyncPresentationTier.Danger -> MaterialTheme.colorScheme.error
+        SyncPresentationTier.Brass -> LocalBankTellerColors.current.brass
+        SyncPresentationTier.Archived -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val tooltipState = rememberTooltipState(isPersistent = true)
+    LaunchedEffect(tooltipState.isVisible) {
+        diagnosticTooltipOpenState.value = tooltipState.isVisible
+    }
+    // Review finding 2: the host may leave composition WHILE the tooltip
+    // is open (the account heals mid-read — the slot's AnimatedVisibility
+    // exit disposes this composable), and nothing would ever publish
+    // `false`: the dim would stay composed forever, consuming every tap
+    // with no tooltip left to dismiss it. Clear the flag on disposal.
+    DisposableEffect(Unit) {
+        onDispose { diagnosticTooltipOpenState.value = false }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(Dimens.xs)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+        ) {
+            TooltipBox(
+                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
+                tooltip = {
+                    PlainTooltip {
+                        Text(accountStatusTooltipText(slot.text, lastFetchAt, errorMessage = errorMessage))
+                    }
+                },
+                state = tooltipState,
+            ) {
+                Icon(
+                    imageVector = when (slot.icon) {
+                        AccountStatusIcon.Error -> Icons.Outlined.ErrorOutline
+                        AccountStatusIcon.Warning -> Icons.Outlined.WarningAmber
+                        AccountStatusIcon.Archive -> Icons.Outlined.Archive
+                    },
+                    contentDescription = null,
+                    tint = tint,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            Text(
+                text = slot.text,
+                style = MaterialTheme.typography.labelSmall,
+                color = tint,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        when (slot.remedy) {
+            // Task 4.8: NO per-card re-authorization action — the slot is a
+            // pure status line; the consent copy names the remedy, the
+            // top-level notice and the settings card carry the action.
+            SyncRemedy.Reauthorize -> Unit
+            SyncRemedy.Refresh -> Text(
+                text = "Refresh balances above",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            SyncRemedy.NextAutomaticSync, SyncRemedy.None -> Unit
+        }
+    }
+}
+
 
 /** `DE89 •••• •••• 3000` — first 4 and last 4 characters, middle masked. Internal: shared with the Settings connection cards. */
 internal fun maskIban(iban: String): String {

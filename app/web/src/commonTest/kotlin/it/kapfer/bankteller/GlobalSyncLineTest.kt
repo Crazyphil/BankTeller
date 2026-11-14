@@ -90,7 +90,8 @@ class GlobalSyncLineTest {
 
     @Test
     fun summary_allHealthy_omitted() {
-        assertNull(
+        assertEquals(
+            emptyList(),
             globalSyncSummary(listOf(bank(lastSuccessAt = 1_000L), bank(lastSuccessAt = 2_000L))),
         )
     }
@@ -99,13 +100,13 @@ class GlobalSyncLineTest {
     fun summary_neverSyncedQuietCase_omitted() {
         // Reload mid-initial-import: no run completed, none succeeded —
         // the line reads "No sync yet" alone.
-        assertNull(globalSyncSummary(listOf(bank(syncState = "never_synced"))))
+        assertEquals(emptyList(), globalSyncSummary(listOf(bank(syncState = "never_synced"))))
     }
 
     @Test
     fun summary_stale_bankOutdatedInBrass() {
         assertEquals(
-            GlobalSyncSummary("1 bank outdated", GlobalSyncSummaryTier.Brass),
+            listOf(GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass)),
             globalSyncSummary(listOf(bank(lastSuccessAt = 1_000L), bank(syncState = "stale", lastSuccessAt = 2_000L))),
         )
     }
@@ -113,7 +114,7 @@ class GlobalSyncLineTest {
     @Test
     fun summary_outdated_pluralizes() {
         assertEquals(
-            GlobalSyncSummary("2 banks outdated", GlobalSyncSummaryTier.Brass),
+            listOf(GlobalSyncSummarySegment("2 banks outdated", GlobalSyncSummaryTier.Brass)),
             globalSyncSummary(
                 listOf(
                     bank(lastSuccessAt = 1_000L),
@@ -129,7 +130,7 @@ class GlobalSyncLineTest {
         // A run completed but never succeeded (the bank's own last_sync_at)
         // next to a fresh bank: the never-synced bank is outdated.
         assertEquals(
-            GlobalSyncSummary("1 bank outdated", GlobalSyncSummaryTier.Brass),
+            listOf(GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass)),
             globalSyncSummary(
                 listOf(
                     bank(lastSyncAt = 1_000L, lastSuccessAt = 2_000L),
@@ -140,38 +141,49 @@ class GlobalSyncLineTest {
     }
 
     @Test
-    fun summary_error_bankNeedsAttentionInDanger() {
+    fun summary_errorBank_isOutdatedInBrass() {
+        // 4.6a re-tier: a bank-level error (no outcome bins — class
+        // unknown) is retryable-class — brass outdated, never danger.
         assertEquals(
-            GlobalSyncSummary("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+            listOf(GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass)),
             globalSyncSummary(listOf(bank(lastSuccessAt = 1_000L), bank(syncState = "error", lastSyncAt = 2_000L))),
         )
     }
 
     @Test
     fun summary_attention_pluralizes() {
+        // 4.6a: attention banks are the consent class — one dead, one
+        // expired — while the retryable error bank renders its brass
+        // segment side by side (4.5a).
         assertEquals(
-            GlobalSyncSummary("2 banks need attention", GlobalSyncSummaryTier.Danger),
+            listOf(
+                GlobalSyncSummarySegment("2 banks need attention", GlobalSyncSummaryTier.Danger),
+                GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass),
+            ),
             globalSyncSummary(
                 listOf(
-                    bank(lastSuccessAt = 1_000L),
-                    bank(syncState = "error", lastSyncAt = 2_000L),
-                    bank(consentBroken = true, lastSuccessAt = 3_000L),
+                    bank(consentBroken = true, lastSuccessAt = 1_000L),
+                    bank(validUntil = "2000-01-01T00:00:00Z", lastSyncAt = 2_000L),
+                    bank(syncState = "error", lastSyncAt = 3_000L),
                 ),
             ),
         )
     }
 
     @Test
-    fun summary_dangerOutranksBrass() {
-        // One error bank + one stale bank: the summary is danger and
-        // counts ONLY the banks needing attention — the stale bank's
-        // detail lives in its per-card freshness sublabel.
+    fun summary_bothClassesRenderSideBySide() {
+        // Task 4.5a: the classes are disjoint per bank, both statements are
+        // simultaneously true — BOTH segments render, danger first; the
+        // old single-override suppressed an active condition.
         assertEquals(
-            GlobalSyncSummary("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+            listOf(
+                GlobalSyncSummarySegment("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+                GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass),
+            ),
             globalSyncSummary(
                 listOf(
                     bank(lastSuccessAt = 1_000L),
-                    bank(syncState = "error", lastSyncAt = 2_000L),
+                    bank(consentBroken = true, lastSyncAt = 2_000L),
                     bank(syncState = "stale", lastSuccessAt = 3_000L),
                 ),
             ),
@@ -183,7 +195,7 @@ class GlobalSyncLineTest {
         // consentBroken overrides the brass state — the bank counts once,
         // in the danger tier.
         assertEquals(
-            GlobalSyncSummary("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+            listOf(GlobalSyncSummarySegment("1 bank needs attention", GlobalSyncSummaryTier.Danger)),
             globalSyncSummary(listOf(bank(syncState = "stale", consentBroken = true, lastSuccessAt = 1_000L))),
         )
     }
@@ -194,18 +206,37 @@ class GlobalSyncLineTest {
         // "Sync paused" sublabels — it counts as needing attention, not
         // as brass-outdated.
         assertEquals(
-            GlobalSyncSummary("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+            listOf(GlobalSyncSummarySegment("1 bank needs attention", GlobalSyncSummaryTier.Danger)),
             globalSyncSummary(listOf(bank(lastSuccessAt = 1_000L, validUntil = "2000-01-01T00:00:00Z"))),
         )
     }
 
     @Test
-    fun summary_allRunsFailed_needsAttentionInDanger() {
-        // Runs occurred but all failed (no successful run anywhere): the
-        // "No sync yet" line appends the danger summary.
+    fun summary_allRunsFailed_transientFailure_isOutdatedInBrass() {
+        // 4.6a: runs occurred but all failed with a RETRYABLE (transient)
+        // failure and no successful run anywhere — the "No sync yet" line
+        // appends the brass summary.
         assertEquals(
-            GlobalSyncSummary("1 bank needs attention", GlobalSyncSummaryTier.Danger),
+            listOf(GlobalSyncSummarySegment("1 bank outdated", GlobalSyncSummaryTier.Brass)),
             globalSyncSummary(listOf(bank(syncState = "error", lastSyncAt = 1_000L))),
+        )
+    }
+
+    @Test
+    fun summary_allRunsFailed_consentClassFailure_needsAttentionInDanger() {
+        // 4.6a: danger is reserved for the consent class — an all-failed
+        // first run whose failure is a dead/expired consent.
+        assertEquals(
+            listOf(GlobalSyncSummarySegment("1 bank needs attention", GlobalSyncSummaryTier.Danger)),
+            globalSyncSummary(
+                listOf(
+                    bank(
+                        validUntil = "2000-01-01T00:00:00Z",
+                        syncState = "error",
+                        lastSyncAt = 1_000L,
+                    ),
+                ),
+            ),
         )
     }
 }

@@ -27,8 +27,10 @@ import kotlinx.serialization.json.put
  * - `GET /api/accounts` — authenticated: accounts + last-known balances +
  *   per-bank sync state + consent expiry + global `sync_in_progress` flag.
  * - `POST /api/onboarding/import-balances` — wizard initial import
- *   (authenticated): starts an `initial` run with the request's PSU context,
- *   returns immediately.
+ *   (authenticated): starts a session-scoped `initial` run over the NEWEST
+ *   `eb_sessions` row (the session just merged by the auth callback — the
+ *   wizard calls this endpoint after the merge), with the request's PSU
+ *   context, returns immediately.
  *
  * All responses are built with the kotlinx.serialization JSON DSL
  * (`buildJsonObject`) — responding with `Map<String, Any?>` fails at
@@ -87,11 +89,14 @@ fun Route.syncRoutes(
         )
         // The initial import bypasses the manual cooldown (the user just
         // completed a bank connection — the import must run) but still arms
-        // it; a run already in flight queues a follow-up pass so the new
-        // session is covered. The run is engine-scoped: it completes
-        // server-side regardless of client disconnects. The response returns
-        // immediately with the run's status; the SPA observes completion via
-        // the sync-status data in GET /api/accounts.
+        // it. The run is SCOPED to the newest eb_sessions row —
+        // the session the auth callback just merged, since the merge precedes
+        // this call (spec: initial import touches only the new bank; design
+        // D2). A session-scoped run executes independently of an in-flight
+        // all-sessions run (it waits on the run mutex, never coalesces into it).
+        // The run is engine-scoped: it completes server-side regardless of
+        // client disconnects. The response returns immediately with the run's
+        // status; the SPA observes completion via GET /api/accounts.
         val result = engine.triggerInitialImport(psuHeaders)
         call.respond(
             buildJsonObject {
@@ -108,6 +113,16 @@ fun Route.syncRoutes(
  * last-known balances, sync state (fresh/stale/error/rate_limited/
  * never_synced with last-run-outcome precedence), consent expiry, and the
  * global in-flight flag.
+ *
+ * Additive localization data (spec: balance-sync — Sync status endpoint data;
+ * design D3): each account carries its latest outcome's `sync_status`
+ * (success | error | rate_limited), `error_bin` when failed, `error_message`
+ * when applicable, and `last_fetch_at`. These fields are ABSENT when no
+ * outcome row exists (pre-first-run, NULL-uid accounts) — the SPA then falls
+ * back to the bank-level state. Every previously existing field keeps its
+ * name and semantics; the five-value `sync_state` vocabulary is unchanged.
+ * (The bank-level `has_issues` flag was REMOVED by the 5.1a re-scope: its
+ * only consumer was the pre-re-scope connection-card tier, now consent-only.)
  *
  * Per the connections data contract (spec: bank-connection-management):
  * every connected bank is included — including banks whose authorization
@@ -200,6 +215,24 @@ internal fun buildAccountsResponse(
                 .executeAsOneOrNull()
             val consentBroken = latestErrorCode != null &&
                 latestErrorCode in CONSENT_DEAD_ERROR_CODES
+            // (The consent-expired derivation was consumed only by the removed
+            // `has_issues` flag — the SPA derives expiry client-side from
+            // `valid_until`. Kept out: no dead code.)
+
+            // Per-account latest outcomes (spec: balance-sync — per-account
+            // sync outcomes; sync-error-presentation). Additive fields only —
+            // every pre-existing account/bank field keeps its name and
+            // semantics (design D3). The latest row is keyed by MAX(id) (runs
+            // are serialized, so a later id is a later run); `.associateBy`
+            // gives each account exactly one row.
+            val latestOutcomes = if (accountIds.isEmpty()) {
+                emptyMap()
+            } else {
+                database.syncOutcomesQueries
+                    .selectLatestOutcomesByAccountIds(accountIds)
+                    .executeAsList()
+                    .associateBy { it.account_id }
+            }
 
             add(
                 buildJsonObject {
@@ -217,6 +250,7 @@ internal fun buildAccountsResponse(
                     put("accounts", buildJsonArray {
                         for (account in accounts) {
                             val balance = balances[account.id]
+                            val latestOutcome = latestOutcomes[account.id]
                             add(
                                 buildJsonObject {
                                     put("id", account.id)
@@ -229,6 +263,16 @@ internal fun buildAccountsResponse(
                                     balance?.balance_type?.let { put("balance_type", it) }
                                     balance?.reference_date?.let { put("reference_date", it) }
                                     balance?.fetched_at?.let { put("fetched_at", it) }
+                                    // Additive per-account outcome fields (absent
+                                    // when no outcome row exists — e.g. pre-first-
+                                    // run or a NULL-uid account; the SPA falls
+                                    // back to the bank-level state).
+                                    latestOutcome?.let { outcome ->
+                                        put("sync_status", outcome.status)
+                                        outcome.error_bin?.let { put("error_bin", it) }
+                                        outcome.error_message?.let { put("error_message", it) }
+                                        put("last_fetch_at", outcome.fetched_at)
+                                    }
                                 }
                             )
                         }

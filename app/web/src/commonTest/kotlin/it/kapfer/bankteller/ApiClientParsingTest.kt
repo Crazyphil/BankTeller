@@ -298,5 +298,101 @@ class ApiClientParsingTest {
         assertNull(data(json).missingAccountsBankName)
     }
 
+    // ---------------------------------------------------------------
+    // parseAccountsData — additive per-account outcomes
+    // (localized-sync-errors 3.2; the bank-level has_issues flag was
+    // REMOVED by the 5.1a re-scope — no remaining consumer)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun parseAccountsData_parsesPresentPerAccountOutcomeFields() {
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"error",
+                       "accounts":[{"id":1,"name":"Checking","currency":"EUR",
+                                    "balance_amount":"10.00","balance_currency":"EUR",
+                                    "sync_status":"error","error_bin":"transient",
+                                    "error_message":"Read timed out",
+                                    "last_fetch_at":1723456789000}]}]}
+        """.trimIndent()
+        val bank = data(json).banks.first()
+        val account = bank.accounts.first()
+        assertEquals("error", account.syncStatus)
+        assertEquals("transient", account.errorBin)
+        assertEquals("Read timed out", account.errorMessage)
+        assertEquals(1723456789000L, account.lastFetchAt)
+    }
+
+    @Test
+    fun parseAccountsData_parsesRateLimitedOutcome() {
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh",
+                       "accounts":[{"id":1,"name":"Checking","currency":"EUR",
+                                    "sync_status":"rate_limited","error_bin":"rate_limited"}]}]}
+        """.trimIndent()
+        val bank = data(json).banks.first()
+        assertEquals("rate_limited", bank.accounts.first().syncStatus)
+        assertEquals("rate_limited", bank.accounts.first().errorBin)
+    }
+
+    @Test
+    fun parseAccountsData_absentAdditiveFieldsDefaultToNull() {
+        // A server predating the change (or an account with no outcome row):
+        // the SPA model tolerates the absent fields — never a guessed default.
+        val json = """
+            {"sync_in_progress":false,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh",
+                       "accounts":[{"id":1,"name":"Checking","currency":"EUR"}]}]}
+        """.trimIndent()
+        val bank = data(json).banks.first()
+        val account = bank.accounts.first()
+        assertNull(account.syncStatus)
+        assertNull(account.errorBin)
+        assertNull(account.lastFetchAt)
+    }
+
+    @Test
+    fun parseAccountsData_additiveFieldsDoNotChangeExistingParsing() {
+        val json = """
+            {"sync_in_progress":true,
+             "banks":[{"bank_name":"Demo Bank","bank_country":"DE","sync_state":"fresh",
+                       "valid_until":"2027-01-01T00:00:00Z","consent_broken":true,
+                       "last_sync_at":111,"last_success_at":222,"bic":"DEMODEFFXXX",
+                       "connected_at":333,
+                       "accounts":[{"id":7,"name":"Savings","iban":"DE89370400440532013000",
+                                    "currency":"EUR","balance_amount":"5.50",
+                                    "balance_currency":"EUR","balance_type":"CLBD",
+                                    "reference_date":"2026-01-01","fetched_at":444,
+                                    "in_consent":0,
+                                    "sync_status":"success","error_bin":null,
+                                    "last_fetch_at":555}]}]}
+        """.trimIndent()
+        val bank = data(json).banks.first()
+        assertEquals("Demo Bank", bank.bankName)
+        assertEquals("DE", bank.bankCountry)
+        assertEquals("fresh", bank.syncState)
+        assertEquals("2027-01-01T00:00:00Z", bank.validUntil)
+        assertTrue(bank.consentBroken)
+        assertEquals(111L, bank.lastSyncAt)
+        assertEquals(222L, bank.lastSuccessAt)
+        assertEquals("DEMODEFFXXX", bank.bic)
+        assertEquals(333L, bank.connectedAt)
+        val account = bank.accounts.single()
+        assertEquals(7L, account.id)
+        assertEquals("Savings", account.name)
+        assertEquals("DE89370400440532013000", account.iban)
+        assertEquals("EUR", account.currency)
+        assertEquals("5.50", account.balanceAmount)
+        assertEquals("EUR", account.balanceCurrency)
+        assertEquals("CLBD", account.balanceType)
+        assertEquals("2026-01-01", account.referenceDate)
+        assertEquals(444L, account.fetchedAt)
+        assertEquals(0L, account.inConsent)
+        assertEquals("success", account.syncStatus)
+        assertNull(account.errorBin)
+        assertEquals(555L, account.lastFetchAt)
+    }
+
     private fun data(json: String): AccountsData = api.parseAccountsData(json)!!
 }
