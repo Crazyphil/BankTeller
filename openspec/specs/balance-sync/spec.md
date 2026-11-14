@@ -16,6 +16,8 @@ Concurrent triggers SHALL coalesce: while a run is in flight, a new trigger SHAL
 
 PSU context extraction SHALL use the same proxy-aware IP resolution as the login rate limiter (`XForwardedHeaders` is installed; `request.origin.remoteHost`), so PSU IP and rate-limit IP cannot diverge.
 
+Every run SHALL carry a **scope**: either all live sessions, or a single named session. The initial balance import (wizard) SHALL run scoped to the newly authorized session only — connecting a bank SHALL NOT make any Enable Banking call against any other bank's connection. Manual and login runs SHALL cover all live sessions **except** sessions in the rate-limit skip state (per the per-bank rate-limit skip requirement); background runs SHALL always cover all live sessions. Session-scoped runs SHALL serialize with other runs (one Enable Banking client, one database) but SHALL NOT be queued behind or coalesced into an in-flight all-sessions run — a new session's import executes for the new session independently.
+
 #### Scenario: Login starts an async sync
 - **WHEN** a user completes `POST /api/login` successfully
 - **THEN** the server starts a sync run with the login request's PSU context, and the login response returns immediately without waiting for the run
@@ -43,6 +45,14 @@ PSU context extraction SHALL use the same proxy-aware IP resolution as the login
 #### Scenario: Concurrent triggers coalesce
 - **WHEN** a sync run is already in flight and a new trigger fires (login, manual, or background)
 - **THEN** no parallel run starts; the in-flight run serves the new trigger
+
+#### Scenario: Initial import touches only the new bank
+- **WHEN** the wizard's initial import runs for a newly authorized session
+- **THEN** only that session's accounts are fetched; no other bank's connection receives any Enable Banking call from this run
+
+#### Scenario: Session-scoped run does not wait on a global run
+- **WHEN** an initial import is triggered while an all-sessions run is in flight
+- **THEN** the scoped run executes for the new session independently — it is neither queued behind nor coalesced into the in-flight run
 
 ### Requirement: PSU-header policy
 
@@ -148,6 +158,8 @@ The auth-callback success path SHALL set a one-shot `pendingInitialImport` signa
 
 The `GET /api/accounts` response SHALL include, per account and per bank: the last-known balance, the timestamp of the last successful sync (from `sync_log`), the current degraded state derived from the sync history, each session's consent expiry (`valid_until`) for bank-scoped health display, and a per-bank consent-broken flag (true when the session's most recent erroring run recorded a consent-dead error code, per the sync log requirement — the flag the SPA uses to distinguish consent-dead [re-authorization action] from transient error [data retry] while the three-value sync-state vocabulary stays stable), and the bank's identity keys (`aspsp_name`, `aspsp_country`) with its `psu_type` — the fields the consent-dead and expired notices' direct re-authorization action needs to reconstruct the auth-initiation selection without a second fetch (per the `account-overview` capability's consent health requirement). The state vocabulary SHALL be: `fresh` (recent success), `stale` (last success older than the background interval with no success since), `error` (last run failed), `rate_limited` (last run was rate-limited), or `never_synced` (no `sync_log` rows exist for the session — e.g. a page reload while the initial import is still in flight). State precedence: the last run's outcome (`error`/`rate_limited`) takes precedence over staleness; `never_synced` applies only when no run has been recorded at all.
 
+The response SHALL additionally include, per account: the account's latest sync outcome status (`success` | `error` | `rate_limited`, from the per-account sync outcomes requirement) and, when failed, its cause-binned error bin and fetch timestamp. The five-value bank `sync_state` vocabulary SHALL remain unchanged — the per-account fields are additive, and every previously existing field is present with unchanged name and semantics. (No per-bank "has issues" rollup flag is exposed: each surface derives its own signal from the states it governs — the dashboard reads per-account outcomes, the connections section reads consent states; a sync-domain flag on the connection surface would invite presenting balance-sync problems where their remedy does not live.)
+
 The response SHALL also include a global `sync_in_progress` flag (true while any sync run is in flight). The SPA SHALL poll `GET /api/accounts` at a modest cadence while a sync is in flight (login-triggered, manual, or initial import) and SHALL exit the syncing/updating state when the flag clears and the last-success timestamps advance. This one mechanism uniformly covers all triggers — no per-trigger completion channel exists.
 
 #### Scenario: Fresh state after successful sync
@@ -170,6 +182,14 @@ The response SHALL also include a global `sync_in_progress` flag (true while any
 - **WHEN** `GET /api/accounts` is called
 - **THEN** each bank's consent expiry (`valid_until`) is included in the response
 
+#### Scenario: Healthy accounts of an errored bank report success
+- **WHEN** one account of a bank failed its latest fetch and its siblings succeeded
+- **THEN** each sibling account's per-account status is `success` while the failed account reports `error` with its bin — enabling localized presentation
+
+#### Scenario: Additive fields only
+- **WHEN** any existing consumer reads the response
+- **THEN** every previously existing field is present and unchanged in name and semantics; the new fields are additions
+
 ### Requirement: Remove-during-sync race guard
 
 SQLite foreign-key enforcement is not enabled for the BankTeller database, so a write against a deleted row would succeed as an invisible orphan. The sync runner SHALL therefore re-check existence before its writes: before upserting a balance, the runner SHALL confirm the account row (and its session) still exists; before writing the `sync_log` row, the runner SHALL confirm the session still exists. A user-initiated connection removal during an in-flight sync run deletes the session and its accounts mid-run — the guard turns the run's later writes into no-ops instead of orphans. A guarded no-op SHALL NOT fail the run (the removal was the user's explicit act; the run's status reflects the accounts it did fetch).
@@ -178,3 +198,34 @@ SQLite foreign-key enforcement is not enabled for the BankTeller database, so a 
 - **WHEN** a connection removal completes while a sync run is still processing that session's accounts
 - **THEN** the run's subsequent balance upserts and its sync-log write for that session are skipped (the existence re-check fails) and no orphaned `balances` or `sync_log` rows are created
 
+### Requirement: Per-bank rate-limit skip
+
+When a session's sync run records a rate-limited outcome (`ASPSP_RATE_LIMIT_EXCEEDED` or HTTP 429) on a **user-triggered run** (login, manual, or the wizard's initial import), the session SHALL enter a rate-limit skip state: subsequent manual and login runs SHALL skip the session entirely (no Enable Banking calls against it) until the next background run executes, which SHALL always include the session and clear the skip state regardless of that run's outcome for it. A rate-limited outcome on a **background** run does NOT arm the skip: the background run is itself the retry horizon (its own inclusion already served as the retry), and a background 429 arming the skip would have the skip outlive the exact run class that clears it — the next manual run may attempt the session once more (a PSU'd fetch is a legitimate retry; the Sabadell evidence showed even online fetches can be 429'd, so the attempt is honest), and its own 429, if any, arms the skip. The skip state SHALL be per-session — it SHALL NOT disable or delay any refresh of other sessions, and it SHALL NOT disable the global refresh affordance. No UI element SHALL display a time until which the session is limited (Enable Banking provides no such data; the next background run is the only honest horizon).
+
+#### Scenario: One rate-limited bank does not block others
+- **WHEN** session A is in the rate-limit skip state and the user triggers a manual refresh
+- **THEN** the run executes for every live session except A; A's accounts keep their previous data and degraded presentation; the refresh affordance was enabled before, during, and after the run
+
+#### Scenario: Background run clears the skip
+- **WHEN** a background run executes while session A is in the rate-limit skip state
+- **THEN** the run includes A, and the skip state is cleared regardless of the run's outcome for A
+
+#### Scenario: A background 429 does not arm the skip
+- **WHEN** a background run records a rate-limited outcome for session A (no skip was armed before it)
+- **THEN** the skip state is NOT armed by that run; the next manual run may attempt session A once more, and only ITS 429 (if any) arms the skip
+
+#### Scenario: Skip state survives a restart
+- **WHEN** the server restarts while a session is in the rate-limit skip state
+- **THEN** the skip state persists (it is server-persisted state, not in-memory) until a background run clears it
+
+### Requirement: Per-account sync outcomes
+
+Every account balance fetch within a run SHALL record a per-account outcome row, linked to the run's `sync_log` entry and the account: status (`success` | `error` | `rate_limited`), the cause-binned error bin (per the `sync-error-presentation` capability's vocabulary) when failed, the parsed Enable Banking error code, the error message when applicable, and the fetch timestamp. A session-level consent-dead or consent-expired condition SHALL propagate to the outcome row of each of the session's in-consent accounts for that run — propagation overwrites the account's own fetch outcome for the run (the severed authorization is the state truth for every account of the session, even when an individual fetch happened to succeed past expiry; the presentation reads consent-dead from the bin, and the successful balance data upserted by such a fetch is retained and rendered as a frozen figure). Outcome rows are audit-grade history; retention/cleanup is out of scope for this change.
+
+#### Scenario: Single-account failure is recorded per account
+- **WHEN** a run fetches five accounts of a session and one fetch times out
+- **THEN** five outcome rows exist for the run: four `success`, one `error` with bin `transient`, the error message, and its timestamp
+
+#### Scenario: Consent-dead propagates to every account
+- **WHEN** a session's run records a consent-dead error code
+- **THEN** each of the session's in-consent accounts' outcome rows carries the `consent_dead` bin for that run
