@@ -1,30 +1,29 @@
 package it.kapfer.bankteller.server
 
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
+import it.kapfer.bankteller.database.BankTellerDatabase
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 /**
- * Regression tests for [MissingAccountSignalStore] — the in-memory one-shot
- * missing-accounts signal (review F6 ruling; design D14 semantics). Since
- * review F4 the per-username entry is the (bankName + accounts) pair
- * [MissingAccountSignalPayload]: the re-authorized bank's name rides the
- * signal and shares its one-shot lifetime.
+ * Regression tests for [MissingAccountSignalStore] — the durable one-shot
+ * missing-accounts signal stored on the `eb_application` row's
+ * `missing_accounts` column (server-side-session-storage, design D6; formerly
+ * an in-memory map — review F6 ruling; design D14 semantics). Since review F4
+ * the entry is the (bankName + accounts) pair [MissingAccountSignalPayload]:
+ * the re-authorized bank's name rides the signal and shares its one-shot
+ * lifetime.
  *
- * The store is a top-level singleton (its state survives across
- * `testApplication` instances — the same reason
- * `AccountLinkingRoutesTest.freshDatabase` calls [MissingAccountSignalStore.clear]),
- * so every test clears it in [BeforeTest] for isolation.
+ * Each test gets a fresh `:memory:` database (DatabaseFactory.init() on
+ * `:memory:` creates a brand-new empty schema per call), so no state leaks.
  *
  * The original regression this class pins down: a live sequence where TWO
- * re-auths occurred before any accounts fetch (two merges → two [MissingAccountSignalStore.store]
- * calls before the first [MissingAccountSignalStore.take]) — the correct behavior
- * is replace-on-store: the SECOND merge's signal is the one the next fetch must
- * carry (it reflects the latest merge's kept accounts; the first set is stale —
- * its accounts may already have matched into the second merge).
+ * re-auths occurred before any accounts fetch (two merges → two
+ * [MissingAccountSignalStore.store] calls before the first
+ * [MissingAccountSignalStore.take]) — the correct behavior is replace-on-store:
+ * the SECOND merge's signal is the one the next fetch must carry (it reflects
+ * the latest merge's kept accounts; the first set is stale — its accounts may
+ * already have matched into the second merge).
  */
 class MissingAccountSignalStoreTest {
 
@@ -37,14 +36,16 @@ class MissingAccountSignalStoreTest {
         MissingAccountSignal(id = 3, name = "Kredit", iban = "DE3", newlyMissing = true),
     )
 
-    @BeforeTest
-    fun clearStore() {
-        MissingAccountSignalStore.clear()
+    companion object {
+        init {
+            System.setProperty("database.path", ":memory:")
+        }
     }
 
-    @AfterTest
-    fun clearStoreAfter() {
-        MissingAccountSignalStore.clear()
+    /** Creates a fresh in-memory database + store over it. */
+    private fun createStore(): Pair<BankTellerDatabase, MissingAccountSignalStore> {
+        val database = DatabaseFactory.init()
+        return Pair(database, MissingAccountSignalStore(database))
     }
 
     @Test
@@ -53,10 +54,11 @@ class MissingAccountSignalStoreTest {
         // sets) before any GET /api/accounts fetch. The second merge's signal
         // is authoritative — the first is stale (its accounts may have matched
         // into the second merge via the identification-hash/IBAN cascade).
-        MissingAccountSignalStore.store("admin", bankName = "First Bank", accounts = firstAccounts)
-        MissingAccountSignalStore.store("admin", bankName = "Second Bank", accounts = secondAccounts)
+        val (_, store) = createStore()
+        store.store("admin", bankName = "First Bank", accounts = firstAccounts)
+        store.store("admin", bankName = "Second Bank", accounts = secondAccounts)
 
-        val taken = MissingAccountSignalStore.take("admin")
+        val taken = store.take("admin")
 
         assertEquals("Second Bank", taken?.bankName, "the second store must REPLACE the first — bank name included")
         assertEquals(secondAccounts, taken?.accounts, "the second store must REPLACE the first, never append/merge")
@@ -64,10 +66,11 @@ class MissingAccountSignalStoreTest {
 
     @Test
     fun `take is one-shot - a second take returns null (carry-then-clear)`() {
-        MissingAccountSignalStore.store("admin", bankName = "Test Bank", accounts = firstAccounts)
+        val (_, store) = createStore()
+        store.store("admin", bankName = "Test Bank", accounts = firstAccounts)
 
-        val firstTake = MissingAccountSignalStore.take("admin")
-        val secondTake = MissingAccountSignalStore.take("admin")
+        val firstTake = store.take("admin")
+        val secondTake = store.take("admin")
 
         assertEquals("Test Bank", firstTake?.bankName)
         assertEquals(firstAccounts, firstTake?.accounts, "the first take carries the signal")
@@ -80,56 +83,75 @@ class MissingAccountSignalStoreTest {
         // signal". A merge that keeps nothing must NOT wipe an earlier
         // merge's still-pending signal (the empty store is a no-op, not a
         // clear) — the bank name alone is never worth a signal.
-        MissingAccountSignalStore.store("admin", bankName = "Test Bank", accounts = firstAccounts)
+        val (_, store) = createStore()
+        store.store("admin", bankName = "Test Bank", accounts = firstAccounts)
 
-        MissingAccountSignalStore.store("admin", bankName = "Empty Bank", accounts = emptyList())
+        store.store("admin", bankName = "Empty Bank", accounts = emptyList())
 
-        val taken = MissingAccountSignalStore.take("admin")
+        val taken = store.take("admin")
         assertEquals("Test Bank", taken?.bankName, "an empty store must leave the pending signal untouched")
         assertEquals(firstAccounts, taken?.accounts, "an empty store must leave the pending signal untouched")
     }
 
     @Test
     fun `clear empties any pending signal`() {
-        MissingAccountSignalStore.store("admin", bankName = "Test Bank", accounts = firstAccounts)
-        MissingAccountSignalStore.store("other", bankName = "Other Bank", accounts = secondAccounts)
+        val (_, store) = createStore()
+        store.store("admin", bankName = "Test Bank", accounts = firstAccounts)
 
-        MissingAccountSignalStore.clear()
+        store.clear()
 
-        assertNull(MissingAccountSignalStore.take("admin"), "admin's signal must be gone")
-        assertNull(MissingAccountSignalStore.take("other"), "other's signal must be gone")
+        assertNull(store.take("admin"), "the pending signal must be gone")
     }
 
     @Test
-    fun `signals for different users are independent - take(A) does not consume B's signal`() {
-        // The store is keyed by username (single-user today; the key keeps the
-        // future multi-user correctness story simple per the kdoc).
-        MissingAccountSignalStore.store("user-a", bankName = "Bank A", accounts = firstAccounts)
-        MissingAccountSignalStore.store("user-b", bankName = "Bank B", accounts = secondAccounts)
+    fun `signal storage is application-scoped - one row, take is not username keyed`() {
+        // Application-scoped semantics (spec: database — missing-accounts signal
+        // on the application row; one row, one signal). The single-user system
+        // keeps the username parameter but it is not a storage key: the last
+        // store wins, and either username's take consumes the same one-shot row
+        // (exactly as the per-user map did in single-user reality).
+        val (_, store) = createStore()
+        store.store("user-a", bankName = "Bank A", accounts = firstAccounts)
+        store.store("user-b", bankName = "Bank B", accounts = secondAccounts)
 
-        val takenByA = MissingAccountSignalStore.take("user-a")
-
-        assertEquals("Bank A", takenByA?.bankName, "user A takes only their own signal")
-        assertEquals(firstAccounts, takenByA?.accounts, "user A takes only their own signal")
-        val takenByB = MissingAccountSignalStore.take("user-b")
-        assertEquals("Bank B", takenByB?.bankName, "user B's signal survives user A's take")
-        assertEquals(secondAccounts, takenByB?.accounts)
-        // And A's take consumed only A's.
-        assertNull(MissingAccountSignalStore.take("user-a"))
+        // The second store overwrote the first; a take by the FIRST username
+        // still carries the application-scoped (second) signal.
+        val taken = store.take("user-a")
+        assertEquals("Bank B", taken?.bankName, "the second store (application-scoped) overwrote the first")
+        assertEquals(secondAccounts, taken?.accounts)
+        assertNull(store.take("user-b"), "the take consumed the single row — one-shot")
     }
 
     @Test
     fun `take with no pending signal returns null`() {
-        assertNull(MissingAccountSignalStore.take("never-stored"), "no signal pending → null, never a fabricated payload")
+        val (_, store) = createStore()
+        assertNull(store.take("never-stored"), "no signal pending → null, never a fabricated payload")
+    }
+
+    @Test
+    fun `signal survives a simulated restart (new store instance over the same database)`() {
+        // Durable on the eb_application row (design D6): the session-independent
+        // callback requires the dialog to surface even after a restart.
+        val (database, store) = createStore()
+        store.store("admin", bankName = "Test Bank", accounts = firstAccounts)
+
+        // "Restart": a brand-new store over the SAME database.
+        val afterRestart = MissingAccountSignalStore(database)
+        val taken = afterRestart.take("admin")
+
+        assertEquals("Test Bank", taken?.bankName, "the signal is persisted on the row, not in memory")
+        assertEquals(firstAccounts, taken?.accounts)
+        assertNull(afterRestart.take("admin"), "still one-shot after the restart")
     }
 
     @Test
     fun `bank name may be null - the payload still carries the accounts`() {
         // A malformed callback could lack the ASPSP name — nullable by
         // contract; the SPA degrades by dropping the "at {bank}" clause.
-        MissingAccountSignalStore.store("admin", bankName = null, accounts = firstAccounts)
+        val (_, store) = createStore()
+        store.store("admin", bankName = null, accounts = firstAccounts)
 
-        val taken = MissingAccountSignalStore.take("admin")
+        val taken = store.take("admin")
 
         assertNull(taken?.bankName)
         assertEquals(firstAccounts, taken?.accounts)

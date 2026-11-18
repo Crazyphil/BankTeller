@@ -4,6 +4,7 @@ import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.util.pipeline.*
 
 /**
  * Ktor HttpClient engine — expect/actual so each KMP target provides its own engine.
@@ -13,9 +14,47 @@ expect fun createHttpClient(): HttpClient
 /**
  * Minimal HTTP API client for the BankTeller SPA.
  * All calls are relative (the browser handles the origin and httpOnly cookies automatically).
+ *
+ * @param onUnauthorized Session-expiry catch-all (server-side-session-storage):
+ *   invoked when ANY API call answers 401 — the server-side session record is
+ *   gone (expired/revoked), so the cookie is worthless. The view model routes
+ *   to the login screen and cancels its polls. Null disables the hook (tests).
  */
-open class ApiClient {
+open class ApiClient(
+    onUnauthorized: ((reason: String?, ttlMinutes: Long?) -> Unit)? = null,
+) {
+    /**
+     * Session-expiry catch-all (server-side-session-storage): invoked when
+     * ANY API call answers 401 — the server-side session record is gone
+     * (expired/revoked), so the cookie is worthless. The view model routes to
+     * the login screen and cancels its polls. Late-bindable so the view model
+     * can point it at its own handler after construction. The callback
+     * receives the 401's parsed `reason` when present (spec:
+     * session-management — session-timeout feedback): `session_expired`
+     * carries the effective TTL payload for the login panel.
+     */
+    var onUnauthorized: ((reason: String?, ttlMinutes: Long?) -> Unit)? = onUnauthorized
+
     private val client = createHttpClient()
+
+    init {
+        // Response observer: fires the hook on any 401. The pipeline's subject
+        // at the Transform phase is the response BODY container — the
+        // [io.ktor.client.HttpClientCall] hangs off the pipeline `context`
+        // (context.response); casting the subject to HttpResponse (an earlier
+        // attempt) always failed silently and the hook never fired. Status +
+        // headers only — the body is NOT read here (the caller owns it); the
+        // server mirrors the reason in the X-Session-* response headers
+        // precisely so this interceptor can latch it cheaply.
+        client.responsePipeline.intercept(HttpResponsePipeline.Transform) {
+            val response = context.response
+            if (response.status.value == 401) {
+                val reason = response.headers["X-Session-Reason"]
+                val ttlMinutes = response.headers["X-Session-Ttl-Minutes"]?.toLongOrNull()
+                this@ApiClient.onUnauthorized?.invoke(reason, ttlMinutes)
+            }
+        }
+    }
 
     open suspend fun login(username: String, password: String): LoginResult {
         try {
@@ -304,6 +343,7 @@ open class ApiClient {
                 val appState = extractJsonStringOrNull(body, "app_state")
                 val pendingAction = extractJsonStringOrNull(body, "pending_action")
                 val onboardingStage = extractJsonStringOrNull(body, "onboarding_stage")
+                val onboardingFlowState = extractJsonStringOrNull(body, "onboarding_flow_state")
                 val stageBankObj = extractJsonObject(body, "stage_bank")
                 val stageBank = stageBankObj?.let {
                     val name = extractJsonString(it, "aspsp_name")
@@ -361,6 +401,7 @@ open class ApiClient {
                     appState = appState,
                     pendingAction = pendingAction,
                     onboardingStage = onboardingStage,
+                    onboardingFlowState = onboardingFlowState,
                     stageBank = stageBank,
                     linkedBanks = linkedBanks,
                     pendingInitialImport = pendingInitialImport,
@@ -1123,6 +1164,13 @@ data class OnboardingState(
     val pendingAction: String? = null,
     /** Stored onboarding view-position stage (`linking_progress`/`auth_progress`/`bank_selection`), or null. */
     val onboardingStage: String? = null,
+    /**
+     * The owner's live email-link onboarding flow token (manual-verification
+     * 8.10): present only while a live flow record exists — the reloaded SPA
+     * uses it to complete the mid-flight registration against the durable
+     * record after a restart. Null when no flow is in flight.
+     */
+    val onboardingFlowState: String? = null,
     /** Stored in-flight bank triple for the current stage (includes the attempted psu_type), or null. */
     val stageBank: SelectedBank? = null,
     /** Deduplicated `{aspsp_name, aspsp_country}` pairs derived from the whitelist; empty when unknown. */

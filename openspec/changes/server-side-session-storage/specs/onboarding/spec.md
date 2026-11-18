@@ -199,3 +199,30 @@ The endpoint SHALL NOT blank stored credentials under any derived state (no auto
 #### Scenario: Credentials absent
 - **WHEN** `GET /api/onboarding/status` is called and `enable_banking_application_id` or `enable_banking_private_key` is missing
 - **THEN** the response reports `enableBankingConfigured: false` and no control-plane call is made
+
+### Requirement: Onboarding state endpoint
+
+The existing requirement is modified: the endpoint SHALL extend the `auth_failed` derivation and SHALL add two response fields:
+
+- `onboarding_flow_state` (string|null): the state token of the owner's live `email_link` flow record when the resumable-flow rung's guards hold (per the `onboarding-view-position` capability's server-resolved onboarding route requirement — a live record AND credentials not yet persisted); null otherwise. Exposed so a reloaded SPA can complete the registration against the record (the same trust level as the start endpoint's response and the email link's continueUrl).
+- `environment` (string|null): the registration environment parsed from the control-plane application entry (per the `eb-application-status` capability) — `SANDBOX` / `PRODUCTION`, null when the lookup failed or the entry carries no recognizable value. Re-exported so the SPA can branch the connect flow without client-side routing logic: the SPA uses it to skip the account-linking step for sandbox (linking is a production-only entitlement — sandbox access is free without it).
+- `auth_failed` (routing flag): the derivation is extended — true iff `auth_error` is non-null AND `auth_completed` is false AND (`linking_completed` is true OR `environment` is `SANDBOX`). For sandbox applications the whitelist is always empty (linking is not part of sandbox onboarding), so the `linking_completed` condition alone would never surface a sandbox authorization failure.
+
+All other derivations and behaviors of the requirement (caching, degradation, 401) are unchanged.
+
+#### Scenario: Environment reported for connect-flow branching
+- **WHEN** `GET /api/onboarding/state` is called and the control-plane lookup succeeds
+- **THEN** the response carries `environment` (`SANDBOX` or `PRODUCTION`), and the SPA's BankSelection step uses it to skip the linking step for sandbox selections
+
+#### Scenario: Sandbox authorization failure surfaces
+- **WHEN** a sandbox user (environment `SANDBOX`, empty whitelist, no `eb_sessions` row) has an `auth_error` recorded from a failed authorization callback
+- **THEN** `auth_failed` is true and the SPA routes to the AuthProgress failure display with retry — the failure is never silently dropped
+
+#### Scenario: Flow-state token reported for a resumable registration
+- **WHEN** `GET /api/onboarding/state` is called while the owner has a live `email_link` flow record and the registration has not persisted its credentials
+- **THEN** the response carries `onboarding_flow_state` with the record's state token, and the SPA completes the registration against the record
+
+#### Scenario: Flow-state token absent outside the resumable window
+- **WHEN** `GET /api/onboarding/state` is called with no live `email_link` record, or the registration has already persisted its credentials
+- **THEN** the response carries `onboarding_flow_state: null`
+

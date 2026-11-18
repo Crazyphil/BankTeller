@@ -25,6 +25,7 @@ class OnboardingRouteResolverTest {
         stageBankKnown: Boolean = true,
         stageBankLinked: Boolean = false,
         sandboxEnvironment: Boolean = false,
+        emailLinkFlowActive: Boolean = false,
     ) = OnboardingRouteInput(
         registrationInProgress = registrationInProgress,
         requiresRelogin = requiresRelogin,
@@ -37,6 +38,7 @@ class OnboardingRouteResolverTest {
         stageBankKnown = stageBankKnown,
         stageBankLinked = stageBankLinked,
         sandboxEnvironment = sandboxEnvironment,
+        emailLinkFlowActive = emailLinkFlowActive,
     )
 
     // =====================================================================
@@ -125,6 +127,54 @@ class OnboardingRouteResolverTest {
         assertEquals(
             OnboardingRoute.EMAIL_ENTRY,
             resolveOnboardingRoute(input(applicationIdPresent = false)),
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Rung 1 override — a live email-link flow record (manual-verification
+    // 8.10): mid-flow server truth outranks the email-entry rung.
+    // ---------------------------------------------------------------------
+
+    @Test
+    fun `an inactive email-link flow keeps the normal ladder`() {
+        // No live flow record → the ladder's baseline is unchanged (a fully
+        // onboarded, active user lands on the dashboard, not registration_review).
+        assertEquals(
+            OnboardingRoute.DASHBOARD,
+            resolveOnboardingRoute(input(emailLinkFlowActive = false)),
+        )
+    }
+
+    @Test
+    fun `a live email-link flow routes to registration_review despite a missing refresh token`() {
+        // The user entered the email and clicked the link; the durable record is
+        // the server-side truth that they are past email entry — routing them
+        // back to email_entry would orphan the live flow.
+        assertEquals(
+            OnboardingRoute.REGISTRATION_REVIEW,
+            resolveOnboardingRoute(
+                input(
+                    emailLinkFlowActive = true,
+                    requiresRelogin = true,
+                    applicationIdPresent = false,
+                    everOnboarded = false,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `a live email-link flow outranks the deleted-app rung`() {
+        assertEquals(
+            OnboardingRoute.REGISTRATION_REVIEW,
+            resolveOnboardingRoute(
+                input(
+                    emailLinkFlowActive = true,
+                    requiresRelogin = false,
+                    appState = EbApplicationState.DELETED,
+                    everOnboarded = false,
+                ),
+            ),
         )
     }
 

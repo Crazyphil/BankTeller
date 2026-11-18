@@ -87,6 +87,18 @@ WHERE a.session_id = ? AND a.in_consent = 1
 deleteOutcomesBySessionIds:
 DELETE FROM sync_outcomes WHERE sync_log_id IN (SELECT id FROM sync_log WHERE session_id IN ?);
 
+-- Purge-all (re-registration): every outcome row's sync_log and account rows are
+-- deleted by the purge — the outcomes go with them (purge-totality: no invisible
+-- orphan history readable as current truth).
+deleteAllOutcomes:
+DELETE FROM sync_outcomes;
+
+-- Local-copy deletion: an account's outcome rows go with the account (the same
+-- orphan rationale as the session cleanup — deleted accounts must not leave
+-- outcome history readable as current per-account truth).
+deleteOutcomesByAccountIds:
+DELETE FROM sync_outcomes WHERE account_id IN ?;
+
 -- Test-support count: outcome rows belonging to one session's runs.
 countOutcomesBySessionId:
 SELECT COUNT(*) FROM sync_outcomes WHERE sync_log_id IN (SELECT id FROM sync_log WHERE session_id = ?);

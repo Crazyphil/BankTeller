@@ -11,7 +11,10 @@ import io.ktor.server.testing.*
 import it.kapfer.bankteller.enablebanking.*
 import it.kapfer.bankteller.module
 import it.kapfer.bankteller.server.DatabaseFactory
-import it.kapfer.bankteller.server.MissingAccountSignalStore
+import it.kapfer.bankteller.server.FlowKind
+import it.kapfer.bankteller.server.FlowRecordStore
+import it.kapfer.bankteller.server.FlowStatus
+import it.kapfer.bankteller.database.seedEbApplication
 import kotlinx.serialization.json.*
 import kotlin.test.*
 import java.time.Instant
@@ -61,10 +64,9 @@ class AccountLinkingRoutesTest {
         // state surviving across testApplication instances — clear it so poll
         // tests start cold.
         clearLinkingSessionConfirmCacheForTests()
-        // The in-memory missing-accounts signal store is top-level server
-        // state too (review F6) — clear it so the one-shot carry-then-clear
-        // tests start with no pending signal.
-        MissingAccountSignalStore.clear()
+        // The missing-accounts signal now lives on the eb_application row
+        // (server-side-session-storage, design D6). A fresh temp-file database
+        // starts with no row — nothing to clear; the per-test file isolates it.
     }
 
     // -----------------------------------------------------------------------
@@ -272,7 +274,7 @@ class AccountLinkingRoutesTest {
             database = DatabaseFactory.init(),
         )
 
-    /** Seeds the shared system_config rows the routes read. */
+    /** Seeds the shared eb_application row the routes read. */
     private fun seedDb(
         applicationId: String = "test-app-id",
         refreshToken: String = "rt-1",
@@ -280,17 +282,17 @@ class AccountLinkingRoutesTest {
         privateKey: String? = null,
     ) {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
-        // Without a private key row, OnboardingService.getStatus() treats the
+        // Without a private key column, OnboardingService.getStatus() treats the
         // app as not-configured (appState unknown) → /api/aspsps takes the
         // data-plane source. Passing a non-null key makes getStatus() do the
         // REAL control-plane lookup (via the MockEngine) — for appState-based
         // source-selection tests.
-        if (privateKey != null) {
-            db.systemConfigQueries.insertOrReplace("enable_banking_private_key", privateKey)
-        }
+        db.seedEbApplication(
+            applicationId = applicationId,
+            privateKey = privateKey,
+            refreshToken = refreshToken,
+            redirectUrl = redirectUrl,
+        )
     }
 
     /** Logs in with the default admin/changeme credentials and returns a cookie jar client. */
@@ -597,7 +599,7 @@ class AccountLinkingRoutesTest {
     // =====================================================================
 
     @Test
-    fun `6_7 auth generates valid state JWT and valid_until now plus maximumConsentValidity`() = testApplication {
+    fun `6_7 auth stores a flow record and valid_until now plus maximumConsentValidity`() = testApplication {
         seedDb()
         val mcv = 7776000L
         val fake = FakeEnableBankingClient(
@@ -640,10 +642,12 @@ class AccountLinkingRoutesTest {
         val diffSeconds = java.time.Duration.between(validUntil, expected).abs().seconds
         assertTrue(diffSeconds < 10, "valid_until should be ≈ now + $mcv, got ${call.access.validUntil}")
 
-        // state is a non-empty JWT with 3 dot-separated parts.
-        val parts = call.state.split(".")
-        assertEquals(3, parts.size)
-        assertTrue(parts.all { it.isNotBlank() })
+        // state is the opaque flow-record token: unguessable, non-empty, not
+        // a signed/decodable payload (no dot-separated JWT structure).
+        val stateToken = call.state
+        assertTrue(stateToken.isNotBlank())
+        assertTrue(!stateToken.contains("."), "state token must be opaque, not a JWT: $stateToken")
+        assertTrue(stateToken.length >= 32, "state token must be a 256-bit random value")
     }
 
     // =====================================================================
@@ -651,7 +655,7 @@ class AccountLinkingRoutesTest {
     // =====================================================================
 
     @Test
-    fun `6_7_1 auth clears stored auth_error from session`() = testApplication {
+    fun `6_7_1 auth discards the owner's unconsumed auth-error outcome`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient(
             aspspsResult = AspsspListResult.Ok(
@@ -755,26 +759,63 @@ class AccountLinkingRoutesTest {
     }
 
     // =====================================================================
-    // Task 6.9 — callback with code+state, no session cookie → 302 to login
+    // Task 6.9 — callback with code+state, NO session cookie: the callback is
+    // session-independent — it completes on the flow record alone (design D4).
     // =====================================================================
 
     @Test
-    fun `6_9 callback with code and state but no session cookie redirects to login`() = testApplication {
+    fun `6_9 callback with code and state but no session cookie completes sessionless and serves SPA`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(
+                url = "https://bank.example/auth",
+                authorizationId = "auth-1",
+                psuIdHash = "hash-1",
+            ),
+            authorizeSessionResult = AuthorizeSessionResult.Ok(
+                sessionId = "eb-sess-1",
+                accounts = emptyList(),
+                aspsp = Aspssp(name = "Test Bank", country = "DE"),
+                psuType = "personal",
+                access = null,
+            ),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(),
                 enableBankingClientFactory = { fake },
             )
         }
+        // Initiate the auth flow WITH a session (the flow record's owner).
+        val sessionClient = loggedInClient()
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+
+        // The callback arrives WITHOUT any session cookie — the flow record
+        // alone correlates it: the code is exchanged, the merge is persisted,
+        // the outcome lands in the flow record, and the SPA bundle is served.
         val noCookieClient = createClient { followRedirects = false }
         val response = noCookieClient.get("/enable-banking-callback") {
             parameter("code", "the-code")
-            parameter("state", "whatever")
+            parameter("state", state)
         }
-        assertEquals(HttpStatusCode.Found, response.status)
-        assertEquals("/", response.headers[HttpHeaders.Location])
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(
+            response.contentType()?.toString()?.startsWith("text/html") == true,
+            "callback must serve the SPA bundle",
+        )
+        assertEquals(1, fake.authorizeSessionCodes.size, "code must be exchanged sessionlessly")
+
+        // The outcome surfaces at the owner's next authenticated view.
+        val stateJson = sessionClient.stateJson()
+        assertEquals(true, stateJson.bool("auth_completed"))
+        assertEquals(true, stateJson.bool("pending_initial_import"))
     }
 
     // =====================================================================
@@ -828,7 +869,7 @@ class AccountLinkingRoutesTest {
     // Task 1.3 — callback error branch (RFC 6749 error redirect)
     // =====================================================================
 
-    /** Runs POST /api/auth to obtain a valid state JWT, then the error callback. */
+    /** Runs POST /api/auth to obtain a valid flow-record state token, then the error callback. */
     private suspend fun HttpClient.runErrorCallback(error: String, state: String) {
         get("/enable-banking-callback") {
             parameter("error", error)
@@ -867,8 +908,13 @@ class AccountLinkingRoutesTest {
             parameter("error_description", "User declined")
             parameter("state", state)
         }
-        assertEquals(HttpStatusCode.Found, response.status)
-        assertEquals("/", response.headers[HttpHeaders.Location])
+        // Session-independent callback: the failure outcome is written into the
+        // flow record and the SPA bundle is served (no redirect).
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(
+            response.contentType()?.toString()?.startsWith("text/html") == true,
+            "error callback must serve the SPA bundle",
+        )
 
         val stateJson = sessionClient.stateJson()
         // Combined format: raw error + description, joined with ": ".
@@ -984,26 +1030,53 @@ class AccountLinkingRoutesTest {
     }
 
     @Test
-    fun `1_3 error callback without session redirects to login recording nothing`() = testApplication {
+    fun `1_3 error callback without session records outcome against the flow record`() = testApplication {
         seedDb()
-        val fake = FakeEnableBankingClient()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(
+                url = "https://bank.example/auth",
+                authorizationId = "auth-1",
+                psuIdHash = "hash-1",
+            ),
+        )
         application {
             module(
                 controlPlaneClient = controlPlaneClient(),
                 enableBankingClientFactory = { fake },
             )
         }
+        // A flow record exists (initiated with a session); the error callback
+        // arrives WITHOUT any session cookie and still records its outcome
+        // against the record (session-independent, design D4).
+        val sessionClient = loggedInClient()
+        sessionClient.post("/api/auth") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"aspsp_name":"Test Bank","aspsp_country":"DE","psu_type":"personal"}""")
+        }
+        val state = fake.lastStartAuth!!.state
+
         val noCookieClient = createClient { followRedirects = false }
         val response = noCookieClient.get("/enable-banking-callback") {
             parameter("error", "access_denied")
-            parameter("state", "whatever")
+            parameter("state", state)
         }
-        assertEquals(HttpStatusCode.Found, response.status)
-        assertEquals("/", response.headers[HttpHeaders.Location])
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(
+            response.contentType()?.toString()?.startsWith("text/html") == true,
+            "error callback must serve the SPA bundle",
+        )
+
+        // The owner's next authenticated view surfaces the failure outcome.
+        val stateJson = sessionClient.stateJson()
+        assertEquals("access_denied", stateJson.str("auth_error"))
+        assertEquals("cancelled", stateJson.str("auth_error_kind"))
     }
 
     @Test
-    fun `1_3 error callback with invalid state redirects to login recording nothing`() = testApplication {
+    fun `1_3 error callback with invalid state records nothing`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient()
         application {
@@ -1017,8 +1090,12 @@ class AccountLinkingRoutesTest {
             parameter("error", "access_denied")
             parameter("state", "invalid-state")
         }
-        assertEquals(HttpStatusCode.Found, response.status)
-        assertEquals("/", response.headers[HttpHeaders.Location])
+        // Unknown token → no outcome recorded; the SPA bundle is served.
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(
+            response.contentType()?.toString()?.startsWith("text/html") == true,
+            "error callback must serve the SPA bundle",
+        )
         // Nothing recorded — auth_error stays null.
         val stateJson = sessionClient.stateJson()
         assertTrue(stateJson.isNull("auth_error"))
@@ -1512,10 +1589,117 @@ class AccountLinkingRoutesTest {
     }
 
     // =====================================================================
-    // Task 6.13 — state endpoint resilience + selected_bank derivation
+    // Manual-verification 8.10 — a TERMINAL-tagged email-link record must not
+    // bounce a registered user (the eb_application row's refresh token is the
+    // discriminator; the coarse record status cannot tell a crashed completion
+    // from a mid-flow one).
     // =====================================================================
 
     @Test
+    fun `state does not bounce a registered user on a completed email-link record`() = testApplication {
+        seedDb(refreshToken = "rt-1")
+        // A record left behind by a completion that crashed between persisting
+        // the credentials and deleting the record (or by any terminal-tagged
+        // attempt): status 'completed' — NOT pending.
+        val db = DatabaseFactory.init()
+        val store = FlowRecordStore(db)
+        val record = store.insert("admin", FlowKind.EMAIL_LINK, "{}")
+        store.updateOutcome(record.token, FlowStatus.COMPLETED, "{}")
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        val stateJson = sessionClient.stateJson()
+        // Credentials are persisted → the app row is the server-side truth; the
+        // record is post-registration and must not route into the wizard.
+        assertEquals(false, stateJson.bool("requires_relogin"))
+        assertNotEquals(
+            "registration_review",
+            stateJson.str("route"),
+            "a registered user must not be bounced by a terminal-tagged record",
+        )
+        // The resumable-token hand-off is gated on the same discriminator.
+        assertNull(
+            stateJson.str("onboarding_flow_state"),
+            "no flow-state token is handed out once credentials are persisted",
+        )
+    }
+
+    @Test
+    fun `state resumes a non-persisted email-link record as registration_review with its token`() = testApplication {
+        // No refresh token yet (registration not completed) — the live record is
+        // the server-side truth that the user is mid-flow.
+        seedDb(refreshToken = "")
+        val db = DatabaseFactory.init()
+        val store = FlowRecordStore(db)
+        val record = store.insert("admin", FlowKind.EMAIL_LINK, "{}")
+        store.updateOutcome(record.token, FlowStatus.COMPLETED, "{}")
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        val stateJson = sessionClient.stateJson()
+        assertEquals(true, stateJson.bool("requires_relogin"))
+        assertEquals(
+            "registration_review",
+            stateJson.str("route"),
+            "an in-flight record outranks the email-entry rung",
+        )
+        assertEquals(
+            record.token,
+            stateJson.str("onboarding_flow_state"),
+            "the owner's own live flow key is handed back on the state read",
+        )
+    }
+
+    @Test
+    fun `state does not resume a failed email-link record`() = testApplication {
+        // Task 4.2 verify item: an auth_failed record (GIT emailLinkSignin failed —
+        // invalid/expired oobCode) is a DEAD flow: the resumable rung must not fire,
+        // the ladder falls through to email_entry, and no flow token is handed out.
+        seedDb(refreshToken = "")
+        val db = DatabaseFactory.init()
+        val store = FlowRecordStore(db)
+        val record = store.insert("admin", FlowKind.EMAIL_LINK, "{}")
+        store.updateOutcome(record.token, FlowStatus.FAILED, "{}")
+
+        val fake = FakeEnableBankingClient()
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        val stateJson = sessionClient.stateJson()
+        assertEquals(true, stateJson.bool("requires_relogin"))
+        assertEquals(
+            "email_entry",
+            stateJson.str("route"),
+            "a terminally failed record is not resumable — the user restarts at email entry",
+        )
+        assertNull(
+            stateJson.str("onboarding_flow_state"),
+            "no flow-state token is handed out for a failed record",
+        )
+    }
+
+    // =====================================================================
+    // Task 6.13 — state endpoint resilience + selected_bank derivation
+    // =====================================================================    @Test
     fun `6_13 state never returns 5xx on control-plane failure`() = testApplication {
         seedDb()
         val fake = FakeEnableBankingClient()

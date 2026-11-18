@@ -15,6 +15,8 @@ import io.ktor.server.testing.*
 import it.kapfer.bankteller.database.BankTellerDatabase
 import it.kapfer.bankteller.enablebanking.*
 import it.kapfer.bankteller.server.DatabaseFactory
+import it.kapfer.bankteller.database.seedEbApplication
+import it.kapfer.bankteller.server.FlowRecordStore
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.TestResult
 import kotlinx.serialization.json.*
@@ -111,9 +113,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus 30s cache returns cached value on second call`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         var applicationRequests = 0
         val controlClient = statusControlClient(
             db,
@@ -137,9 +137,7 @@ class OnboardingServiceTest {
     @Test
     fun `invalidateStatusCache forces re-verification on next getStatus`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         var applicationRequests = 0
         val controlClient = statusControlClient(
             db,
@@ -160,9 +158,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus reports deleted after the app was active and then disappears from the control plane`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         var appJson = """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]"""
         val controlClient = statusControlClient(db, applicationJson = { appJson })
         val service = OnboardingService(
@@ -181,16 +177,14 @@ class OnboardingServiceTest {
         assertEquals(OnboardingStatusResponse(true, EbApplicationState.DELETED, null), service.getStatus())
 
         // Deletion must NOT auto-reset the credentials.
-        assertEquals("app-001", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
-        assertEquals("fake-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
+        assertEquals("app-001", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id)
+        assertEquals("fake-pem", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key)
     }
 
     @Test
     fun `getStatus reports inactiveNeverLinked for a fresh app that was never activated`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val controlClient = statusControlClient(
             db,
             applicationJson = { """[{"kid":"app-001","active":false,"whitelisted_accounts":[]}]""" },
@@ -205,16 +199,14 @@ class OnboardingServiceTest {
         assertEquals(OnboardingStatusResponse(true, EbApplicationState.INACTIVE_NEVER_LINKED, null), result)
 
         // Credentials must still be present (not blanked).
-        assertEquals("app-001", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
-        assertEquals("fake-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
+        assertEquals("app-001", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id)
+        assertEquals("fake-pem", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key)
     }
 
     @Test
     fun `getStatus reports inactiveButLinked for an inactive app with a non-empty whitelist`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val controlClient = statusControlClient(
             db,
             applicationJson = { """[{"kid":"app-001","active":false,"whitelisted_accounts":[{"created":"2026-08-24T09:11:37.093Z","aspsp":{"name":"Test Bank","country":"DE"}}]}]""" },
@@ -231,9 +223,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus carries the parsed environment through on a successful lookup`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val controlClient = statusControlClient(
             db,
             applicationJson = { """[{"kid":"app-001","active":true,"environment":"SANDBOX","whitelisted_accounts":[]}]""" },
@@ -250,9 +240,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus reports null environment when the control-plane entry omits it`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val controlClient = statusControlClient(
             db,
             applicationJson = { """[{"kid":"app-001","active":true,"whitelisted_accounts":[]}]""" },
@@ -269,9 +257,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus reports null environment when the lookup fails`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val engine = MockEngine { request ->
             val url = request.url.toString()
             when {
@@ -302,9 +288,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus returns unknown when refresh fails and never reports deleted`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val engine = MockEngine { request ->
             val url = request.url.toString()
             when {
@@ -333,9 +317,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus returns unknown when getApplication fails and never reports deleted`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem", refreshToken = "rt-1")
         val engine = MockEngine { request ->
             val url = request.url.toString()
             when {
@@ -368,8 +350,7 @@ class OnboardingServiceTest {
     @Test
     fun `getStatus returns unknown when refresh token missing but credentials configured`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        db.seedEbApplication(applicationId = "app-001", privateKey = "fake-pem")
         val service = createService(database = db)
 
         val status = service.getStatus()
@@ -766,19 +747,19 @@ class OnboardingServiceTest {
         )
         assertTrue(result is CompleteResult.Success)
         assertEquals(true, (result as CompleteResult.Success).active)
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val appId = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id
         assertEquals("app-001", appId)
-        val redirectUrl = db.systemConfigQueries.selectValue("enable_banking_redirect_url").executeAsOneOrNull()
+        val redirectUrl = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.redirect_url
         assertEquals("https://app.example.com/cb", redirectUrl)
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val privateKey = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key
         assertNotNull(privateKey)
         assertTrue(privateKey!!.isNotBlank())
-        // Verification returned active=true — the previously_active marker is
-        // deliberately NOT written anymore (task 2.2): stale values are never read.
-        val previouslyActive = db.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
-            .executeAsOneOrNull()
-        assertNull(previouslyActive)
+        // The retired previously_active marker has no storage any more: the
+        // eb_application row carries only the typed columns (design D6).
+        assertNull(
+            db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.missing_accounts,
+            "no marker columns beyond the typed set",
+        )
     }
 
     @Test
@@ -965,7 +946,7 @@ class OnboardingServiceTest {
         )
         assertTrue(result is CompleteResult.IdTokenExpired)
         assertEquals("Your login session has expired. Please restart the onboarding flow.", (result as CompleteResult.IdTokenExpired).message)
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val privateKey = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key
         assertEquals("", privateKey)
     }
 
@@ -1076,7 +1057,7 @@ class OnboardingServiceTest {
         // Context is still CALLBACK_RECEIVED (not FAILED), so getWaitStatus returns Complete
         assertEquals(WaitStatus.Complete, service.getWaitStatus(state, "admin"))
         // Private key was cleaned up
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val privateKey = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key
         assertEquals("", privateKey)
     }
 
@@ -1165,7 +1146,7 @@ class OnboardingServiceTest {
         assertEquals(1, emailLinkSigninCalls, "emailLinkSignin should be called only once")
 
         // Application ID was persisted from the second attempt
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val appId = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id
         assertEquals("app-retry", appId)
     }
 
@@ -1479,8 +1460,7 @@ class OnboardingServiceTest {
         assertEquals(OnboardingStatusResponse(true, EbApplicationState.ACTIVE, null), service.getStatus())
 
         // Simulate maintainer clearing system_config rows (re-onboarding scenario)
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "")
+        db.seedEbApplication(applicationId = "", privateKey = "")
         service.invalidateStatusCache()
 
         // After clearing, the system appears unconfigured
@@ -1552,12 +1532,12 @@ class OnboardingServiceTest {
         )
         assertTrue(result is CompleteResult.Success)
         // All three keys must be persisted: application_id, private_key, refresh_token.
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val appId = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id
         assertEquals("app-001", appId)
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val privateKey = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key
         assertNotNull(privateKey)
         assertTrue(privateKey!!.isNotBlank())
-        val refreshToken = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val refreshToken = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token
         assertEquals("test-refresh-token", refreshToken)
     }
 
@@ -1566,29 +1546,33 @@ class OnboardingServiceTest {
     // =====================================================================
 
     @Test
-    fun `resetCredentials blanks the three credential keys and leaves previously_active untouched`() = runBlocking {
+    fun `resetCredentials blanks the eb_application credential columns`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "app-001")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "refresh-xyz")
-        // Stale marker from an earlier app — reset must not touch it; it is
-        // simply never read (task 2.2/2.4).
-        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
+        // Seed credentials plus the non-credential columns reset must leave alone.
+        db.seedEbApplication(
+            applicationId = "app-001",
+            privateKey = "fake-pem",
+            refreshToken = "refresh-xyz",
+            email = "user@example.com",
+            everOnboarded = 1L,
+        )
         val service = createService(database = db)
 
         service.resetCredentials()
 
-        val appId = db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull()
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
-        val refreshToken = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
-        val previouslyActive = db.systemConfigQueries
-            .selectValue("enable_banking_previously_active")
-            .executeAsOneOrNull()
-        assertEquals("", appId)
-        assertEquals("", privateKey)
-        assertEquals("", refreshToken)
-        // The stale marker value simply remains — no migration, no write.
-        assertEquals("true", previouslyActive)
+        val row = db.ebApplicationQueries.selectEbApplication().executeAsOne()
+        // The three credentials are blanked (NULL — clearEbApplicationCredentials).
+        assertNull(row.application_id, "application_id is blanked")
+        assertNull(row.private_key, "private_key is blanked")
+        assertNull(row.refresh_token, "refresh_token is blanked")
+        // The clear query wipes the whole registration set (email + redirect URL
+        // ride the same clear — the row is otherwise a fresh unregistered app).
+        assertNull(row.email)
+        assertNull(row.redirect_url)
+        // The ever-onboarded marker is NOT part of the credential reset.
+        assertEquals(1L, row.ever_onboarded, "reset leaves the ever-onboarded marker untouched")
+        // The next status check reports not configured.
+        assertFalse(service.getStatus().enableBankingConfigured)
     }
 
     // =====================================================================
@@ -1599,13 +1583,7 @@ class OnboardingServiceTest {
     fun `reregister with stored refresh token re-registers and persists rotated token and email`() = runBlocking {
         val db = createDatabase()
         // Preserved credentials from the old (deleted) app.
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "old-app")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "old-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-refresh")
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://old.example.com/cb")
-        // Stale history from the old app — must be blanked by the re-registration.
-        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
+        db.seedEbApplication(applicationId = "old-app", privateKey = "old-pem", refreshToken = "stored-refresh", email = "stored@example.com", redirectUrl = "https://old.example.com/cb")
 
         val refreshBodies = mutableListOf<String>()
         val engine = MockEngine { request ->
@@ -1653,32 +1631,25 @@ class OnboardingServiceTest {
         assertEquals(1, refreshBodies.size)
         assertTrue(refreshBodies.single().contains("refresh_token=stored-refresh"))
         // New application registered and persisted (old one overwritten).
-        assertEquals("new-app", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
-        assertEquals("https://app.example.com/cb", db.systemConfigQueries.selectValue("enable_banking_redirect_url").executeAsOneOrNull())
+        assertEquals("new-app", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id)
+        assertEquals("https://app.example.com/cb", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.redirect_url)
         // Rotated refresh token preserved.
-        assertEquals("rotated-refresh", db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull())
+        assertEquals("rotated-refresh", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token)
         // Email persisted.
-        assertEquals("stored@example.com", db.systemConfigQueries.selectValue("enable_banking_email").executeAsOneOrNull())
+        assertEquals("stored@example.com", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.email)
         // New private key generated (not the old one).
-        val privateKey = db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull()
+        val privateKey = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key
         assertNotNull(privateKey)
         assertTrue(privateKey!!.isNotBlank())
         assertNotEquals("old-pem", privateKey)
-        // The previously_active marker is no longer written by the flow (task
-        // 2.2) — the stale value simply remains, never read.
-        assertEquals(
-            "true",
-            db.systemConfigQueries.selectValue("enable_banking_previously_active").executeAsOneOrNull(),
-        )
+        // The retired previously_active marker has no storage any more (design
+        // D6) — nothing to assert beyond the typed row's credential columns.
     }
 
     @Test
     fun `reregister PRODUCTION uses stored email as gdprEmail default`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-refresh")
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
-        // Stale history from the old app — must be blanked by the re-registration.
-        db.systemConfigQueries.insertOrReplace("enable_banking_previously_active", "true")
+        db.seedEbApplication(refreshToken = "stored-refresh", email = "stored@example.com")
 
         val registerBodies = mutableListOf<String>()
         val engine = MockEngine { request ->
@@ -1725,21 +1696,14 @@ class OnboardingServiceTest {
         assertEquals("stored@example.com", json["gdpr_email"]?.jsonPrimitive?.content)
         assertEquals("https://app.example.com/privacy", json["privacy_url"]?.jsonPrimitive?.content)
         assertEquals("https://app.example.com/terms", json["terms_url"]?.jsonPrimitive?.content)
-        // The previously_active marker is no longer blanked by the
-        // re-registration (task 2.2) — the stale value simply remains, never read.
-        assertEquals(
-            "true",
-            db.systemConfigQueries.selectValue("enable_banking_previously_active").executeAsOneOrNull(),
-        )
+        // The retired previously_active marker has no storage any more (design
+        // D6) — nothing to assert beyond the typed row's credential columns.
     }
 
     @Test
     fun `reregister with blank stored refresh token returns retryable error and no mutations`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "old-app")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "old-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
+        db.seedEbApplication(applicationId = "old-app", privateKey = "old-pem", refreshToken = "", email = "stored@example.com")
 
         var httpCalls = 0
         val engine = MockEngine { request ->
@@ -1762,10 +1726,11 @@ class OnboardingServiceTest {
 
         assertTrue(result is CompleteResult.ReregisterError)
         assertEquals(0, httpCalls, "No HTTP call should be made without a refresh token")
-        // No system_config mutations.
-        assertEquals("old-app", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
-        assertEquals("old-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
-        assertEquals("", db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull())
+        // No eb_application row mutations.
+        val row = db.ebApplicationQueries.selectEbApplication().executeAsOne()
+        assertEquals("old-app", row.application_id)
+        assertEquals("old-pem", row.private_key)
+        assertEquals("", row.refresh_token)
     }
 
     @Test
@@ -1787,9 +1752,7 @@ class OnboardingServiceTest {
     @Test
     fun `reregister with failed token refresh returns retryable error and no mutations`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "old-app")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "old-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-refresh")
+        db.seedEbApplication(applicationId = "old-app", privateKey = "old-pem", refreshToken = "stored-refresh")
 
         var registerCalls = 0
         val engine = MockEngine { request ->
@@ -1823,9 +1786,9 @@ class OnboardingServiceTest {
         assertTrue(result is CompleteResult.ReregisterError)
         assertEquals(0, registerCalls)
         // Private key must not be regenerated/blanked on a failed refresh.
-        assertEquals("old-pem", db.systemConfigQueries.selectValue("enable_banking_private_key").executeAsOneOrNull())
+        assertEquals("old-pem", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.private_key)
         // Old application id preserved.
-        assertEquals("old-app", db.systemConfigQueries.selectValue("enable_banking_application_id").executeAsOneOrNull())
+        assertEquals("old-app", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.application_id)
     }
 
     // =====================================================================
@@ -1836,11 +1799,7 @@ class OnboardingServiceTest {
     fun `reregister purges stale eb_sessions and accounts rows`() = runBlocking {
         val db = createDatabase()
         // Preserved credentials from the old (deleted) app.
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "old-app")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "old-pem")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-refresh")
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://old.example.com/cb")
+        db.seedEbApplication(applicationId = "old-app", privateKey = "old-pem", refreshToken = "stored-refresh", email = "stored@example.com", redirectUrl = "https://old.example.com/cb")
         // Stale rows from the old app — must be purged by the re-registration.
         EbSessionStore(db).mergeSession(
             sessionId = "stale-session",
@@ -1885,6 +1844,26 @@ class OnboardingServiceTest {
             status = "success",
             error_code = null,
             error_message = null,
+        )
+        // A per-account outcome row from the old app's sync history — the purge
+        // is TOTAL (manual-verification 8.10 audit finding): re-registration must
+        // not leak orphaned sync_outcomes readable as stale per-account truth.
+        val staleSyncLogId = db.balancesQueries
+            .selectLatestSyncLogBySessionId(staleSessionRow.id)
+            .executeAsOne()
+            .id
+        db.syncOutcomesQueries.insertSyncOutcome(
+            sync_log_id = staleSyncLogId,
+            account_id = staleAccountRow.id,
+            status = "error",
+            error_bin = "consent_dead",
+            error_code = null,
+            error_message = null,
+            fetched_at = 2_000L,
+        )
+        assertNotNull(
+            db.syncOutcomesQueries.selectLatestOutcomeByAccountId(staleAccountRow.id).executeAsOneOrNull(),
+            "precondition: the stale outcome row exists before the purge",
         )
 
         val engine = MockEngine { request ->
@@ -1932,8 +1911,9 @@ class OnboardingServiceTest {
         // place that un-onboards (spec: database — ever-onboarded marker).
         assertFalse(EbSessionStore(db).isEverOnboarded())
         assertEquals(
-            null,
-            db.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
+            0L,
+            db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded,
+            "the row's ever_onboarded column is cleared by the same purge",
         )
         // The purge is TOTAL (review F2): balances and sync_log rows go with
         // their accounts/sessions — all six row classes gone.
@@ -1945,6 +1925,12 @@ class OnboardingServiceTest {
             0L,
             db.balancesQueries.countSyncLogsBySessionId(staleSessionRow.id).executeAsOne(),
             "the stale session's sync_log rows must be purged",
+        )
+        // The outcome rows go too — checked WITHOUT the sync_log join (which
+        // would hide an orphaned row behind its deleted run header).
+        assertNull(
+            db.syncOutcomesQueries.selectLatestOutcomeByAccountId(staleAccountRow.id).executeAsOneOrNull(),
+            "the stale account's sync_outcomes rows must be purged",
         )
     }
 
@@ -2086,8 +2072,7 @@ class OnboardingServiceTest {
     @Test
     fun `getRegistrationInfo returns stored email and redirect url`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://app.example.com/cb")
+        db.seedEbApplication(email = "stored@example.com", redirectUrl = "https://app.example.com/cb")
         val service = createService(database = db)
 
         val info = service.getRegistrationInfo()
@@ -2099,7 +2084,7 @@ class OnboardingServiceTest {
     @Test
     fun `getRegistrationInfo returns nulls when absent or blank`() = runBlocking {
         val db = createDatabase()
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "")
+        db.seedEbApplication(email = "")
         val service = createService(database = db)
 
         val info = service.getRegistrationInfo()
@@ -2164,6 +2149,133 @@ class OnboardingServiceTest {
             redirectUrl = "https://app.example.com/cb",
         )
         assertTrue(result is CompleteResult.Success)
-        assertEquals("user@example.com", db.systemConfigQueries.selectValue("enable_banking_email").executeAsOneOrNull())
+        assertEquals("user@example.com", db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.email)
+    }
+
+    // =====================================================================
+    // Task 4.1 — the email-link flow lives in persisted flow records
+    // (server-side-session-storage, design D5)
+    // =====================================================================
+
+    @Test
+    fun `startOnboarding persists an email_link flow record owned by the caller`() = testWithCall { call ->
+        val db = createDatabase()
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"success": true}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val service = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+        val result = service.startOnboarding("user@example.com", "admin", call)
+        val state = (result as StartResult.Ok).state
+
+        val record = FlowRecordStore(db).lookup(state)
+        assertNotNull(record, "the state token must be a live flow-record key")
+        assertEquals("email_link", record.kind)
+        assertEquals("admin", record.owner)
+        assertEquals("pending", record.status)
+        val payload = FlowRecordStore.decode(EmailLinkFlowPayload.serializer(), record.payload)
+        assertEquals("user@example.com", payload.email)
+        assertNull(payload.oobCode)
+        assertEquals(state, record.token)
+    }
+
+    @Test
+    fun `email-link flow survives a simulated restart (new service instance, same database)`() = testWithCall { call ->
+        val db = createDatabase()
+        val engine = MockEngine { request ->
+            when {
+                request.url.toString().contains("getOobConfirmationCode") -> respond(
+                    content = """{"success": true}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+                request.url.toString().contains("emailLinkSignin") -> respond(
+                    content = """{"idToken": "test-id-token"}""",
+                    status = HttpStatusCode.OK,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+                request.url.toString().contains("enablebanking.com/api/applications") -> respond(
+                    content = """{"app_id": "app-001"}""",
+                    status = HttpStatusCode.Created,
+                    headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+                )
+                else -> error("Unexpected request: ${request.url}")
+            }
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val mockClient = object : EnableBankingClient(DatabaseEnableBankingCredentialProvider(db)) {
+            override suspend fun verifyApplication() = ApplicationVerificationResult.Success(active = true)
+            override fun close() = Unit
+        }
+        // First service instance: the user clicks the emailed link (callback).
+        val before = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+        val state = (before.startOnboarding("user@example.com", "admin", call) as StartResult.Ok).state
+        before.handleCallback(state, "oob-123")
+        assertEquals(WaitStatus.Complete, before.getWaitStatus(state, "admin"))
+
+        // Server restarts: a brand-new service instance over the SAME database.
+        val after = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { mockClient },
+        )
+        assertEquals(
+            WaitStatus.Complete,
+            after.getWaitStatus(state, "admin"),
+            "the AUTH_VALIDATED flow record survives the restart — the flow is not orphaned",
+        )
+        val result = after.completeOnboarding(
+            state = state,
+            ownerUsername = "admin",
+            environment = Environment.SANDBOX,
+            redirectUrl = "https://app.example.com/cb",
+        )
+        assertTrue(result is CompleteResult.Success, "completion after the restart works: $result")
+    }
+
+    @Test
+    fun `email-link owner check survives a restart (other user is forbidden)`() = testWithCall { call ->
+        val db = createDatabase()
+        val engine = MockEngine { request ->
+            respond(
+                content = """{"success": true}""",
+                status = HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+            )
+        }
+        val controlClient = EnableBankingControlPlaneClient(client = HttpClient(engine))
+        val before = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+        val state = (before.startOnboarding("user@example.com", "admin", call) as StartResult.Ok).state
+
+        val after = OnboardingService(
+            database = db,
+            controlPlaneClient = controlClient,
+            enableBankingClientFactory = { error("not called") },
+        )
+        assertEquals(WaitStatus.Forbidden, after.getWaitStatus(state, "other"))
+        assertTrue(
+            after.completeOnboarding(
+                state = state,
+                ownerUsername = "other",
+                environment = Environment.SANDBOX,
+                redirectUrl = "https://app.example.com/cb",
+            ) is CompleteResult.Forbidden,
+        )
     }
 }

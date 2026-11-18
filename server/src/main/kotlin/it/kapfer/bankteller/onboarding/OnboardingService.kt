@@ -14,10 +14,13 @@ import it.kapfer.bankteller.enablebanking.GetOobResult
 import it.kapfer.bankteller.enablebanking.IdTokenRefreshResult
 import it.kapfer.bankteller.enablebanking.ProductionFields
 import it.kapfer.bankteller.enablebanking.RegisterApplicationResult
+import it.kapfer.bankteller.server.FlowKind
+import it.kapfer.bankteller.server.FlowRecord
+import it.kapfer.bankteller.server.FlowRecordStore
+import it.kapfer.bankteller.server.FlowStatus
 import it.kapfer.bankteller.util.TtlCache
+import kotlinx.serialization.Serializable
 import org.slf4j.LoggerFactory
-import java.security.SecureRandom
-import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 
 // ---------------------------------------------------------------------------
@@ -54,22 +57,55 @@ fun ApplicationCall.deriveCallbackUrl(): String {
 enum class OnboardingStatus { PENDING, CALLBACK_RECEIVED, AUTH_VALIDATED, AUTH_FAILED, COMPLETED, FAILED }
 
 /**
- * In-memory context representing one onboarding flow.
+ * The persisted payload of one email-link onboarding flow
+ * (server-side-session-storage, design D5).
  *
- * @property ownerUsername The [UserSession.username] that started this flow.
- *   Since [UserSession] has only a [username] field and no separate session ID,
- *   the username serves as the ownership binding for this context.
+ * Replaces the former in-memory `OnboardingContext`: the flow's mutable
+ * context fields live in the `flow_records.payload` JSON (kind
+ * [FlowKind.EMAIL_LINK]), the owner and status live in the record's columns.
+ * The `state` token is the record's key — it is not repeated here.
+ *
+ * @property email the Enable Banking login email.
+ * @property derivedRedirectUrl the callback URL derived at initiation time.
+ * @property oobCode the captured one-time code (null until the callback).
+ * @property cachedIdToken/cachedRefreshToken the tokens exchanged from the
+ *   `oobCode` at the callback (cached so completion does not re-exchange a
+ *   single-use code).
  */
-data class OnboardingContext(
+@Serializable
+data class EmailLinkFlowPayload(
     val email: String,
-    val state: String,
-    val ownerUsername: String,
     val derivedRedirectUrl: String,
-    var oobCode: String? = null,
-    var cachedIdToken: String? = null,
-    var cachedRefreshToken: String? = null,
-    var status: OnboardingStatus = OnboardingStatus.PENDING,
+    val oobCode: String? = null,
+    val cachedIdToken: String? = null,
+    val cachedRefreshToken: String? = null,
 )
+
+/**
+ * Maps the email-link flow's [OnboardingStatus] onto the `flow_records.status`
+ * column tags (the status is authoritative in the column, the payload carries
+ * only context — see [FlowStatus]). PENDING/CALLBACK_RECEIVED are both
+ * "in flight" ([FlowStatus.PENDING]); AUTH_VALIDATED and COMPLETED are
+ * `COMPLETED`; AUTH_FAILED and FAILED are `FAILED`.
+ */
+internal fun OnboardingStatus.toFlowStatus(): String = when (this) {
+    OnboardingStatus.PENDING, OnboardingStatus.CALLBACK_RECEIVED -> FlowStatus.PENDING
+    OnboardingStatus.AUTH_VALIDATED, OnboardingStatus.COMPLETED -> FlowStatus.COMPLETED
+    OnboardingStatus.AUTH_FAILED, OnboardingStatus.FAILED -> FlowStatus.FAILED
+}
+
+/**
+ * The inverse of [toFlowStatus] for the statuses the email-link flow observes
+ * through a record read. The record cannot distinguish AUTH_VALIDATED from
+ * COMPLETED or AUTH_FAILED from FAILED (both collapse to the same tag), and
+ * PENDING from the transitional CALLBACK_RECEIVED — callers only need the
+ * coarse category, which is all the wait/lifecycle logic uses.
+ */
+internal fun String.toOnboardingStatus(): OnboardingStatus = when (this) {
+    FlowStatus.COMPLETED -> OnboardingStatus.AUTH_VALIDATED
+    FlowStatus.FAILED -> OnboardingStatus.AUTH_FAILED
+    else -> OnboardingStatus.PENDING
+}
 
 data class ProductionFieldOverrides(
     val description: String? = null,
@@ -107,8 +143,8 @@ data class OnboardingStatusResponse(
 
 /**
  * Pre-fill data for the SPA's RegistrationReview step when re-registering a
- * deleted/inactive Enable Banking application. Both fields are read from
- * `system_config`; `null` means absent or blank.
+ * deleted/inactive Enable Banking application. Both fields are read from the
+ * `eb_application` row; `null` means absent or blank.
  */
 data class RegistrationInfo(
     val email: String?,
@@ -174,17 +210,25 @@ class OnboardingService(
     private val enableBankingClientFactory: () -> EnableBankingClient,
     /** Injectable clock for tests (context expiry). */
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    /**
+     * Flow-record store for the email-link flow (kind [FlowKind.EMAIL_LINK] —
+     * design D5). When null a store is created over [database] with the
+     * injected [nowMillis] clock (tests that drive TTL expiry share the clock).
+     */
+    flowRecordStore: FlowRecordStore? = null,
 ) {
     private val logger = LoggerFactory.getLogger(OnboardingService::class.java)
-    private val secureRandom = SecureRandom()
 
     /**
-     * In-memory state-token → onboarding context. Single-instance server only.
-     * Entries carry a creation timestamp and expire after [CONTEXT_TTL_MILLIS]
-     * (see [liveContext]) — abandoned flows (user closes the tab mid-wizard)
-     * must not leak memory forever.
+     * The email-link flow records (kind [FlowKind.EMAIL_LINK]) — replaces the
+     * former in-memory `contexts` map (server-side-session-storage, design
+     * D5). The state token is the record key; expiry is the store's natural
+     * `STATE_TTL_MINUTES` (default 60 — same window as the old
+     * `CONTEXT_TTL_MILLIS`), pruned lazily on access. Persisted, so a restart
+     * mid-flow no longer orphans it.
      */
-    private val contexts = mutableMapOf<String, ContextEntry>()
+    private val flowRecordStore: FlowRecordStore =
+        flowRecordStore ?: FlowRecordStore(database, clock = nowMillis)
 
     /**
      * Volatile in-memory registration-in-flight marker (design D10): set for
@@ -203,28 +247,20 @@ class OnboardingService(
     /** True while the completion endpoint's registration task is running (design D10). */
     fun isRegistrationInProgress(): Boolean = registrationInProgress.get()
 
-    /** Wrapper pairing a context with its creation time for TTL expiry. */
-    private class ContextEntry(
-        val context: OnboardingContext,
-        val createdAtMillis: Long,
-    )
-
     companion object {
         /**
-         * Lifetime of an in-memory onboarding context. The state JWT itself is
-         * valid for 15 minutes and the email-link flow realistically completes
-         * within minutes, so one hour comfortably covers every legitimate flow
-         * while ensuring abandoned contexts are eventually reclaimed.
+         * Retained for the TTL-expiry tests: the email-link flow now uses the
+         * flow-record store's `STATE_TTL_MINUTES` expiry (default 60 min), the
+         * same window this constant documented for the old in-memory map.
          */
         internal const val CONTEXT_TTL_MILLIS = 60L * 60L * 1000L
 
         /**
          * Sentinel `state` value for the complete endpoint meaning "re-register
          * the existing (deleted/inactive) application" instead of completing a
-         * fresh email-link onboarding flow. There is no in-memory
-         * [OnboardingContext] for this flow — the preserved credentials live in
-         * `system_config` and the stored refresh token is exchanged for a fresh
-         * idToken.
+         * fresh email-link onboarding flow. There is no flow record for this
+         * mode — the preserved credentials live on the `eb_application` row and
+         * the stored refresh token is exchanged for a fresh idToken.
          */
         const val REREGISTER_STATE = "reregister"
     }
@@ -245,12 +281,9 @@ class OnboardingService(
         // Check cache
         statusCache.get("status")?.let { return it }
 
-        val appId = database.systemConfigQueries
-            .selectValue("enable_banking_application_id")
-            .executeAsOneOrNull()
-        val privateKey = database.systemConfigQueries
-            .selectValue("enable_banking_private_key")
-            .executeAsOneOrNull()
+        val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+        val appId = app?.application_id
+        val privateKey = app?.private_key
 
         if (appId.isNullOrBlank() || privateKey.isNullOrBlank()) {
             val response = OnboardingStatusResponse(enableBankingConfigured = false)
@@ -262,9 +295,7 @@ class OnboardingService(
         // source that can distinguish a deleted app from an inactive one; the
         // data-plane verifyApplication() answers active:false forever for a
         // deleted app, so it is not usable here).
-        val refreshToken = database.systemConfigQueries
-            .selectValue("enable_banking_refresh_token")
-            .executeAsOneOrNull()
+        val refreshToken = app.refresh_token
         if (refreshToken.isNullOrBlank()) {
             // Unknown state — the SPA's requires_relogin handles routing.
             val response = OnboardingStatusResponse(enableBankingConfigured = true)
@@ -325,22 +356,19 @@ class OnboardingService(
     }
 
     /**
-     * Clears the persisted Enable Banking credentials (application ID + private
-     * key + refresh token) from `system_config` and invalidates the status
-     * cache.
+     * Blanks the Enable Banking credentials (application ID + private key +
+     * refresh token) on the `eb_application` row and invalidates the status
+     * cache (server-side-session-storage, design D6 — replaces the former
+     * `system_config` key blanking).
      *
      * After this call, [getStatus] reports `enableBankingConfigured = false`, which
      * routes the onboarding gate to [EmailEntry] so the user can re-register.
-     *
-     * Uses blank-string overwrites (same trade-off as [cleanupPrivateKey]) rather
-     * than a SQL DELETE, because [SystemConfig.sq] has no delete query and adding
-     * one is out of scope. Both [getStatus] and [DatabaseEnableBankingCredentialProvider]
-     * treat blank values as "not configured" via `isNullOrBlank()`.
      */
     fun resetCredentials() {
-        database.systemConfigQueries.insertOrReplace("enable_banking_application_id", "")
-        database.systemConfigQueries.insertOrReplace("enable_banking_private_key", "")
-        database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
+        database.transaction {
+            database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+            database.ebApplicationQueries.clearEbApplicationCredentials()
+        }
         invalidateStatusCache()
     }
 
@@ -354,24 +382,21 @@ class OnboardingService(
             return StartResult.InvalidEmail
         }
 
-        val state = generateState()
         val derivedUrl = call.deriveCallbackUrl()
-        val continueUrl = "$derivedUrl?state=$state"
-
-        val context = OnboardingContext(
-            email = email,
-            state = state,
-            ownerUsername = ownerUsername,
-            derivedRedirectUrl = derivedUrl,
-            oobCode = null,
-            status = OnboardingStatus.PENDING,
+        // Persist the flow record BEFORE the outbound call: the state token is
+        // its key (design D5). On a getOob failure the record is deleted again.
+        val record = flowRecordStore.insert(
+            owner = ownerUsername,
+            kind = FlowKind.EMAIL_LINK,
+            payload = encodePayload(EmailLinkFlowPayload(email = email, derivedRedirectUrl = derivedUrl)),
         )
-        contexts[state] = ContextEntry(context, nowMillis())
+        val state = record.token
+        val continueUrl = "$derivedUrl?state=$state"
 
         return when (val result = controlPlaneClient.getOobConfirmationCode(email, continueUrl)) {
             is GetOobResult.Ok -> StartResult.Ok(state = state, derivedRedirectUrl = derivedUrl)
             is GetOobResult.Error -> {
-                contexts.remove(state)
+                flowRecordStore.delete(state)
                 StartResult.Error(result.message)
             }
         }
@@ -383,32 +408,41 @@ class OnboardingService(
 
     suspend fun handleCallback(state: String?, oobCode: String?): CallbackResult {
         if (state == null) return CallbackResult.InvalidState
-        val context = liveContext(state) ?: return CallbackResult.InvalidState
+        val record = liveRecord(state) ?: return CallbackResult.InvalidState
+        val context = decodePayload(record) ?: return CallbackResult.InvalidState
 
         // Idempotent: if already validated or failed, don't re-call emailLinkSignin
         // (oobCode is single-use; a re-click of the same link should not re-validate)
-        if (context.status == OnboardingStatus.AUTH_VALIDATED) return CallbackResult.Ok
-        if (context.status == OnboardingStatus.AUTH_FAILED) return CallbackResult.Ok
+        val status = record.status.toOnboardingStatus()
+        if (status == OnboardingStatus.AUTH_VALIDATED) return CallbackResult.Ok
+        if (status == OnboardingStatus.AUTH_FAILED) return CallbackResult.Ok
 
         if (oobCode.isNullOrBlank()) return CallbackResult.MissingOobCode
 
-        context.oobCode = oobCode
-        context.status = OnboardingStatus.CALLBACK_RECEIVED // transitional
+        // Transitional CALLBACK_RECEIVED collapses onto FlowStatus.PENDING (the
+        // record is still in flight) — write the captured oobCode with it.
+        updateRecord(state, OnboardingStatus.CALLBACK_RECEIVED, context.copy(oobCode = oobCode))
 
         // NEW: immediately exchange oobCode for Firebase idToken (validates the oobCode)
         return when (val result = controlPlaneClient.emailLinkSignin(context.email, oobCode)) {
             is EmailLinkSigninResult.Ok -> {
-                context.cachedIdToken = result.idToken
-                context.cachedRefreshToken = result.refreshToken
-                context.status = OnboardingStatus.AUTH_VALIDATED
+                updateRecord(
+                    state,
+                    OnboardingStatus.AUTH_VALIDATED,
+                    context.copy(
+                        oobCode = oobCode,
+                        cachedIdToken = result.idToken,
+                        cachedRefreshToken = result.refreshToken,
+                    ),
+                )
                 CallbackResult.Ok
             }
             is EmailLinkSigninResult.InvalidOobCode -> {
-                context.status = OnboardingStatus.AUTH_FAILED
+                updateRecord(state, OnboardingStatus.AUTH_FAILED, context.copy(oobCode = oobCode))
                 CallbackResult.Ok // route ignores result; AuthFailed surfaces via wait-poll
             }
             is EmailLinkSigninResult.Error -> {
-                context.status = OnboardingStatus.AUTH_FAILED
+                updateRecord(state, OnboardingStatus.AUTH_FAILED, context.copy(oobCode = oobCode))
                 CallbackResult.Ok
             }
         }
@@ -419,13 +453,14 @@ class OnboardingService(
     // -----------------------------------------------------------------------
 
     /**
-     * Reads the pre-fill data for the SPA's RegistrationReview step from
-     * `system_config`. Returns `null` for a field that is absent or blank.
+     * Reads the pre-fill data for the SPA's RegistrationReview step from the
+     * `eb_application` row. Returns `null` for a field that is absent or blank.
      */
     fun getRegistrationInfo(): RegistrationInfo {
+        val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
         return RegistrationInfo(
-            email = systemConfigOrNull("enable_banking_email"),
-            redirectUrl = systemConfigOrNull("enable_banking_redirect_url"),
+            email = app?.email?.takeIf { it.isNotBlank() },
+            redirectUrl = app?.redirect_url?.takeIf { it.isNotBlank() },
         )
     }
 
@@ -461,23 +496,25 @@ class OnboardingService(
         redirectUrl: String,
         productionOverrides: ProductionFieldOverrides?,
     ): CompleteResult {
-        // --- Re-registration mode: no in-memory context exists ---
+        // --- Re-registration mode: no flow record exists ---
         // The login gate routes an inactive/deleted app directly to
         // RegistrationReview, so complete is called with the sentinel state and
-        // no [OnboardingContext]. Credentials (email, redirect URL, refresh
-        // token) are preserved in system_config; the stored refresh token is
+        // no email-link record. Credentials (email, redirect URL, refresh token)
+        // are preserved on the eb_application row; the stored refresh token is
         // exchanged for a fresh idToken.
         if (state == REREGISTER_STATE) {
             return completeReregistration(environment, redirectUrl, productionOverrides)
         }
 
-        val context = liveContext(state) ?: return CompleteResult.StateNotFound
+        val record = liveRecord(state) ?: return CompleteResult.StateNotFound
 
-        if (context.ownerUsername != ownerUsername) return CompleteResult.Forbidden
+        if (record.owner != ownerUsername) return CompleteResult.Forbidden
 
-        if (context.status != OnboardingStatus.AUTH_VALIDATED || context.oobCode == null) {
+        if (record.status.toOnboardingStatus() != OnboardingStatus.AUTH_VALIDATED) {
             return CompleteResult.NotReady
         }
+        var context = decodePayload(record) ?: return CompleteResult.StateNotFound
+        if (context.oobCode == null) return CompleteResult.NotReady
 
         // --- Step 4: Email-link sign-in (or reuse cached idToken) ---
         val idToken: String
@@ -490,11 +527,11 @@ class OnboardingService(
                 is EmailLinkSigninResult.Ok -> {
                     idToken = result.idToken
                     refreshToken = result.refreshToken
-                    context.cachedIdToken = idToken
-                    context.cachedRefreshToken = refreshToken
+                    context = context.copy(cachedIdToken = idToken, cachedRefreshToken = refreshToken)
+                    updateRecord(state, OnboardingStatus.AUTH_VALIDATED, context)
                 }
                 is EmailLinkSigninResult.InvalidOobCode -> {
-                    context.status = OnboardingStatus.FAILED
+                    updateRecord(state, OnboardingStatus.FAILED, context)
                     return CompleteResult.InvalidOobCode("Login link expired or invalid. Please restart the onboarding flow.")
                 }
                 is EmailLinkSigninResult.Error -> {
@@ -517,8 +554,7 @@ class OnboardingService(
             redirectUrl = redirectUrl,
             productionFields = productionFields,
             onInvalidToken = {
-                context.cachedIdToken = null
-                context.status = OnboardingStatus.FAILED
+                updateRecord(state, OnboardingStatus.FAILED, context.copy(cachedIdToken = null))
             },
         )
         val applicationId = when (registration) {
@@ -537,15 +573,19 @@ class OnboardingService(
         invalidateStatusCacheAndWhitelistCache()
 
         // --- Step 11: Verify freshly-persisted credentials ---
-        val freshActive = verifyFreshCredentials { context.status = OnboardingStatus.COMPLETED }
-        contexts.remove(state)
+        val freshActive = verifyFreshCredentials {
+            updateRecord(state, OnboardingStatus.COMPLETED, context)
+        }
+        // The flow is finished: discard the record (a completed email-link flow
+        // has no further use — mirrors the former contexts.remove(state)).
+        flowRecordStore.delete(state)
         return CompleteResult.Success(active = freshActive)
     }
 
     /**
-     * Re-registration mode: reuses the preserved EB credentials from
-     * `system_config` to register a brand-new application (the old app is gone
-     * or inactive). No email re-entry, no in-memory context.
+     * Re-registration mode: reuses the preserved EB credentials from the
+     * `eb_application` row to register a brand-new application (the old app is
+     * gone or inactive). No email re-entry, no flow record.
      */
     private suspend fun completeReregistration(
         environment: Environment,
@@ -553,7 +593,7 @@ class OnboardingService(
         productionOverrides: ProductionFieldOverrides?,
     ): CompleteResult {
         // Refresh token is the only credential we cannot reconstruct — require it.
-        val storedRefreshToken = systemConfigOrNull("enable_banking_refresh_token")
+        val storedRefreshToken = appRow().refresh_token?.takeIf { it.isNotBlank() }
         if (storedRefreshToken == null) {
             return CompleteResult.ReregisterError(
                 "Missing Enable Banking refresh token. Please sign in with Enable Banking again.",
@@ -575,7 +615,7 @@ class OnboardingService(
         val idToken = refreshResult.idToken
         val rotatedRefreshToken = refreshResult.refreshToken
 
-        val storedEmail = systemConfigOrNull("enable_banking_email")
+        val storedEmail = appRow().email
         val productionFields = buildProductionFields(environment, redirectUrl, productionOverrides, storedEmail)
 
         // Overwrite the old private key — the old application is gone.
@@ -699,9 +739,11 @@ class OnboardingService(
     ) {
         // ONE transaction (design D8): purge all stale application-scoped rows
         // (deleteAllAccounts before deleteAllSessions keeps the FK contract
-        // honest) AND overwrite the system_config credentials. The purge runs at
-        // persist time — after registration success, before verifyFreshCredentials
-        // (a best-effort activation check whose failure must not skip the purge).
+        // honest) AND overwrite the `eb_application` row's credentials
+        // (server-side-session-storage, design D6 — replacing the former
+        // `system_config` keys). The purge runs at persist time — after
+        // registration success, before verifyFreshCredentials (a best-effort
+        // activation check whose failure must not skip the purge).
         //
         // The purge is TOTAL (spec: database — consent expiry and logo columns,
         // purge-totality clause): balances and sync_log rows go with their
@@ -710,20 +752,32 @@ class OnboardingService(
         // merge-path only; a re-registration deletes everything by design.)
         //
         // Re-registration is the ONE place that un-onboards: clearing the
-        // ever-onboarded marker restores wizard routing (spec: database —
-        // ever-onboarded marker, cleared only by the explicit re-registration
-        // purge). It rides the same transaction as the row purge.
+        // ever-onboarded marker (the row's `ever_onboarded` column) restores
+        // wizard routing (spec: database — ever-onboarded marker, cleared only
+        // by the explicit re-registration purge). It rides the same transaction
+        // as the row purge — as does clearing the one-shot missing-accounts
+        // signal (review finding): a signal pending at re-registration time
+        // enumerates account rows the purge just deleted; surfacing it would
+        // render a dialog whose "Delete newly missing data" action is a no-op.
         database.transaction {
             database.ebSessionsQueries.deleteAllAccounts()
             database.ebSessionsQueries.deleteAllSessions()
             database.balancesQueries.deleteAllBalances()
             database.balancesQueries.deleteAllSyncLogs()
-            database.systemConfigQueries.deleteValue(EbSessionStore.EVER_ONBOARDED_KEY)
-            database.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
-            database.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
-            database.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
+            // Purge-totality (manual-verification 8.10 audit finding): the
+            // outcome rows keyed to the purged sync_log/account rows go with
+            // them — without this, every re-registration leaked orphaned
+            // sync_outcomes (invisible, but readable as stale per-account
+            // history).
+            database.syncOutcomesQueries.deleteAllOutcomes()
+            database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+            database.ebApplicationQueries.updateEbApplicationEverOnboarded(0L)
+            database.ebApplicationQueries.updateEbApplicationMissingAccounts(null)
+            database.ebApplicationQueries.updateEbApplicationId(applicationId)
+            database.ebApplicationQueries.updateEbApplicationRedirectUrl(redirectUrl)
+            database.ebApplicationQueries.updateEbApplicationRefreshToken(refreshToken)
             if (email != null) {
-                database.systemConfigQueries.insertOrReplace("enable_banking_email", email)
+                database.ebApplicationQueries.updateEbApplicationEmail(email)
             }
         }
     }
@@ -759,9 +813,19 @@ class OnboardingService(
         }
     }
 
-    /** Reads a `system_config` value, returning null when absent or blank. */
-    private fun systemConfigOrNull(key: String): String? =
-        database.systemConfigQueries.selectValue(key).executeAsOneOrNull()?.takeIf { it.isNotBlank() }
+    /** Reads the single `eb_application` row (all columns) — null when the row does not exist. */
+    private fun appRow(): it.kapfer.bankteller.database.Eb_application =
+        database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+            ?: it.kapfer.bankteller.database.Eb_application(
+                id = 1,
+                application_id = null,
+                private_key = null,
+                refresh_token = null,
+                email = null,
+                redirect_url = null,
+                ever_onboarded = null,
+                missing_accounts = null,
+            )
 
     // -----------------------------------------------------------------------
     // Wait-status lookup (called from routes)
@@ -773,15 +837,15 @@ class OnboardingService(
      *   another user, otherwise the current flow status.
      */
     fun getWaitStatus(state: String, username: String): WaitStatus? {
-        val context = liveContext(state) ?: return null
-        if (context.ownerUsername != username) return WaitStatus.Forbidden
-        return when (context.status) {
+        val record = liveRecord(state) ?: return null
+        if (record.owner != username) return WaitStatus.Forbidden
+        return when (record.status.toOnboardingStatus()) {
             OnboardingStatus.PENDING -> WaitStatus.Pending
-            OnboardingStatus.CALLBACK_RECEIVED -> WaitStatus.Pending // transitional while emailLinkSignin runs
             OnboardingStatus.AUTH_VALIDATED -> WaitStatus.Complete
             OnboardingStatus.AUTH_FAILED -> WaitStatus.AuthFailed
-            OnboardingStatus.COMPLETED -> WaitStatus.Complete
-            OnboardingStatus.FAILED -> WaitStatus.AuthFailed // FAILED means idToken expired — surface as auth failure so SPA routes to EmailEntry
+            // Coarse mapping (see toOnboardingStatus): AUTH_VALIDATED ≡
+            // COMPLETED, AUTH_FAILED ≡ FAILED — same wait semantics as before.
+            else -> WaitStatus.Pending
         }
     }
 
@@ -790,43 +854,48 @@ class OnboardingService(
     // -----------------------------------------------------------------------
 
     /**
-     * Returns the live (non-expired) [OnboardingContext] for [state], or null
-     * if unknown or past [CONTEXT_TTL_MILLIS]. Expired entries are pruned
-     * lazily on access — no background thread — so abandoned flows (user
-     * closes the tab mid-wizard) do not accumulate forever.
+     * Returns the live (non-expired) email-link flow record for [state], or
+     * null if unknown or past the store's TTL (`STATE_TTL_MINUTES`, default
+     * 60 — the same window the old in-memory map used). The store prunes
+     * expired rows lazily on access.
      */
-    private fun liveContext(state: String): OnboardingContext? {
-        val entry = contexts[state] ?: return null
-        if (nowMillis() - entry.createdAtMillis > CONTEXT_TTL_MILLIS) {
-            contexts.remove(state)
-            return null
-        }
-        return entry.context
+    private fun liveRecord(state: String): FlowRecord? =
+        flowRecordStore.lookup(state)?.takeIf { it.kind == FlowKind.EMAIL_LINK }
+
+    /** Encodes an email-link payload for the flow record's payload column. */
+    private fun encodePayload(payload: EmailLinkFlowPayload): String =
+        FlowRecordStore.encode(EmailLinkFlowPayload.serializer(), payload)
+
+    /** Decodes a record's payload, tolerating a malformed/foreign payload → null. */
+    private fun decodePayload(record: FlowRecord): EmailLinkFlowPayload? =
+        runCatching { FlowRecordStore.decode(EmailLinkFlowPayload.serializer(), record.payload) }.getOrNull()
+
+    /**
+     * Writes the record's status tag and payload in one statement (an outcome
+     * must never be half-applied). Missing (expired/pruned) record → no-op —
+     * the next read reports the flow as unknown exactly as before.
+     */
+    private fun updateRecord(state: String, status: OnboardingStatus, payload: EmailLinkFlowPayload) {
+        flowRecordStore.updateOutcome(
+            token = state,
+            status = status.toFlowStatus(),
+            payload = encodePayload(payload),
+        )
     }
 
     /**
-     * Generates a cryptographically random state token: 32 bytes → base64url
-     * without padding.
-     */
-    private fun generateState(): String {
-        val bytes = ByteArray(32)
-        secureRandom.nextBytes(bytes)
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-    }
-
-    /**
-     * Overwrites the persisted private key with an empty string on registration
-     * failure.
+     * Clears the persisted private key on the `eb_application` row on
+     * registration failure (server-side-session-storage, design D6).
      *
-     * Trade-off: the empty row remains in [system_config] but since [getStatus]
-     * checks for both [enable_banking_application_id] and
-     * [enable_banking_private_key], a missing-or-blank private key means
-     * [enableBankingConfigured] will be `false` — effectively treating the
-     * orphan as dead weight. A true deletion would require adding a SQLDelight
-     * delete query to [SystemConfig.sq], which is out of scope for this change.
+     * [getStatus] checks both the row's `application_id` and `private_key`, so a
+     * NULL private key means [enableBankingConfigured] is `false` — effectively
+     * treating the orphaned application id as dead weight.
      */
     private fun cleanupPrivateKey() {
-        database.systemConfigQueries.insertOrReplace("enable_banking_private_key", "")
+        database.transaction {
+            database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+            database.ebApplicationQueries.updateEbApplicationPrivateKey(null)
+        }
     }
 
     /**

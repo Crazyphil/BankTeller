@@ -2,13 +2,33 @@
 
 ## MODIFIED Requirements
 
+### Requirement: Username and password authentication
+
+The system SHALL authenticate users against credentials defined in the `.env` file (`AUTH_USERNAME` and `AUTH_PASSWORD`). On first startup, the system SHALL hash the password with bcrypt and store the hash in the database. On subsequent starts, the system SHALL compare the `.env` password against the stored bcrypt hash.
+
+#### Scenario: Successful login
+- **WHEN** a user submits the correct username and password on the login screen
+- **THEN** the system issues an httpOnly, SameSite=Lax cookie containing only the opaque session ID (per this change's session-management requirement — the signed session payload is retired) and redirects to the dashboard
+
+#### Scenario: Failed login
+- **WHEN** a user submits an incorrect username or password
+- **THEN** the system returns a login error without revealing whether the username or password was incorrect
+
+#### Scenario: First startup stores password hash
+- **WHEN** the server starts for the first time and no password hash exists in the database
+- **THEN** the system hashes `AUTH_PASSWORD` with bcrypt and stores the result in the `system_config` table
+
+#### Scenario: Subsequent startup validates password
+- **WHEN** the server starts and a password hash already exists in the database
+- **THEN** the system compares `AUTH_PASSWORD` from `.env` against the stored bcrypt hash. If they don't match, the system SHALL log a warning and use the stored hash as the source of truth
+
 ### Requirement: Session management via httpOnly cookies
 
-The system SHALL issue, upon successful login, an httpOnly `bankteller-session` cookie with `SameSite=Strict` containing ONLY an opaque session ID; the session payload (identity and session-scoped flow state) SHALL live in a server-side session record (see the `session-management` capability). The `Secure` flag SHALL be set per `COOKIE_SECURE`. The session record SHALL contain identity (`username`) plus the onboarding view-position fields (see `onboarding-view-position`) — all stored server-side. The session record SHALL NOT carry onboarding progress — progress is derived server-side from the Enable Banking API and the `eb_sessions`/`accounts` tables. The cookie SHALL NOT be signed with a payload MAC — the ID is an unguessable random token whose validity is decided by the session store alone. **No legacy-cookie import and no legacy decode:** the pre-change signed-payload cookie format is not recognized, not decoded, and not imported; a legacy cookie is treated as no session and is simply overwritten at the next login (no release carried it). **Auth-callback failure diagnostics move to the flow record:** the auth callback's failure outcomes (`authError`, `authErrorKind`, `authorizationId` of the failed attempt) are stored in the flow record (see the `onboarding` capability's session-independent auth-callback requirement), not in the session; they surface to the owner's next authenticated view, consume-once, with the one-shot and attempt-scoped semantics preserved (a newer flow's outcome supersedes an unconsumed older one).
+The system SHALL issue, upon successful login, an httpOnly `bankteller-session` cookie with `SameSite=Lax` containing ONLY an opaque session ID; the session payload (identity and session-scoped flow state) SHALL live in a server-side session record (see the `session-management` capability). The `Secure` flag SHALL be set per `COOKIE_SECURE`. **SameSite=Lax (manual-verification amendment):** Strict was the original setting, but Firefox drops the Strict cookie both on the bank → callback cross-site top-level GET and on the same-origin follow-up navigation after a cross-site redirect chain — the session-timeout classification (see the `session-management` capability's session-timeout feedback requirement) can never see the expired ID on those document routes, so the expiry panel never latches in the bank-return flow. Lax attaches the cookie on top-level GET navigations (the bank's redirect back to the callback) while still blocking cross-site POSTs (the CSRF property that matters); the session-independent callback design (see the `onboarding` capability) means the cookie policy no longer gates the callback itself. The session record SHALL contain identity (`username`) plus the onboarding view-position fields (see `onboarding-view-position`) — all stored server-side. The session record SHALL NOT carry onboarding progress — progress is derived server-side from the Enable Banking API and the `eb_sessions`/`accounts` tables. The cookie SHALL NOT be signed with a payload MAC — the ID is an unguessable random token whose validity is decided by the session store alone. **No legacy-cookie import and no legacy decode:** the pre-change signed-payload cookie format is not recognized, not decoded, and not imported; a legacy cookie is treated as no session and is simply overwritten at the next login (no release carried it). **Auth-callback failure diagnostics move to the flow record:** the auth callback's failure outcomes (`authError`, `authErrorKind`, `authorizationId` of the failed attempt) are stored in the flow record (see the `onboarding` capability's session-independent auth-callback requirement), not in the session; they surface to the owner's next authenticated view, consume-once, with the one-shot and attempt-scoped semantics preserved (a newer flow's outcome supersedes an unconsumed older one).
 
 #### Scenario: Cookie issued on login
 - **WHEN** a user logs in with valid credentials
-- **THEN** the system issues an httpOnly, SameSite=Strict `bankteller-session` cookie containing only the opaque session ID, backed by a server-side session record holding the username, and redirects to the dashboard
+- **THEN** the system issues an httpOnly, SameSite=Lax `bankteller-session` cookie containing only the opaque session ID, backed by a server-side session record holding the username, and redirects to the dashboard
 
 #### Scenario: Session validated on protected routes
 - **WHEN** a request arrives at a protected route with a session cookie whose ID resolves to a live server-side session record
@@ -16,7 +36,7 @@ The system SHALL issue, upon successful login, an httpOnly `bankteller-session` 
 
 #### Scenario: Invalid session redirects to login
 - **WHEN** a request arrives at a protected route without a valid session cookie (no cookie, unknown ID, expired or revoked record)
-- **THEN** the request is unauthenticated — a page route redirects to login, an API route answers 401
+- **THEN** the request is unauthenticated — a page route redirects to login, an API route answers 401 (the 401 body MAY carry the expiry reason per the `session-management` capability's session-timeout feedback requirement)
 
 #### Scenario: Old-format cookie decodes without logout
 - **WHEN** a cookie issued before this change (a signed payload containing `psuIdHash`, `aspspName`, `ebSessionId`, `accountsJson`, …) is presented

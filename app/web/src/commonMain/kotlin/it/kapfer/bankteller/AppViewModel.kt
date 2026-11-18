@@ -130,9 +130,19 @@ data class ReAuthBank(
  * - `viewModelScope` provides structured concurrency tied to the ViewModel lifecycle.
  */
 class AppViewModel(
-    private val apiClient: ApiClient = ApiClient(),
+    private val apiClient: ApiClient = ApiClient(onUnauthorized = null),
 ) : ViewModel() {
 
+    init {
+        // Session-expiry catch-all (server-side-session-storage): ANY API call
+        // answering 401 routes to the login screen immediately — the
+        // server-side session record is gone (expired/revoked), the cookie is
+        // worthless, and leaving the user on a stale screen with inline
+        // errors is a dead end (manual-verification 8.2 finding). Wired via a
+        // late-binding setter (the view model owns the routing state; the
+        // client may be injected by tests without the hook).
+        apiClient.onUnauthorized = ::handleSessionExpired
+    }
     // ---------------------------------------------------------------
     // State
     // ---------------------------------------------------------------
@@ -611,12 +621,88 @@ class AppViewModel(
     // ---------------------------------------------------------------
 
     /**
+     * Session-expiry catch-all (server-side-session-storage): any API call
+     * answering 401 means the server-side session record is gone (expired,
+     * revoked, or restarted into a fresh database) — the cookie is worthless.
+     * Route to the login screen immediately instead of leaving the user on a
+     * stale screen with inline errors. Cancels every active poll first (a
+     * polling loop would otherwise keep firing 401s and, worse, keep the
+     * on-activity sliding renewal alive for a session that no longer exists).
+     *
+     * Session-timeout feedback (spec: session-management): when the 401
+     * carried `reason: session_expired`, the reason is LATCHED here —
+     * concurrent polling 401s may be processed before/after the
+     * reason-carrying one, and the login gate must render the panel based on
+     * ANY observed reason, regardless of which response triggered the
+     * routing. The latch is one-shot (consumed by the login screen's panel;
+     * cleared on dismissal, on a successful re-login, and on logout).
+     */
+    fun handleSessionExpired(reason: String? = null, ttlMinutes: Long? = null) {
+        waitPollJob?.cancel()
+        waitPollJob = null
+        registrationProgressPollJob?.cancel()
+        registrationProgressPollJob = null
+        stopLinkingSessionPoll()
+        stopAccountsPoll()
+        stopCooldownTimer()
+        importInProgress = false
+        importFailed = false
+        if (reason == "session_expired") {
+            sessionExpiredTtlMinutes = ttlMinutes
+            // Persist the latch (spec: session-management — session-timeout
+            // feedback, cross-reload semantics): the login screen may render
+            // in a DIFFERENT page instance than the one that observed the
+            // 401 (the auth callback's full-page redirect; a background tab
+            // that consumed the server-side one-shot reason). localStorage
+            // carries the reason across reloads and tabs.
+            if (ttlMinutes != null) {
+                localStorageSet(SESSION_EXPIRED_MARKER_KEY, ttlMinutes.toString())
+            }
+        }
+        isAuthenticated = false
+        username = ""
+        currentScreen = Screen.Login
+        loginError = null
+        isRateLimited = false
+        resetOnboardingState()
+    }
+
+    /**
+     * The latched session-expiry reason's TTL (spec: session-management —
+     * session-timeout feedback): non-null while the login screen should render
+     * the one-shot informational panel naming the effective inactivity
+     * window. Persisted to localStorage (cross-reload/cross-tab — the latch
+     * may be set by a page instance that dies before the login screen
+     * renders). Cleared by [dismissSessionExpiredPanel], on a successful
+     * re-login, and on logout.
+     */
+    var sessionExpiredTtlMinutes by mutableStateOf<Long?>(null)
+        private set
+
+    /** One-shot dismissal of the session-expiry panel (spec: session-management). */
+    fun dismissSessionExpiredPanel() {
+        sessionExpiredTtlMinutes = null
+        localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
+    }
+
+    /**
      * Check whether the current session is still valid (called once at startup).
      * Navigates to [Screen.Dashboard] if authenticated, [Screen.Login] otherwise.
      * On authenticated sessions the onboarding gate is checked as well (tasks 7.2, 7.8).
      */
     fun checkAuth() {
         viewModelScope.launch {
+            // Restore a persisted expiry latch (spec: session-management —
+            // session-timeout feedback, cross-reload semantics): the reason may
+            // have been latched by ANOTHER page instance (a background tab's
+            // poll consumed the server-side one-shot reason; its in-memory
+            // latch died with its page) or before a full-page reload (the
+            // auth callback's redirect to "/"). localStorage is shared across
+            // tabs and survives reloads — restoring it here lets the fresh
+            // boot's login screen render the panel.
+            if (sessionExpiredTtlMinutes == null) {
+                sessionExpiredTtlMinutes = localStorageGet(SESSION_EXPIRED_MARKER_KEY)?.toLongOrNull()
+            }
             val state = apiClient.checkAuth()
             when (state) {
                 is AuthState.Authenticated -> {
@@ -655,6 +741,11 @@ class AppViewModel(
                     isAuthenticated = true
                     username = inputUsername
                     loginError = null
+                    // One-shot panel semantics (spec: session-management —
+                    // session-timeout feedback): a successful re-login
+                    // consumes the latched expiry reason (memory + persisted).
+                    sessionExpiredTtlMinutes = null
+                    localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
                     // Suspend call: runs the onboarding gate (further network
                     // requests) and routes to the destination screen. isLoading
                     // stays true through this so the login button remains
@@ -688,6 +779,10 @@ class AppViewModel(
         stopCooldownTimer()
         importInProgress = false
         importFailed = false
+        // Deliberate logout shows no panel (spec: session-management —
+        // session-timeout feedback: logout is expected, timeout is not).
+        sessionExpiredTtlMinutes = null
+        localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
         viewModelScope.launch {
             apiClient.logout()
             isAuthenticated = false
@@ -1174,6 +1269,14 @@ class AppViewModel(
                     // the registration-info flow). No reset call — credentials kept.
                     currentScreen = Screen.Onboarding
                     onboardingStep = OnboardingStep.RegistrationReview
+                    // Mid-flow resume (manual-verification 8.10): when the
+                    // server routed here because a live email-link flow
+                    // record exists (a restart/reload mid-onboarding), adopt
+                    // the server-provided flow token — the completion resolves
+                    // against the durable record (captured oobCode, cached
+                    // tokens). Without it the complete call would fall to the
+                    // "reregister" sentinel and skip the real flow.
+                    state.onboardingFlowState?.let { onboardingStateToken = it }
                     loadRegistrationInfo()
                 }
                 "activation_guide" -> {
@@ -2196,6 +2299,18 @@ class AppViewModel(
         if (markBusy) isLoading = true
         aspspsFetchJob = viewModelScope.launch {
             val result = apiClient.getAspsps()
+            // Session-expiry catch-all: a 401 from the bank list means the
+            // session record is gone — route to login instead of rendering
+            // an inline error the user cannot recover from without a reload.
+            if (result is AspspsResult.Error && result.statusCode == 401) {
+                handleSessionExpired()
+                aspspsFetchJob = null
+                if (aspspsFetchBusyRequested) {
+                    aspspsFetchBusyRequested = false
+                    isLoading = false
+                }
+                return@launch
+            }
             aspspsState = when (result) {
                 is AspspsResult.Ok -> AspspsState.Loaded(result.aspsps)
                 is AspspsResult.Error -> AspspsState.Error(result.message)
@@ -2638,6 +2753,17 @@ class AppViewModel(
          * of the refresh control (spec: refresh affordance).
          */
         const val MANUAL_REFRESH_COOLDOWN_SECONDS = 60L
+
+        /**
+         * localStorage key persisting the latched session-expiry TTL
+         * across reloads/tabs (spec: session-management — session-timeout
+         * feedback): the latch may be set by a page instance that dies
+         * before the login screen renders (the auth callback's full-page
+         * redirect; a background tab consuming the server-side one-shot
+         * reason). Cleared with the one-shot semantics (dismissal /
+         * re-login / logout).
+         */
+        const val SESSION_EXPIRED_MARKER_KEY = "bankteller_session_expired_ttl"
     }
 }
 

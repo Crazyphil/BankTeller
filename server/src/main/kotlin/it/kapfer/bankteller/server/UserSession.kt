@@ -3,103 +3,66 @@ package it.kapfer.bankteller.server
 import kotlinx.serialization.Serializable
 
 /**
- * BankTeller session cookie payload.
+ * BankTeller session payload — stored SERVER-SIDE in the `sessions` table
+ * (server-side-session-storage, design D1).
  *
- * The cookie now holds only the username plus a one-shot authError. All
- * onboarding progress (EB sessions, linked accounts, selected bank) is
- * persisted server-side in the SQLite database — the `eb_sessions`/`accounts`
- * tables (see `EbSessionStore`) plus `system_config` for the Enable Banking
- * application state. Keeping the cookie slim means it stays small and dies
- * with the session (logout/expiry) without stranding flow state.
+ * The cookie carries only the opaque session ID; this payload is the
+ * serialized `sessions.payload` blob. All onboarding progress (EB sessions,
+ * linked accounts, selected bank) is derived server-side from the Enable
+ * Banking API and the `eb_sessions`/`accounts` tables — the payload below is
+ * identity plus the onboarding view-position flow state ONLY (spec:
+ * session-management — the payload-identity rule; nothing new ever rides the
+ * cookie).
  *
- * The serializer is configured with `ignoreUnknownKeys = true` so cookies
- * issued by older formats (which carried fields like `psuIdHash`,
- * `aspspName`, `ebSessionId`, `accountsJson`) still decode into this class.
+ * Auth-flow outcomes (auth-error diagnostics, the import signals) live in
+ * the `flow_records` table (see `FlowRecordStore`) — consumed once at the
+ * owner's next authenticated view; they are NOT session fields.
  *
- * @property username The logged-in user.
- * @property authError Error reason from the last failed auth callback
- *   (display-only; cleared at the start of every `POST /api/auth` and on
- *   callback success).
- * @property authErrorKind Classified RFC 6749 error kind from the last failed
- *   auth callback: `cancelled`, `technical`, `configuration`, or `unexpected`.
- *   Null when there is no error. Cleared alongside [authError].
- * @property authorizationId The Enable Banking `authorization_id` from the
- *   most recent `POST /api/auth` (the only key into EB's control-panel request
- *   logs for diagnosing a failed authorization). Overwritten on every new
- *   attempt; null when no attempt has been made.
+ * @property username The logged-in user (the session record's owner).
  * @property onboardingStage The onboarding view-position stage — one of
  *   `linking_progress`, `auth_progress`, or `bank_selection` (see
  *   `OnboardingStage`). Ephemeral flow-control data, NEVER progress
  *   authority: it records where in the wizard the user is standing so a page
- *   refresh within a session restores the exact screen; all completed-progress
- *   flags remain derived server-side from EB state and `eb_sessions`. Written
- *   at the link-accounts / auth / cancel-linking touchpoints; cleared at
- *   auth-callback success, application (re-)registration, and login (fresh
- *   cookie). Null when no stage is stored.
- * @property stageAspspName The in-flight bank name of the stored stage
- *   (from the touchpoint request's bank selection). Cleared together with
+ *   refresh within a session restores the exact screen; all
+ *   completed-progress flags remain derived server-side from EB state and
+ *   `eb_sessions`. Written at the link-accounts / auth / cancel-linking
+ *   touchpoints; cleared at outcome consumption (auth-callback success),
+ *   application (re-)registration, and login (fresh record). Null when no
+ *   stage is stored.
+ * @property stageAspspName The in-flight bank name of the stored stage (from
+ *   the touchpoint request's bank selection). Cleared together with
  *   [onboardingStage]; null for the `bank_selection` stage (no bank in
  *   flight) and when no stage is stored.
- * @property stageAspspCountry The in-flight bank country of the stored
- *   stage. Cleared together with [onboardingStage].
+ * @property stageAspspCountry The in-flight bank country of the stored stage.
+ *   Cleared together with [onboardingStage].
  * @property stagePsuType The in-flight bank psu_type (`personal` /
- *   `business`) of the stored stage. Cleared together with
- *   [onboardingStage].
+ *   `business`) of the stored stage. Cleared together with [onboardingStage].
  * @property sessionid The EB AIS sessionid parsed from the linking
- *   `authorization_url` at link time (spec: onboarding-view-position, design
- *   D2). Meaningful only for the `linking_progress` stage; consumed exclusively
+ *   `authorization_url` at link time (spec: onboarding-view-position).
+ *   Meaningful only for the `linking_progress` stage; consumed exclusively
  *   server-side by the linking-session-status poll endpoint. A capability
- *   token: never exposed by `GET /api/onboarding/state`, never logged.
- *   Overwritten on every new link attempt; cleared together with
- *   [onboardingStage]. Null when no sessionid was stored (a cookie issued
- *   before this change, or an `authorization_url` without a parseable
- *   `sessionid`).
+ *   token: never exposed by `GET /api/onboarding/state`, never logged, never
+ *   sent to the SPA. Overwritten on every new link attempt; cleared together
+ *   with [onboardingStage]. Null when no sessionid was stored (an
+ *   `authorization_url` without a parseable `sessionid`).
  * @property stageSessionBaseUrl The poll base URL (scheme + host of the
  *   linking `authorization_url`) persisted at link time (spec:
- *   onboarding-view-position, design D2/D3). Meaningful only for the
- *   `linking_progress` stage; the poll endpoint needs it at cold-boot time to
- *   construct the session-status request (the `authorization_url` itself is
- *   returned to the SPA and never stored server-side). The host is never
- *   hardcoded — it follows the `authorization_url`. Overwritten on every new
- *   link attempt; cleared together with [onboardingStage].
+ *   onboarding-view-position). Meaningful only for the `linking_progress`
+ *   stage; the poll endpoint needs it at cold-boot time to construct the
+ *   session-status request (the `authorization_url` itself is returned to the
+ *   SPA and never stored server-side). The host is never hardcoded — it
+ *   follows the `authorization_url`. Overwritten on every new link attempt;
+ *   cleared together with [onboardingStage].
  */
 @Serializable
 data class UserSession(
     val username: String,
-    val authError: String? = null,
-    val authErrorKind: String? = null,
-    val authorizationId: String? = null,
     val onboardingStage: String? = null,
     val stageAspspName: String? = null,
     val stageAspspCountry: String? = null,
     val stagePsuType: String? = null,
     val sessionid: String? = null,
     val stageSessionBaseUrl: String? = null,
-    /** ASPSP logo URL staged at POST /api/auth (from the already-fetched list — no extra EB call). */
-    val stageAspspLogo: String? = null,
-    /** ASPSP BIC staged at POST /api/auth (from the already-fetched list — no extra EB call). */
-    val stageAspspBic: String? = null,
-    /** One-shot signal: a freshly authorized session's initial balance import is pending (wizard import step). */
-    val pendingInitialImport: Boolean? = null,
-    /**
-     * One-shot signal: the freshly authorized session was the user's FIRST
-     * connection ever (the merge transitioned `eb_sessions` 0 → 1 — the
-     * zero-account notice's "first connection ever" predicate). Set at the
-     * auth callback ONLY when the merge outcome says first-connection
-     * (an ever-onboarded user's reconnect is never a first connection);
-     * consumed-and-cleared by the FIRST `GET /api/onboarding/state` read —
-     * exactly the [pendingInitialImport] pattern (the redirect cold boot
-     * wipes client-side mode snapshots, so the SPA cannot derive this truth
-     * itself; the ever-onboarded marker flips to true inside the same merge
-     * transaction and can no longer distinguish the two cases).
-     */
-    val firstConnectionImport: Boolean? = null,
-    // The one-shot missing-accounts signal moved SERVER-SIDE (review F6
-    // ruling: the set is merge-computed server data — never a cookie
-    // payload; the old cookie field was a needless client roundtrip, a
-    // ~4KB size liability at scale, and a client-trust boundary). It lives
-    // in system_config via MissingAccountSignalStore, carried — and
-    // cleared — by exactly one GET /api/accounts response (design D14).
 )
 
 /**

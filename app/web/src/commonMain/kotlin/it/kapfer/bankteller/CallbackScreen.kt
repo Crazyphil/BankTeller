@@ -58,6 +58,14 @@ import kotlinx.coroutines.delay
 fun CallbackScreen() {
     val search = remember { getCurrentSearch() }
     val isAuthFlow = search.contains("code=")
+    // Auth-flow failure (RFC 6749): `error` (+ optional `error_description`) with
+    // NO code — the bank refused/aborted the authorization (e.g. access_denied
+    // after a bank-side session timeout). Distinct from the email-link error
+    // (missing oobCode): this is an AUTHORIZATION callback failure and renders
+    // the auth-failure copy family (spec: handle-authorization-failure — the
+    // same kind-based selector the wizard's failure panel uses, so the two
+    // presentations never drift apart).
+    val isAuthError = !isAuthFlow && search.contains("error=")
     val params = remember(search) { parseQueryParams(search) }
     val isSuccess = search.contains("state=") && (search.contains("oobCode=") || isAuthFlow)
 
@@ -98,6 +106,10 @@ fun CallbackScreen() {
             if (isSuccess) {
                 StatusCard {
                     SuccessContent(isAuthFlow, params)
+                }
+            } else if (isAuthError) {
+                StatusCard {
+                    AuthErrorContent(params)
                 }
             } else {
                 StatusCard {
@@ -231,6 +243,78 @@ private fun SuccessContent(isAuthFlow: Boolean, params: Map<String, String>) {
         ) {
             WaitingIndicator.Inline()
         }
+    }
+}
+
+/**
+ * Auth-flow failure content (RFC 6749 error redirect): the bank refused or
+ * aborted the authorization. The copy comes from the shared kind-based
+ * auth-failure selector ([authFailureCopy] — the same family the wizard's
+ * failure panel and the dashboard's add-flow notice use), so the callback
+ * page and the in-app failure surfaces can never drift apart. The raw
+ * `error`/`error_description` values are diagnostics-only (rendered in the
+ * mono details block, never as the message).
+ */
+@Composable
+private fun AuthErrorContent(params: Map<String, String>) {
+    val danger = MaterialTheme.colorScheme.error
+
+    // Same RFC 6749 classification as the server's classifyAuthError.
+    val copy = authFailureCopy(
+        when (params["error"]) {
+            "access_denied" -> "cancelled"
+            "server_error", "temporarily_unavailable" -> "technical"
+            "invalid_request", "unauthorized_client", "unsupported_response_type", "invalid_scope" -> "configuration"
+            else -> null
+        }
+    )
+
+    StatusBadge(
+        icon = Icons.Filled.Error,
+        label = "Error",
+        tint = danger,
+    )
+
+    Text(
+        text = copy.title,
+        style = MaterialTheme.typography.headlineSmall,
+        color = danger,
+    )
+
+    Text(
+        text = copy.body,
+        style = MaterialTheme.typography.bodyMedium,
+        color = danger,
+    )
+
+    Text(
+        text = copy.guidance,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+
+    // Diagnostics in JetBrains Mono (D13): the raw error values, never the message.
+    val details = "received query: " + if (params.isEmpty()) {
+        "(none)"
+    } else {
+        params.entries.joinToString(" & ") { "${it.key}=${it.value}" }
+    }
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+    ) {
+        Text(
+            text = details,
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = jetBrainsMonoFamily()),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(Dimens.sm),
+        )
+    }
+
+    Spacer(modifier = Modifier.height(Dimens.sm))
+
+    Button(onClick = { redirectTo("/") }) {
+        Text("Back to BankTeller")
     }
 }
 

@@ -183,9 +183,12 @@ class RegistrationInProgressTest {
         val client = loggedInClient()
         val state = client.prepareValidatedState()
 
-        // Before the task runs: no marker — the normal ladder resolves
-        // (email_entry: the refresh token is not yet persisted).
-        assertEquals(OnboardingRoute.EMAIL_ENTRY, client.stateJson().str("route"))
+        // Before the task runs: no marker — the normal ladder resolves. A
+        // validated email-link flow record exists (prepareValidatedState), so
+        // the email_entry rung is outranked by the live-record continuation
+        // (manual-verification 8.10): the user is mid-flow, past email entry —
+        // registration_review, not email_entry.
+        assertEquals(OnboardingRoute.REGISTRATION_REVIEW, client.stateJson().str("route"))
 
         // Hold the registration task mid-flight (inside registerApplication).
         val complete = scope.launch { client.completeCall(state) }

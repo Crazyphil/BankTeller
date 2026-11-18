@@ -423,4 +423,199 @@ class DatabaseFactoryTest {
         // user_version now tracked, so a restart is a clean no-op.
         DatabaseFactory.init()
     }
+
+    @Test
+    fun `init migrates user_version 0 database in the prior v6-equivalent schema state`() {
+        val path = newTempDbPath()
+        // A pre-migration-6 database: the full migration-5 schema (all four
+        // legacy tables + migration-4 columns + sync_outcomes/rate_limit_skip)
+        // exists, but sessions/flow_records/eb_application do NOT and
+        // user_version was never written. The inference ladder must resolve the
+        // PRIOR version so migration 6 applies: the three new tables + their
+        // owner indexes are created without touching existing rows.
+        val driver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        driver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE eb_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                aspsp_name TEXT,
+                aspsp_country TEXT,
+                psu_type TEXT,
+                created_at INTEGER NOT NULL,
+                valid_until TEXT,
+                logo TEXT,
+                bic TEXT,
+                rate_limit_skip INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                iban TEXT,
+                uid TEXT,
+                currency TEXT,
+                name TEXT,
+                identification_hash TEXT,
+                in_consent INTEGER NOT NULL DEFAULT 1
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE balances (
+                account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+                balance_amount TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                balance_type TEXT NOT NULL,
+                reference_date TEXT,
+                fetched_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE sync_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+                sync_type TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                error_message TEXT
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            """
+            CREATE TABLE sync_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_log_id INTEGER NOT NULL REFERENCES sync_log(id),
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                status TEXT NOT NULL,
+                error_bin TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                fetched_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(null, "INSERT INTO system_config (key, value) VALUES ('jwt_signing_key', 'k')", 0)
+        driver.execute(null, "INSERT INTO system_config (key, value) VALUES ('password_hash', 'h')", 0)
+        driver.execute(null, "INSERT INTO eb_sessions (session_id, created_at) VALUES ('sess-1', 1)", 0)
+        driver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        // Migration 6 applied: all three tables are queryable…
+        assertEquals(0L, db.sessionsQueries.countSessions().executeAsOne())
+        assertEquals(0L, db.flowRecordsQueries.countFlowRecords().executeAsOne())
+        assertNull(db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull())
+        // …and the untouched legacy data survived.
+        assertEquals("k", db.systemConfigQueries.selectValue("jwt_signing_key").executeAsOneOrNull())
+        assertEquals("sess-1", db.ebSessionsQueries.selectSessionBySessionId("sess-1").executeAsOne().session_id)
+        // user_version now tracked, so a restart is a clean no-op.
+        DatabaseFactory.init()
+    }
+
+    @Test
+    fun `migration 6 copies the application keys into eb_application and shrinks system_config`() {
+        val path = newTempDbPath()
+        // A pre-migration-6 database holding the six system_config application
+        // keys plus the retired enable_banking_previously_active key, and the
+        // two keys that must survive. After the migration (task 1.2 / design
+        // D6) system_config contains ONLY jwt_signing_key and password_hash,
+        // and the six values live on the single eb_application row.
+        val legacyDriver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        legacyDriver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        val keys = mapOf(
+            "jwt_signing_key" to "jwt-value",
+            "password_hash" to "\$2a\$hash",
+            "enable_banking_application_id" to "app-123",
+            "enable_banking_private_key" to "-----BEGIN PRIVATE KEY-----\npem\n-----END PRIVATE KEY-----",
+            "enable_banking_refresh_token" to "refresh-1",
+            "enable_banking_email" to "user@example.com",
+            "enable_banking_redirect_url" to "https://bankteller.example/callback",
+            "ever_onboarded" to "true",
+            "enable_banking_previously_active" to "true",
+        )
+        keys.forEach { (k, v) ->
+            legacyDriver.execute(
+                null,
+                "INSERT INTO system_config (key, value) VALUES (?, ?)",
+                2,
+            ) { bindString(0, k); bindString(1, v) }
+        }
+        legacyDriver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+
+        // system_config is reduced to exactly the two retained keys (spec:
+        // database — system_config is reduced). No "select all" query exists on
+        // system_config; read the known keys explicitly (the set under test is
+        // fixed).
+        val remainingKeys = listOf(
+            "jwt_signing_key", "password_hash",
+            "enable_banking_application_id", "enable_banking_private_key",
+            "enable_banking_refresh_token", "enable_banking_email",
+            "enable_banking_redirect_url", "ever_onboarded",
+            "enable_banking_previously_active",
+        ).filter { key -> db.systemConfigQueries.selectValue(key).executeAsOneOrNull() != null }
+        assertEquals(listOf("jwt_signing_key", "password_hash"), remainingKeys)
+
+        // The application state is one typed row carrying the copied values.
+        val app = db.ebApplicationQueries.selectEbApplication().executeAsOne()
+        assertEquals("app-123", app.application_id)
+        assertEquals(keys["enable_banking_private_key"], app.private_key)
+        assertEquals("refresh-1", app.refresh_token)
+        assertEquals("user@example.com", app.email)
+        assertEquals("https://bankteller.example/callback", app.redirect_url)
+        assertEquals(1L, app.ever_onboarded, "\"true\" must migrate to the integer marker 1")
+        assertNull(app.missing_accounts, "missing-accounts has no system_config predecessor")
+    }
+
+    @Test
+    fun `migration 6 leaves eb_application empty when no application keys existed`() {
+        val path = newTempDbPath()
+        val legacyDriver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        legacyDriver.execute(
+            null,
+            "CREATE TABLE system_config (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)",
+            0,
+        )
+        legacyDriver.execute(null, "INSERT INTO system_config (key, value) VALUES ('jwt_signing_key', 'k')", 0)
+        legacyDriver.execute(null, "INSERT INTO system_config (key, value) VALUES ('password_hash', 'h')", 0)
+        legacyDriver.close()
+
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+
+        assertNull(db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull())
+        assertEquals("k", db.systemConfigQueries.selectValue("jwt_signing_key").executeAsOneOrNull())
+        assertEquals("h", db.systemConfigQueries.selectValue("password_hash").executeAsOneOrNull())
+    }
 }

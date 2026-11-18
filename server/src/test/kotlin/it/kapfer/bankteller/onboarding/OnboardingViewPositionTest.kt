@@ -11,6 +11,7 @@ import io.ktor.server.testing.*
 import it.kapfer.bankteller.enablebanking.*
 import it.kapfer.bankteller.module
 import it.kapfer.bankteller.server.DatabaseFactory
+import it.kapfer.bankteller.database.seedEbApplication
 import kotlinx.serialization.json.*
 import kotlin.test.*
 
@@ -175,13 +176,16 @@ class OnboardingViewPositionTest {
         redirectUrl: String = "https://app.example.com/enable-banking-callback",
     ) {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", applicationId)
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", refreshToken)
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", redirectUrl)
-        // OnboardingService.getStatus() treats a missing private key as
-        // "not configured" (appState=null) — seed it so the tests exercise the
-        // real control-plane derivation (same convention as OnboardingServiceTest).
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "fake-pem")
+        // Seed the single eb_application row. OnboardingService.getStatus()
+        // treats a missing private key as "not configured" (appState=null) — seed
+        // it so the tests exercise the real control-plane derivation (same
+        // convention as OnboardingServiceTest).
+        db.seedEbApplication(
+            applicationId = applicationId,
+            privateKey = "fake-pem",
+            refreshToken = refreshToken,
+            redirectUrl = redirectUrl,
+        )
     }
 
     private suspend fun ApplicationTestBuilder.loggedInClient(): HttpClient {
@@ -420,6 +424,65 @@ class OnboardingViewPositionTest {
         state = sessionClient.stateJson()
         assertTrue(state.isNull("onboarding_stage"), "login must clear the stored stage (fresh cookie)")
         assertTrue(state.isNull("stage_bank"))
+    }
+
+    @Test
+    fun `auth-callback failure outcome keeps the stored stage for the retry affordances`() = testApplication {
+        seedDb()
+        val fake = FakeEnableBankingClient(
+            aspspsResult = AspsspListResult.Ok(
+                listOf(Aspssp(name = "Test Bank", country = "DE", maximumConsentValidity = 7776000L)),
+            ),
+            startAuthResult = StartAuthResult.Ok(
+                url = "https://bank.example/auth",
+                authorizationId = "auth-1",
+                psuIdHash = "hash-1",
+            ),
+            authorizeSessionResult = AuthorizeSessionResult.Error(400, null, "Invalid or expired code"),
+        )
+        application {
+            module(
+                controlPlaneClient = controlPlaneClient(),
+                enableBankingClientFactory = { fake },
+            )
+        }
+        val sessionClient = loggedInClient()
+
+        // Store the auth_progress stage with the bank triple (POST /api/auth).
+        assertEquals(HttpStatusCode.OK, sessionClient.postAuth(bank = "Test Bank", country = "DE").status)
+        var state = sessionClient.stateJson()
+        assertEquals("auth_progress", state.str("onboarding_stage"))
+        val stageBank = state["stage_bank"]?.jsonObject
+        assertEquals("Test Bank", stageBank?.get("aspsp_name")?.jsonPrimitive?.contentOrNull)
+
+        // Fail the authorization at the bank → the error callback stores the
+        // FAILED outcome; the next state read consumes it.
+        sessionClient.get("/enable-banking-callback") {
+            parameter("error", "server_error")
+            parameter("state", fake.lastState!!)
+        }
+        state = sessionClient.stateJson()
+
+        // The failure outcome is consumed (auth_error reported exactly once)…
+        assertEquals("server_error", state.str("auth_error"))
+        assertEquals("technical", state.str("auth_error_kind"))
+        // …but the stored stage STAYS (spec: onboarding-view-position — the
+        // clearing actor clears on the auth-callback SUCCESS path only): the
+        // retry affordances key on stage_bank incl. psu_type.
+        assertEquals("auth_progress", state.str("onboarding_stage"), "a failure outcome keeps the stage")
+        val retryStageBank = state["stage_bank"]?.jsonObject
+        assertEquals(
+            "Test Bank",
+            retryStageBank?.get("aspsp_name")?.jsonPrimitive?.contentOrNull,
+            "the stage bank triple survives the failed attempt",
+        )
+        assertEquals("personal", retryStageBank?.get("psu_type")?.jsonPrimitive?.contentOrNull)
+
+        // The outcome is consume-once: the second read reports no auth_error,
+        // the stage still intact.
+        val second = sessionClient.stateJson()
+        assertEquals(null, second.str("auth_error") ?: null)
+        assertEquals("auth_progress", second.str("onboarding_stage"))
     }
 
     @Test

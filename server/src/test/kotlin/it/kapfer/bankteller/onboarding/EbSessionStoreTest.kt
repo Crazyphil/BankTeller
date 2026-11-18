@@ -77,8 +77,8 @@ class EbSessionStoreTest {
 
         assertEquals(true, store.isEverOnboarded())
         assertEquals(
-            "true",
-            database.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
+            1L,
+            database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded,
             "the marker is persisted on the 0 → 1 session transition, inside the merge transaction",
         )
     }
@@ -88,14 +88,17 @@ class EbSessionStoreTest {
         val (database, store) = createStore()
         store.mergeSession("sess-1", "Test Bank", "DE", "personal", emptyList())
         // Sentinel value proves the marker write happens only on the 0 → 1
-        // transition (a re-auth is 1 → 1 and must not touch it).
-        database.systemConfigQueries.insertOrReplace(EbSessionStore.EVER_ONBOARDED_KEY, "sentinel")
+        // transition (a re-auth is 1 → 1 and must not touch it). The column is
+        // free-form INTEGER space — 0 is "set but explicitly cleared" semantics
+        // the merge must still not touch (the write is keyed on the bare
+        // transition... which HAS happened, so a re-auth is 1 → 1).
+        database.ebApplicationQueries.updateEbApplicationEverOnboarded(7L)
 
-        store.mergeSession("sess-2", "Test Bank", "DE", "personal", emptyList())
+        store.mergeSession("sess-2", "Other Bank", "FR", "personal", emptyList())
 
         assertEquals(
-            "sentinel",
-            database.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
+            7L,
+            database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded,
             "a later merge must not rewrite the marker",
         )
         assertEquals(true, store.isEverOnboarded())
@@ -108,11 +111,15 @@ class EbSessionStoreTest {
         // never written (backfill-on-read).
         database.ebSessionsQueries.insertSession("sess-1", "Test Bank", "DE", "personal", 1_000L, null, null, null)
 
-        assertEquals(
-            null,
-            database.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
-        )
+        // The row carries no marker yet (NULL) — the session row alone proves
+        // onboarded.
+        assertNull(database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded)
         assertEquals(true, store.isEverOnboarded(), "sessions exist without a marker → onboarded (backfill-on-read)")
+        assertEquals(
+            1L,
+            database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded,
+            "backfill-on-read persists the marker onto the row",
+        )
     }
 
     @Test
@@ -131,8 +138,9 @@ class EbSessionStoreTest {
 
         assertEquals(false, store.isEverOnboarded())
         assertEquals(
-            null,
-            database.systemConfigQueries.selectValue(EbSessionStore.EVER_ONBOARDED_KEY).executeAsOneOrNull(),
+            0L,
+            database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded,
+            "clearEverOnboarded writes the row's column to 0",
         )
     }
 
@@ -701,6 +709,74 @@ class EbSessionStoreTest {
         assertFalse(deleted, "a live (in_consent = 1) account is never per-account deletable")
         assertEquals(1L, database.accountCount())
         assertNotNull(database.balancesQueries.selectBalanceByAccountId(live.id).executeAsOneOrNull())
+    }
+
+    @Test
+    fun `deleteLocalCopyAccounts deletes the batch with its sync_outcomes and keeps live accounts`() {
+        val (database, store) = createStore()
+        store.mergeSession(
+            sessionId = "sess-1",
+            aspspName = "Test Bank",
+            aspspCountry = "DE",
+            psuType = "personal",
+            accounts = listOf(
+                EbSessionStore.MergedAccount(iban = "DE1", uid = "u1", currency = "EUR", name = "Giro"),
+                EbSessionStore.MergedAccount(iban = "DE2", uid = "u2", currency = "EUR", name = "Savings"),
+            ),
+        )
+        // Re-auth without DE1/DE2 → both become kept local copies; DE3 is live.
+        store.mergeSession(
+            sessionId = "sess-2",
+            aspspName = "Test Bank",
+            aspspCountry = "DE",
+            psuType = "personal",
+            accounts = listOf(EbSessionStore.MergedAccount(iban = "DE3", uid = "u3", currency = "EUR", name = "Giro")),
+        )
+        val session2 = database.ebSessionsQueries.selectSessionBySessionId("sess-2").executeAsOne()
+        val kept = database.accountsFor("sess-2").filter { it.in_consent == 0L }
+        assertEquals(2, kept.size, "both superseded accounts are kept as local copies")
+        val live = database.accountsFor("sess-2").single { it.in_consent == 1L }
+
+        // Per-account outcome rows for the batch AND the live account (same run).
+        database.balancesQueries.insertSyncLog(session2.id, "manual", 1_000L, 2_000L, "success", null, null)
+        val syncLogId = database.balancesQueries.selectLatestSyncLogBySessionId(session2.id).executeAsOne().id
+        (kept.map { it.id } + live.id).forEach { accountId ->
+            database.syncOutcomesQueries.insertSyncOutcome(
+                sync_log_id = syncLogId,
+                account_id = accountId,
+                status = "error",
+                error_bin = "consent_dead",
+                error_code = null,
+                error_message = null,
+                fetched_at = 2_000L,
+            )
+        }
+
+        val deleted = store.deleteLocalCopyAccounts(kept.map { it.id })
+
+        assertEquals(kept.map { it.id }.toSet(), deleted.toSet())
+        // The deleted account rows are gone; the live one survives.
+        kept.forEach { account ->
+            assertNull(
+                database.ebSessionsQueries.selectAccountById(account.id).executeAsOneOrNull(),
+                "the deleted local-copy account row must be gone",
+            )
+        }
+        // Deleted accounts leave no outcome history behind (manual-verification
+        // 8.10 audit finding — same orphan rationale as the session cleanup).
+        kept.forEach { account ->
+            assertNull(
+                database.syncOutcomesQueries.selectLatestOutcomeByAccountId(account.id).executeAsOneOrNull(),
+                "a deleted local copy's sync_outcomes rows must go with it",
+            )
+        }
+        // The live account and its outcome survive untouched.
+        assertEquals("DE3", database.ebSessionsQueries.selectAccountById(live.id).executeAsOne().iban)
+        assertEquals(
+            "error",
+            database.syncOutcomesQueries.selectLatestOutcomeByAccountId(live.id).executeAsOne().status,
+            "a live account's outcome is never touched by local-copy deletion",
+        )
     }
 
     @Test

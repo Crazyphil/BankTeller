@@ -5,6 +5,7 @@ import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.server.testing.*
+import it.kapfer.bankteller.database.seedEbApplication
 import it.kapfer.bankteller.module
 import kotlin.test.*
 
@@ -219,8 +220,7 @@ class OnboardingRoutesTest {
         dbFile.deleteOnExit()
         System.setProperty("database.path", dbFile.absolutePath)
         val db = it.kapfer.bankteller.server.DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_email", "stored@example.com")
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://app.example.com/cb")
+        db.seedEbApplication(email = "stored@example.com", redirectUrl = "https://app.example.com/cb")
 
         testApplication {
             application { module() }

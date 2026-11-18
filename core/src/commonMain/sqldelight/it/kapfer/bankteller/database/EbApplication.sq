@@ -1,0 +1,79 @@
+-- The Enable Banking application state as ONE typed row (server-side-session-
+-- storage, design D6). `id` is the row identity (one row today, row-per-
+-- application in a multi-user/multi-application future — the single row always
+-- carries id 1). Replaces the six `system_config` application keys
+-- (`enable_banking_application_id`, ..., `ever_onboarded`), which the 6.sqm
+-- migration copies here opportunistically; the retired
+-- `enable_banking_previously_active` key is deleted. `missing_accounts` has no
+-- `system_config` predecessor — it holds the one-shot missing-accounts signal
+-- JSON (MissingAccountSignalPayload), set at the merge and consumed once by
+-- GET /api/accounts.
+
+CREATE TABLE eb_application (
+    id INTEGER PRIMARY KEY,
+    application_id TEXT,
+    private_key TEXT,
+    refresh_token TEXT,
+    email TEXT,
+    redirect_url TEXT,
+    ever_onboarded INTEGER,
+    missing_accounts TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- eb_application queries
+-- ---------------------------------------------------------------------------
+
+selectEbApplication:
+SELECT * FROM eb_application WHERE id = 1;
+
+-- Upsert of the whole row (credential registration). INSERT OR REPLACE keeps
+-- id = 1 stable; callers read the row first when they must preserve columns
+-- they do not set (the per-column queries below serve that).
+upsertEbApplication:
+INSERT OR REPLACE INTO eb_application(
+    id, application_id, private_key, refresh_token, email, redirect_url, ever_onboarded, missing_accounts
+) VALUES (1, ?, ?, ?, ?, ?, ?, ?);
+
+-- Ensure the single row exists (id 1) before per-column updates — a database
+-- migrated from a system_config without application keys has no row yet.
+insertEbApplicationRowIfAbsent:
+INSERT OR IGNORE INTO eb_application(id) VALUES (1);
+
+-- ---------------------------------------------------------------------------
+-- Per-column updates (all target the single row; the row must exist — callers
+-- use insertEbApplicationRowIfAbsent first or a full upsert).
+-- ---------------------------------------------------------------------------
+
+updateEbApplicationId:
+UPDATE eb_application SET application_id = ? WHERE id = 1;
+
+updateEbApplicationPrivateKey:
+UPDATE eb_application SET private_key = ? WHERE id = 1;
+
+-- Refresh-token lifecycle: set on authorization, cleared on reset
+-- (NULL = no refresh token).
+updateEbApplicationRefreshToken:
+UPDATE eb_application SET refresh_token = ? WHERE id = 1;
+
+updateEbApplicationEmail:
+UPDATE eb_application SET email = ? WHERE id = 1;
+
+updateEbApplicationRedirectUrl:
+UPDATE eb_application SET redirect_url = ? WHERE id = 1;
+
+-- ever-onboarded marker: 1 = set, 0 = explicitly unset (NULL = unknown).
+updateEbApplicationEverOnboarded:
+UPDATE eb_application SET ever_onboarded = ? WHERE id = 1;
+
+-- The one-shot missing-accounts signal: set at the merge, cleared (NULL) by
+-- the consuming GET /api/accounts response.
+updateEbApplicationMissingAccounts:
+UPDATE eb_application SET missing_accounts = ? WHERE id = 1;
+
+-- Registration/reset wipe: clears the credentials but keeps the row (and the
+-- ever-onboarded/missing-accounts state, which the callers manage explicitly).
+clearEbApplicationCredentials:
+UPDATE eb_application
+SET application_id = NULL, private_key = NULL, refresh_token = NULL, email = NULL, redirect_url = NULL
+WHERE id = 1;

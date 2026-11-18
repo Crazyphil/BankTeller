@@ -1,0 +1,71 @@
+-- Persisted redirect-flow records (server-side-session-storage, design
+-- D3/D4/D5). One row per in-flight flow:
+--   * kind `bank_auth`  — the OAuth `state` token is `state_token`; payload
+--     carries the ASPSP logo URL/BIC/authorization_id staged at
+--     `POST /api/auth` and the callback outcome afterwards.
+--   * kind `email_link` — payload carries the in-memory `OnboardingContext`
+--     as JSON (owner/status preserve the previous owner-check semantics).
+-- `status` is a free-form TEXT tag interpreted per kind (`pending`,
+-- `completed`, `failed`, `awaiting_confirmation`, …). `owner` is the owning
+-- username — outcomes are consumed ONCE, filtered by owner (D4).
+-- Expired rows are pruned lazily on access.
+
+CREATE TABLE flow_records (
+    state_token TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX flow_records_owner_idx ON flow_records(owner);
+
+-- ---------------------------------------------------------------------------
+-- FlowRecords queries
+-- ---------------------------------------------------------------------------
+
+insertFlowRecord:
+INSERT INTO flow_records(state_token, kind, owner, status, payload, created_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- Lookup by the OAuth state token. The wrapped store checks expires_at and
+-- prunes an expired row (unknown → rejected at the callback; lazy prune).
+selectFlowRecord:
+SELECT * FROM flow_records WHERE state_token = ?;
+
+updateFlowRecordStatus:
+UPDATE flow_records SET status = ? WHERE state_token = ?;
+
+updateFlowRecordPayload:
+UPDATE flow_records SET payload = ? WHERE state_token = ?;
+
+-- Status + payload together: the callback writes its outcome in one statement
+-- (a record update that must not be half-applied between two statements).
+updateFlowRecordStatusAndPayload:
+UPDATE flow_records SET status = ?, payload = ? WHERE state_token = ?;
+
+-- Delete by token — an explicit discard after consumption.
+deleteFlowRecord:
+DELETE FROM flow_records WHERE state_token = ?;
+
+deleteExpiredFlowRecords:
+DELETE FROM flow_records WHERE expires_at < ?;
+
+-- Owner-indexed reads, all filtered by kind. The SQLDelight type of an IN-list
+-- parameter needs an explicit type annotation on the parameter list.
+selectFlowRecordsByOwnerAndKind:
+SELECT * FROM flow_records WHERE owner = ? AND kind = ? ORDER BY created_at DESC;
+
+-- Supersede/discard (design D4): a new `POST /api/auth`, cancel-linking, or an
+-- application (re-)registration discards the owner's queued outcomes of one
+-- kind — the pending outcome always refers to the latest attempt.
+deleteFlowRecordsByOwnerAndKind:
+DELETE FROM flow_records WHERE owner = ? AND kind = ?;
+
+deleteFlowRecordByIdentity:
+DELETE FROM flow_records WHERE state_token = ? AND owner = ? AND kind = ?;
+
+countFlowRecords:
+SELECT COUNT(*) FROM flow_records;

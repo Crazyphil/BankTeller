@@ -11,7 +11,11 @@ import it.kapfer.bankteller.enablebanking.AuthorizeSessionResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
 import it.kapfer.bankteller.enablebanking.EnableBankingControlPlaneClient
 import it.kapfer.bankteller.enablebanking.Environment
+import it.kapfer.bankteller.server.FlowRecordStore
+import it.kapfer.bankteller.server.FlowKind
+import it.kapfer.bankteller.server.FlowStatus
 import it.kapfer.bankteller.server.MissingAccountSignalStore
+import it.kapfer.bankteller.server.SqlDelightSessionStorage
 import it.kapfer.bankteller.server.UserSession
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
@@ -59,7 +63,8 @@ fun Route.onboardingRoutes(
     service: OnboardingService,
     controlPlaneClient: EnableBankingControlPlaneClient, // retained for future use
     enableBankingClientFactory: (() -> EnableBankingClient)? = null,
-    stateJwt: StateJwt? = null,
+    flowRecordStore: FlowRecordStore? = null,
+    sessionStorage: SqlDelightSessionStorage? = null,
 ) {
     val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
@@ -67,17 +72,19 @@ fun Route.onboardingRoutes(
     // -----------------------------------------------------------------------
 
     // 5.5 — Enable Banking callback (unauthenticated).
-    // Handles two kinds of redirects (design D2):
+    // Handles two kinds of redirects (design D2/D4):
     //  - Email-link callback (`oobCode` + `state`): possibly a different device,
     //    NO session cookie expected. oobCode capture happens server-side
     //    synchronously BEFORE the SPA bundle is served.
-    //  - Auth callback (`code` + `state`, no `oobCode`): same browser tab, so the
-    //    session cookie IS expected. Missing/invalid cookie → 302 to the
-    //    BankTeller login page, discarding the single-use `code`. On valid
-    //    session the code is exchanged via authorizeSession; the result is
-    //    persisted server-side (eb_sessions/accounts via EbSessionStore on
-    //    success, auth_error in the cookie on failure) before the SPA bundle
-    //    is served.
+    //  - Auth callback (`code` + `state`, no `oobCode`): SESSION-INDEPENDENT —
+    //    the flow record alone correlates the redirect. The single-use code is
+    //    exchanged and the merge is persisted server-side regardless of any
+    //    live session; the outcome (import signals, or failure diagnostics) is
+    //    written INTO the flow record and surfaces consume-once at the owner's
+    //    next authenticated view. A user whose session died at the bank site
+    //    returns, logs in, and finds the connection completed. The SPA bundle
+    //    is served afterwards; the SPA's login gate handles the no-session
+    //    case.
     get("/enable-banking-callback") {
         val state = call.request.queryParameters["state"]
         val oobCode = call.request.queryParameters["oobCode"]
@@ -90,45 +97,43 @@ fun Route.onboardingRoutes(
             oobCode != null -> {
                 logger.info("EB callback: email-link branch (oobCode present, state={})", state)
                 service.handleCallback(state, oobCode) // captures oobCode as side-effect
-                serveSpaBundle(call)
+                serveSpaBundle(call, sessionStorage)
             }
 
-            // Auth flow — session cookie required (same-tab redirect)
+            // Auth flow — session-independent (design D4): the flow record
+            // alone correlates the redirect.
             code != null -> {
-                val session = call.sessions.get<UserSession>()
-                if (session == null) {
-                    // 302 redirect to the BankTeller login page (username/password —
-                    // not the EB email-link flow). The code is single-use and
-                    // time-limited, so it is discarded; the SPA resumes via
-                    // GET /api/onboarding/state after re-login.
-                    logger.warn("EB callback: auth branch WITHOUT session cookie — code discarded, redirecting to login")
-                    call.respondRedirect("/")
+                // Look up the flow record by the state token. Unknown/expired
+                // token → rejected, no code exchange (the record was pruned or
+                // superseded; the single-use code is discarded).
+                val record = state?.let { flowRecordStore?.lookup(it) }
+                if (flowRecordStore == null || record == null || record.kind != FlowKind.BANK_AUTH) {
+                    logger.warn("EB callback: auth branch with unknown/expired state token — code discarded")
+                    serveSpaBundle(call, sessionStorage)
                     return@get
                 }
+                val staged = runCatching {
+                    FlowRecordStore.decode(BankAuthFlowPayload.serializer(), record.payload)
+                }.getOrNull() ?: BankAuthFlowPayload()
 
-                // Decode the state JWT and bind it to this session.
-                val sessionId = state?.let { stateJwt?.verify(it) }
-                if (sessionId == null || sessionId != session.username) {
-                    logger.warn(
-                        "EB callback: state mismatch — stateJwt resolved={}, session username={}",
-                        sessionId, session.username,
+                // Write a failure outcome into the record and serve the SPA.
+                // The callback NEVER touches any session (design D4).
+                suspend fun fail(message: String, kind: String) {
+                    flowRecordStore.updateOutcome(
+                        token = record.token,
+                        status = FlowStatus.FAILED,
+                        payload = FlowRecordStore.encode(
+                            BankAuthFlowPayload.serializer(),
+                            staged.copy(authError = message, authErrorKind = kind),
+                        ),
                     )
-                    call.sessions.set(session.copy(
-                        authError = "State mismatch — please retry the authorization",
-                        authErrorKind = "unexpected",
-                    ))
-                    serveSpaBundle(call)
-                    return@get
                 }
 
                 val client = enableBankingClientFactory?.invoke()
                 if (client == null) {
                     logger.warn("EB callback: no Enable Banking client factory configured")
-                    call.sessions.set(session.copy(
-                        authError = "Technical error",
-                        authErrorKind = "unexpected",
-                    ))
-                    serveSpaBundle(call)
+                    fail("Technical error", "unexpected")
+                    serveSpaBundle(call, sessionStorage)
                     return@get
                 }
                 try {
@@ -138,16 +143,14 @@ fun Route.onboardingRoutes(
                                 "EB callback: authorizeSession OK — sessionId={}, accounts={}",
                                 result.sessionId, result.accounts.size,
                             )
-                            // Phase 2 of the auth-callback handling: persist the
-                            // session + merge accounts server-side (phase 1 was
-                            // the authorizeSession() call above). On failure keep
-                            // the user logged in but surface a retryable error.
+                            // Persist the session + merge accounts server-side.
+                            // The authorize response's `aspsp` object uses EB's
+                            // minimal ASPSP schema (name + country only — no
+                            // logo/BIC, per the OpenAPI), so the staged values
+                            // are the practical source; the response's own
+                            // logo/BIC win on the rare occasion EB supplies
+                            // them (fresher data at merge time).
                             try {
-                                // The authorize response's `aspsp` object uses EB's
-                                // minimal ASPSP schema (name + country only — no
-                                // logo/BIC, per the OpenAPI). The logo and BIC
-                                // staged at POST /api/auth (from the already-fetched
-                                // bank list) are the authoritative fallback.
                                 val mergeOutcome = ebSessionStore.mergeSession(
                                     sessionId = result.sessionId,
                                     aspspName = result.aspsp?.name,
@@ -164,132 +167,105 @@ fun Route.onboardingRoutes(
                                     },
                                     validUntil = result.access?.validUntil,
                                     logo = result.aspsp?.logo?.takeIf { it.isNotEmpty() }
-                                        ?: session.stageAspspLogo,
+                                        ?: staged.aspspLogo,
                                     bic = result.aspsp?.bic?.takeIf { it.isNotEmpty() }
-                                        ?: session.stageAspspBic,
+                                        ?: staged.aspspBic,
                                 )
                                 logger.info(
-                                    "EB callback: session persisted, stage cleared, pendingInitialImport set ({} missing accounts kept, firstConnection={})",
+                                    "EB callback: session persisted, outcome stored ({} missing accounts kept, firstConnection={})",
                                     mergeOutcome.missingAccounts.size, mergeOutcome.firstConnection,
                                 )
-                                call.sessions.set(
-                                    session.copy(
-                                        authError = null,
-                                        authErrorKind = null,
-                                        // Clear the view position too (spec:
-                                        // onboarding-view-position): authorization
-                                        // completed — the next natural position is
-                                        // the Dashboard, and a stale stage must
-                                        // never fabricate progress. The EB AIS
-                                        // sessionid and poll base URL are cleared
-                                        // alongside the stage (they are meaningful
-                                        // only for the linking_progress stage).
-                                        onboardingStage = null,
-                                        stageAspspName = null,
-                                        stageAspspCountry = null,
-                                        stagePsuType = null,
-                                        sessionid = null,
-                                        stageSessionBaseUrl = null,
-                                        stageAspspLogo = null,
-                                        stageAspspBic = null,
-                                        // One-shot signal (spec: wizard-initial-import):
-                                        // a freshly authorized session's initial
-                                        // balance import is pending. Cleared on the
-                                        // next GET /api/onboarding/state read.
-                                        pendingInitialImport = true,
-                                        // One-shot signal (spec: onboarding —
-                                        // zero-account notice, amended): the merge
-                                        // says this was the FIRST connection ever
-                                        // (eb_sessions 0 → 1). Set ONLY then — an
-                                        // ever-onboarded user's reconnect is never
-                                        // a first connection (the marker flips
-                                        // inside this transaction and cannot
-                                        // distinguish the two on the redirect cold
-                                        // boot). Consumed-and-cleared by the FIRST
-                                        // GET /api/onboarding/state read, exactly
-                                        // the pendingInitialImport pattern.
-                                        // OR-composed (delta review F1-2): a
-                                        // defensive re-delivery whose idempotency
-                                        // guard reports firstConnection=false
-                                        // must never DISARM an already-armed
-                                        // genuine signal — not arming is not
-                                        // license to clobber.
-                                        firstConnectionImport = session.firstConnectionImport == true || mergeOutcome.firstConnection,
+                                // Success outcome INTO the flow record (design
+                                // D4): the one-shot import signals consumed at
+                                // the owner's next authenticated state read.
+                                // firstConnectionImport ONLY when the merge says
+                                // first-connection (eb_sessions 0 → 1; the
+                                // ever-onboarded marker flips inside the same
+                                // transaction and cannot distinguish a genuine
+                                // first connection from an ever-onboarded
+                                // reconnect on the redirect cold boot).
+                                flowRecordStore.updateOutcome(
+                                    token = record.token,
+                                    status = FlowStatus.COMPLETED,
+                                    payload = FlowRecordStore.encode(
+                                        BankAuthFlowPayload.serializer(),
+                                        staged.copy(
+                                            authError = null,
+                                            authErrorKind = null,
+                                            pendingInitialImport = true,
+                                            firstConnectionImport = mergeOutcome.firstConnection,
+                                        ),
                                     ),
                                 )
                                 // One-shot informational signal (spec:
                                 // onboarding — email-link callback route,
                                 // modified): accounts of the previous
                                 // same-bank session kept as local copies.
-                                // Stored SERVER-SIDE, in-memory (review F6
-                                // ruling: the set is merge-computed server
-                                // data — never a cookie payload; volatile
-                                // by design, the registrationInProgress
-                                // pattern); carried — and cleared — by the
-                                // next GET /api/accounts response (the
-                                // callback serves the SPA bundle, not
-                                // JSON). The bank name rides the signal
-                                // (review F4: the redirect cold boot wipes
-                                // the client's reAuthBank stash, so the
-                                // dialog's "at {bank}" copy can only come
-                                // from here — in-memory only, NEVER a
-                                // database row).
-                                MissingAccountSignalStore.store(
-                                    username = session.username,
-                                    bankName = result.aspsp?.name ?: session.stageAspspName,
+                                // Stored SERVER-SIDE (review F6 ruling: the
+                                // set is merge-computed server data); carried —
+                                // and cleared — by the next GET /api/accounts
+                                // response (the callback serves the SPA bundle,
+                                // not JSON). The bank name rides the signal
+                                // (review F4: the redirect cold boot wipes the
+                                // client's reAuthBank stash, so the dialog's
+                                // "at {bank}" copy can only come from here).
+                                MissingAccountSignalStore(database).store(
+                                    username = record.owner,
+                                    bankName = result.aspsp?.name ?: staged.aspspName,
                                     accounts = mergeOutcome.missingAccounts,
                                 )
                             } catch (e: Exception) {
                                 logger.warn("Failed to persist EB session ${result.sessionId}", e)
-                                call.sessions.set(session.copy(
-                                    authError = "Failed to persist session — please retry",
-                                    authErrorKind = "unexpected",
-                                ))
+                                fail("Failed to persist session — please retry", "unexpected")
                             }
                         }
                         is AuthorizeSessionResult.Error -> {
                             logger.warn("EB callback: authorizeSession ERROR — {}", result.message)
-                            call.sessions.set(session.copy(
-                                authError = result.message,
-                                authErrorKind = "unexpected",
-                            ))
+                            fail(result.message, "unexpected")
                         }
                     }
                 } finally {
                     client.close()
                 }
-                serveSpaBundle(call)
+                serveSpaBundle(call, sessionStorage)
             }
 
             // Error branch — OAuth error redirect (RFC 6749): `error` (+ optional
-            // `error_description`, + `state`), NO oobCode/code. Requires a valid
-            // session + state JWT; classify the error, store the raw value + kind
-            // + authorization_id in the session, log the raw error server-side
-            // (the only durable record of the raw value), then 302 to "/".
+            // `error_description`, + `state`), NO oobCode/code. Session-independent
+            // like the success branch: the failure outcome is written INTO the
+            // flow record (consume-once at the owner's next authenticated view),
+            // the raw error is logged server-side (the only durable record of
+            // the raw value), then the SPA bundle is served.
             error != null -> {
-                val session = call.sessions.get<UserSession>()
-                if (session == null) {
-                    call.respondRedirect("/")
+                val record = state?.let { flowRecordStore?.lookup(it) }
+                if (flowRecordStore == null || record == null || record.kind != FlowKind.BANK_AUTH) {
+                    // Unknown/expired token — nothing to record against; serve
+                    // the SPA (its login gate routes the user).
+                    serveSpaBundle(call, sessionStorage)
                     return@get
                 }
-                val sessionId = state?.let { stateJwt?.verify(it) }
-                if (sessionId == null || sessionId != session.username) {
-                    call.respondRedirect("/")
-                    return@get
-                }
+                val staged = runCatching {
+                    FlowRecordStore.decode(BankAuthFlowPayload.serializer(), record.payload)
+                }.getOrNull() ?: BankAuthFlowPayload()
                 val kind = classifyAuthError(error)
                 logger.warn(
                     "Enable Banking auth callback error: error={}, error_description={}, authorization_id={}",
-                    error, errorDescription, session.authorizationId,
+                    error, errorDescription, staged.authorizationId,
                 )
-                call.sessions.set(session.copy(
-                    // Raw error value + description when present (e.g. "server_error: Denied data sharing consent");
-                    // plain code when no description accompanies it.
-                    authError = listOfNotNull(error, errorDescription).joinToString(": "),
-                    authErrorKind = kind,
-                    authorizationId = session.authorizationId,
-                ))
-                call.respondRedirect("/")
+                flowRecordStore.updateOutcome(
+                    token = record.token,
+                    status = FlowStatus.FAILED,
+                    payload = FlowRecordStore.encode(
+                        BankAuthFlowPayload.serializer(),
+                        staged.copy(
+                            // Raw error value + description when present (e.g. "server_error: Denied data sharing consent");
+                            // plain code when no description accompanies it.
+                            authError = listOfNotNull(error, errorDescription).joinToString(": "),
+                            authErrorKind = kind,
+                        ),
+                    ),
+                )
+                serveSpaBundle(call, sessionStorage)
             }
 
             // Neither param — preserve the previous missing-oobCode behavior
@@ -299,7 +275,7 @@ fun Route.onboardingRoutes(
                     state, call.request.queryParameters.names(),
                 )
                 service.handleCallback(state, null)
-                serveSpaBundle(call)
+                serveSpaBundle(call, sessionStorage)
             }
         }
     }
@@ -403,18 +379,17 @@ fun Route.onboardingRoutes(
             productionOverrides = overrides,
         )) {
             is CompleteResult.Success -> {
-                // Design D8: a recorded authorization failure / authorization ID
-                // refers to the defunct application — clear the one-shot
-                // diagnostics fields so they cannot surface against the new app.
-                // The stored onboarding view position is cleared for the same
-                // reason (spec: onboarding-view-position): it refers to the
-                // defunct application's flow and must not route the user past
-                // ActivationGuide into the new application's onboarding.
+                // Design D8: a recorded authorization failure refers to the
+                // defunct application — discard the owner's unconsumed
+                // `bank_auth` flow-record outcomes so they cannot surface
+                // against the new app. The stored onboarding view position is
+                // cleared for the same reason (spec: onboarding-view-position):
+                // it refers to the defunct application's flow and must not
+                // route the user past ActivationGuide into the new
+                // application's onboarding.
+                flowRecordStore?.discardByOwnerAndKind(session.username, FlowKind.BANK_AUTH)
                 call.sessions.set(
                     session.copy(
-                        authError = null,
-                        authErrorKind = null,
-                        authorizationId = null,
                         onboardingStage = null,
                         stageAspspName = null,
                         stageAspspCountry = null,
@@ -561,12 +536,42 @@ private fun classifyAuthError(error: String): String = when (error) {
 /**
  * Serves the SPA bundle (`static/index.html` from the classpath) with 200 OK.
  * Mirrors the foundation's catch-all SPA-bundle handler in `Application.kt`.
+ *
+ * Session-timeout feedback (spec: session-management): this response is served
+ * on a full-page navigation (the bank's redirect back to the callback), so the
+ * Sessions plugin's cookie-clear on a failed load lands HERE — the browser
+ * deletes the cookie before the SPA boots, and the API-side classification
+ * can never see the expired ID. The classification therefore runs inside this
+ * handler: an expired record is pruned and the served `index.html` carries an
+ * inline script setting the SPA's expiry latch (localStorage — restored by
+ * the boot's login gate; one-shot semantics owned by the SPA).
  */
-private suspend fun serveSpaBundle(call: ApplicationCall) {
+private suspend fun serveSpaBundle(
+    call: ApplicationCall,
+    sessionStorage: SqlDelightSessionStorage? = null,
+) {
+    val sessionExpired = sessionStorage != null &&
+        call.request.cookies["bankteller-session"]?.let { sessionStorage.classifyExpired(it) } == true
     val indexHtml = call.application.environment.classLoader
         .getResourceAsStream("static/index.html")?.bufferedReader()?.readText()
     if (indexHtml != null) {
-        call.respondText(indexHtml, ContentType.Text.Html, HttpStatusCode.OK)
+        if (sessionExpired) {
+            // no-store ONLY on the latch-carrying variant (see Application.kt's
+            // root route note): per-response latch state must never come from
+            // cache; the plain variant stays cacheable for production.
+            call.response.cacheControl(CacheControl.NoStore(visibility = CacheControl.Visibility.Public))
+            call.respondText(
+                indexHtml.replace(
+                    "</head>",
+                    "<script>try{window.localStorage.setItem('bankteller_session_expired_ttl','" +
+                        sessionStorage!!.sessionTtlMinutes + "')}catch(e){}</script></head>",
+                ),
+                ContentType.Text.Html,
+                HttpStatusCode.OK,
+            )
+        } else {
+            call.respondText(indexHtml, ContentType.Text.Html, HttpStatusCode.OK)
+        }
     } else {
         call.respondText("Not found", ContentType.Text.Plain, HttpStatusCode.NotFound)
     }

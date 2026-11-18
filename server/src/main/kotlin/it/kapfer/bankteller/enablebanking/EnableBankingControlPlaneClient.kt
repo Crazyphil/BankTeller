@@ -678,7 +678,8 @@ class EnableBankingControlPlaneClient(
      * [AspspStatusResult.Error] (and is cached for the same window).
      *
      * The idToken is obtained internally by refreshing the persisted refresh
-     * token from `system_config` (the same auth the route-level callers use).
+     * token from the `eb_application` row (the same auth the route-level
+     * callers use).
      *
      * @return [AspspStatusResult.Ok] with the per-`{brand, country, psu_type}`
      *   status map (AIS entries only, duplicates aggregated worst-of), or
@@ -688,9 +689,10 @@ class EnableBankingControlPlaneClient(
         aspspStatusCache.get("status")?.let { return it }
 
         val result = try {
-            val refreshToken = database?.systemConfigQueries
-                ?.selectValue("enable_banking_refresh_token")
+            val refreshToken = database?.ebApplicationQueries
+                ?.selectEbApplication()
                 ?.executeAsOneOrNull()
+                ?.refresh_token
             if (refreshToken.isNullOrBlank()) {
                 AspspStatusResult.Error("Enable Banking refresh token not configured")
             } else {
@@ -752,25 +754,36 @@ class EnableBankingControlPlaneClient(
     }
 
     /**
-     * Persists the (possibly rotated) Firebase refresh token to `system_config`
-     * under the key `enable_banking_refresh_token`.
+     * Persists the (possibly rotated) Firebase refresh token to the
+     * `eb_application` row's `refresh_token` column (server-side-session-
+     * storage, design D6 — replacing the former `system_config`
+     * `enable_banking_refresh_token` key).
      *
      * Called by [refreshIdToken] on success. The caller owns the full token
      * lifecycle — no route persists or clears the token separately.
      */
     private fun persistRefreshToken(token: String) {
-        database?.systemConfigQueries?.insertOrReplace("enable_banking_refresh_token", token)
+        val db = database ?: return
+        db.transaction {
+            db.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+            db.ebApplicationQueries.updateEbApplicationRefreshToken(token)
+        }
     }
 
     /**
-     * Blanks the persisted Firebase refresh token in `system_config`.
+     * Clears the persisted Firebase refresh token in the `eb_application`
+     * row's `refresh_token` column (NULL = no token).
      *
      * Called by [refreshIdToken] when the refresh token is invalid/expired/
      * revoked (non-5xx failure), so the next onboarding-state check detects the
      * missing token and routes the user to re-login.
      */
     private fun clearRefreshToken() {
-        database?.systemConfigQueries?.insertOrReplace("enable_banking_refresh_token", "")
+        val db = database ?: return
+        db.transaction {
+            db.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+            db.ebApplicationQueries.updateEbApplicationRefreshToken(null)
+        }
     }
 
     /**
@@ -778,10 +791,10 @@ class EnableBankingControlPlaneClient(
      *
      * Owns the full refresh-token lifecycle:
      *  - On success (HTTP 200): persists the (possibly rotated) `refresh_token`
-     *    from the response to `system_config` as `enable_banking_refresh_token`.
-     *  - On failure (invalid/expired/revoked — non-200, non-5xx): clears
-     *    `enable_banking_refresh_token` so the next onboarding-state check
-     *    routes the user to re-login.
+     *    from the response to the `eb_application` row's `refresh_token` column.
+     *  - On failure (invalid/expired/revoked — non-200, non-5xx): clears the
+     *    `refresh_token` column so the next onboarding-state check routes the
+     *    user to re-login.
      *  - On transient errors (network, 5xx): does NOT clear the token — it may
      *    still be valid on retry.
      *

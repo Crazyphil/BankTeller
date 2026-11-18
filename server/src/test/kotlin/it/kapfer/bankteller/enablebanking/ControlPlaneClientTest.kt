@@ -10,6 +10,7 @@ import io.ktor.client.request.*
 import io.ktor.client.request.forms.FormDataContent
 import io.ktor.client.request.forms.MultiPartFormDataContent
 import it.kapfer.bankteller.database.BankTellerDatabase
+import it.kapfer.bankteller.database.seedEbApplication
 import it.kapfer.bankteller.server.DatabaseFactory
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.*
@@ -337,7 +338,7 @@ class ControlPlaneClientTest {
     @Test
     fun `refreshIdToken parses successful response and persists new refresh token`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "old-refresh-token")
+        db.seedEbApplication(refreshToken = "old-refresh-token")
         val engine = MockEngine { request ->
             assertEquals(
                 "https://securetoken.googleapis.com/v1/token",
@@ -358,8 +359,9 @@ class ControlPlaneClientTest {
         assertEquals("new-id-token", ok.idToken)
         assertEquals("new-refresh-token", ok.refreshToken)
         assertEquals(3600L, ok.expiresIn)
-        // The (possibly rotated) refresh token must be persisted to system_config.
-        val persisted = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        // The (possibly rotated) refresh token must be persisted to the
+        // eb_application row's refresh_token column.
+        val persisted = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token
         assertEquals("new-refresh-token", persisted)
         client.close()
     }
@@ -367,7 +369,7 @@ class ControlPlaneClientTest {
     @Test
     fun `refreshIdToken returns Error on non-200 and clears stored refresh token`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-token")
+        db.seedEbApplication(refreshToken = "stored-token")
         val engine = MockEngine { request ->
             respond(
                 content = """{"error":{"message":"INVALID_REFRESH_TOKEN"}}""",
@@ -379,15 +381,15 @@ class ControlPlaneClientTest {
         assertTrue(result is IdTokenRefreshResult.Error)
         assertEquals(400, (result as IdTokenRefreshResult.Error).statusCode)
         // Invalid/expired/revoked token → cleared so the next state check routes to re-login.
-        val persisted = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
-        assertEquals("", persisted)
+        val persisted = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token
+        assertNull(persisted, "the refresh_token column is cleared (NULL = no token)")
         client.close()
     }
 
     @Test
     fun `refreshIdToken returns Error on 5xx and does NOT clear stored refresh token`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-token")
+        db.seedEbApplication(refreshToken = "stored-token")
         val engine = MockEngine { request ->
             respond(
                 content = """{"error":"Internal Server Error"}""",
@@ -399,7 +401,7 @@ class ControlPlaneClientTest {
         assertTrue(result is IdTokenRefreshResult.Error)
         assertEquals(500, (result as IdTokenRefreshResult.Error).statusCode)
         // Transient 5xx → token must NOT be cleared (may still be valid on retry).
-        val persisted = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val persisted = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token
         assertEquals("stored-token", persisted)
         client.close()
     }
@@ -407,7 +409,7 @@ class ControlPlaneClientTest {
     @Test
     fun `refreshIdToken network failure returns Error and does NOT clear stored refresh token`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "stored-token")
+        db.seedEbApplication(refreshToken = "stored-token")
         val engine = MockEngine { request ->
             throw java.io.IOException("Broken pipe")
         }
@@ -417,7 +419,7 @@ class ControlPlaneClientTest {
         assertNull((result as IdTokenRefreshResult.Error).statusCode)
         assertTrue(result.message.contains("Broken pipe"))
         // Network/transient error → token must NOT be cleared.
-        val persisted = db.systemConfigQueries.selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val persisted = db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.refresh_token
         assertEquals("stored-token", persisted)
         client.close()
     }
@@ -735,7 +737,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus parses AIS entries into per brand country psu_type map`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(refreshToken = "rt-1")
         val engine = statsEngine("""[
             {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
             {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"business","service":"AIS","status":"yellow"},
@@ -755,7 +757,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus filters out non-AIS entries`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(refreshToken = "rt-1")
         val engine = statsEngine("""[
             {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
             {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"personal","service":"PIS","status":"red"},
@@ -773,7 +775,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus aggregates duplicate keys worst-of`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(refreshToken = "rt-1")
         val engine = statsEngine("""[
             {"connector_name":"c1","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"green"},
             {"connector_name":"c2","brand":"Test Bank","country":"DE","psu_type":"personal","service":"AIS","status":"red"},
@@ -792,7 +794,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus caches result for 60 seconds`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(refreshToken = "rt-1")
         var statsRequests = 0
         val engine = MockEngine { request ->
             val url = request.url.toString()
@@ -826,7 +828,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus never throws on network failure and caches the failure`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
+        db.seedEbApplication(refreshToken = "rt-1")
         var statsRequests = 0
         val engine = MockEngine { request ->
             val url = request.url.toString()
@@ -858,7 +860,7 @@ class ControlPlaneClientTest {
     @Test
     fun `getAspspStatus returns Error when refresh token missing`() = runBlocking {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "")
+        db.seedEbApplication(refreshToken = "")
         val engine = MockEngine { request -> error("No request expected: ${request.url}") }
         val client = EnableBankingControlPlaneClient(client = HttpClient(engine), database = db)
         val result = client.getAspspStatus()

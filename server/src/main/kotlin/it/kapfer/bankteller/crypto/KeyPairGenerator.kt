@@ -82,21 +82,24 @@ class KeyPairGenerator {
 
 /**
  * Generates a fresh key pair and self-signed certificate via [KeyPairGenerator],
- * persists **only the private key** to `system_config` under
- * `enable_banking_private_key`, and returns **only the certificate PEM**
- * (public material).
+ * persists **only the private key** to the `eb_application` row's
+ * `private_key` column (server-side-session-storage, design D6 — replacing the
+ * former `system_config` `enable_banking_private_key` key), and returns
+ * **only the certificate PEM** (public material).
  *
  * By signature this function guarantees the private key is never exposed to
  * the caller — it is written straight to the database and discarded from scope.
  *
- * @param database  the application database whose `systemConfigQueries` are use.
+ * @param database  the application database whose `ebApplicationQueries` are used.
  * @return the PEM-encoded X.509 certificate (safe for transmission to EB).
  */
 fun generateAndPersist(database: BankTellerDatabase): String {
     val material = KeyPairGenerator().generate()
-    database.systemConfigQueries.insertOrReplace(
-        "enable_banking_private_key",
-        material.privateKeyPem,
-    )
+    database.transaction {
+        // The row may not exist yet (a database with no prior application keys
+        // has no eb_application row — see the 6.sqm migration).
+        database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+        database.ebApplicationQueries.updateEbApplicationPrivateKey(material.privateKeyPem)
+    }
     return material.certificatePem
 }

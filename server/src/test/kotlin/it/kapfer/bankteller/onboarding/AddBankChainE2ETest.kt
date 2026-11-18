@@ -11,6 +11,7 @@ import io.ktor.server.testing.*
 import it.kapfer.bankteller.enablebanking.*
 import it.kapfer.bankteller.module
 import it.kapfer.bankteller.server.DatabaseFactory
+import it.kapfer.bankteller.database.seedEbApplication
 import it.kapfer.bankteller.sync.BalanceSyncEngine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -185,9 +186,7 @@ class AddBankChainE2ETest {
     /** Seeds the system_config rows the auth route reads. */
     private fun seedDb() {
         val db = DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "test-app-id")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt-1")
-        db.systemConfigQueries.insertOrReplace("enable_banking_redirect_url", "https://app.example.com/enable-banking-callback")
+        db.seedEbApplication(applicationId = "test-app-id", refreshToken = "rt-1", redirectUrl = "https://app.example.com/enable-banking-callback")
     }
 
     /** The exact amount a uid's balance fetch returns (distinguishes persisted values). */

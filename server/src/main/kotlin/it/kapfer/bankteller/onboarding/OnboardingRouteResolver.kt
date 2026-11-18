@@ -100,6 +100,14 @@ data class OnboardingRouteInput(
     val stageBankKnown: Boolean,
     val stageBankLinked: Boolean = false,
     val sandboxEnvironment: Boolean = false,
+    /**
+     * A live email-link onboarding flow record exists for this owner
+     * (manual-verification 8.10): the user has started onboarding and the
+     * flow is mid-flight (pending, callback-received, or validated) — the
+     * durable record IS the server-side truth that the user is past email
+     * entry, even before the refresh token is persisted at completion.
+     */
+    val emailLinkFlowActive: Boolean = false,
 )
 
 /**
@@ -181,7 +189,17 @@ fun resolveOnboardingRoute(input: OnboardingRouteInput): String {
     }
 
     // 1. No refresh token, or a refresh token without an application id —
-    // the user must (re-)authenticate with Enable Banking.
+    // the user must (re-)authenticate with Enable Banking — UNLESS a live
+    // email-link flow record exists (manual-verification 8.10): the user
+    // already entered their email and clicked the link; the durable record
+    // (captured oobCode, cached tokens) IS the server-side truth that they
+    // are mid-flow. Routing them back to email entry would orphan the live
+    // record and force restarting a flow the server knows is further ahead
+    // — the SPA routes to the registration-review continuation instead (the
+    // wait/complete endpoints resolve the rest on the record).
+    if (input.emailLinkFlowActive) {
+        return OnboardingRoute.REGISTRATION_REVIEW
+    }
     if (input.requiresRelogin || !input.applicationIdPresent) {
         return OnboardingRoute.EMAIL_ENTRY
     }

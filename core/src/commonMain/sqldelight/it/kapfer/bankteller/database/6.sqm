@@ -1,0 +1,113 @@
+-- Migration 6 -> 7: server-side session storage, persisted flow records, and
+-- the typed Enable Banking application row (server-side-session-storage,
+-- design D1/D2/D4/D5/D6).
+--
+-- NEW additive tables only — no existing table is altered by it:
+--   * `sessions`       — one row per live login session (opaque-ID cookie; the
+--                        serialized flow-state payload lives in one TEXT
+--                        column, D1). `expires_at` is sliding (D2).
+--   * `flow_records`   — one row per in-flight redirect flow (`bank_auth` |
+--                        `email_link`); the OAuth `state` token is the key and
+--                        the record carries the kind-specific JSON payload and
+--                        the callback outcome (D3/D4/D5).
+--   * `eb_application` — the EB application state as one typed row, replacing
+--                        the six `system_config` application keys (D6).
+--
+-- Idempotent where possible: CREATE TABLE/INDEX IF NOT EXISTS make re-running
+-- the DDL safe on databases where the objects already exist (same rationale as
+-- 2.sqm/3.sqm — DatabaseFactory.init() may re-run migrations on a user_version
+-- = 0 database with a partially present schema), and this migration performs
+-- no ALTER TABLE (nothing to guard against a duplicate column).
+--
+-- Opportunistic data copy (task 1.2 / D6): the six application keys
+-- (`enable_banking_application_id`, `enable_banking_private_key`,
+-- `enable_banking_refresh_token`, `enable_banking_email`,
+-- `enable_banking_redirect_url`, `ever_onboarded`) are copied into the single
+-- `eb_application` row when present, then deleted together with the retired
+-- `enable_banking_previously_active` key. `jwt_signing_key` and `password_hash`
+-- stay — the database spec pins `system_config` to exactly those two rows once
+-- this migration has run. The copy inserts a row ONLY when at least one of the
+-- six keys exists AND no `eb_application` row does yet, so a re-run (or a
+-- database that already carries a row) never duplicates or overwrites it; the
+-- deletion is a no-op once the keys are gone.
+--
+-- `ever_onboarded` was stored as the string "true" in `system_config` (its
+-- absence meant "never onboarded"); the typed column is the INTEGER marker,
+-- so the legacy value is translated here (1 = set, 0 = explicitly unset).
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY NOT NULL,
+    username TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sessions_username_idx ON sessions(username);
+
+CREATE TABLE IF NOT EXISTS flow_records (
+    state_token TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS flow_records_owner_idx ON flow_records(owner);
+
+CREATE TABLE IF NOT EXISTS eb_application (
+    id INTEGER PRIMARY KEY,
+    application_id TEXT,
+    private_key TEXT,
+    refresh_token TEXT,
+    email TEXT,
+    redirect_url TEXT,
+    ever_onboarded INTEGER,
+    missing_accounts TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- Opportunistic copy: one INSERT ... SELECT reads system_config once and
+-- produces exactly one output row (aggregate without GROUP BY). MAX(...) picks
+-- the single matching value or NULL (system_config.key is the primary key, so
+-- at most one row matches each CASE); HAVING COUNT(*) > 0 skips the insert
+-- entirely when none of the six keys is present anymore.
+-- ---------------------------------------------------------------------------
+INSERT INTO eb_application(application_id, private_key, refresh_token, email, redirect_url, ever_onboarded, missing_accounts)
+SELECT
+    MAX(CASE WHEN key = 'enable_banking_application_id' THEN value END),
+    MAX(CASE WHEN key = 'enable_banking_private_key' THEN value END),
+    MAX(CASE WHEN key = 'enable_banking_refresh_token' THEN value END),
+    MAX(CASE WHEN key = 'enable_banking_email' THEN value END),
+    MAX(CASE WHEN key = 'enable_banking_redirect_url' THEN value END),
+    CASE MAX(CASE WHEN key = 'ever_onboarded' THEN value END)
+        WHEN 'true' THEN 1
+        WHEN 'false' THEN 0
+        ELSE NULL
+    END,
+    NULL
+FROM system_config
+WHERE key IN (
+    'enable_banking_application_id',
+    'enable_banking_private_key',
+    'enable_banking_refresh_token',
+    'enable_banking_email',
+    'enable_banking_redirect_url',
+    'ever_onboarded'
+)
+GROUP BY NULL
+HAVING COUNT(*) > 0
+   AND NOT EXISTS (SELECT 1 FROM eb_application);
+
+DELETE FROM system_config
+WHERE key IN (
+    'enable_banking_application_id',
+    'enable_banking_private_key',
+    'enable_banking_refresh_token',
+    'enable_banking_email',
+    'enable_banking_redirect_url',
+    'ever_onboarded',
+    'enable_banking_previously_active'
+);

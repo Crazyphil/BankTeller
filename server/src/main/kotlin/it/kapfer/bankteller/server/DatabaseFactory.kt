@@ -85,8 +85,9 @@ object DatabaseFactory {
             //   3. Nothing exists — genuinely fresh, create() from scratch.
             //
             // Since migration 4 (bic + in_consent + identification_hash
-            // columns) and migration 5 (sync_outcomes table + rate_limit_skip
-            // column) the FULL schema can no longer be distinguished by table
+            // columns), migration 5 (sync_outcomes table + rate_limit_skip
+            // column) and migration 6 (sessions/flow_records/eb_application
+            // tables) the FULL schema can no longer be distinguished by table
             // presence alone — a database carrying all the legacy tables may
             // still be at a PRIOR version. The ladder therefore ALSO checks the
             // migration-added columns/table: only a database with ALL of them
@@ -114,29 +115,42 @@ object DatabaseFactory {
             val hasInConsent = columnExists("accounts", "in_consent")
             val hasIdentificationHash = columnExists("accounts", "identification_hash")
             val hasRateLimitSkip = columnExists("eb_sessions", "rate_limit_skip")
+            // Migration 6 (server-side-session-storage) adds three tables and
+            // nothing else — table presence alone distinguishes it.
+            val hasSessions = tableExists("sessions")
+            val hasFlowRecords = tableExists("flow_records")
+            val hasEbApplication = tableExists("eb_application")
             currentVersion = when {
-                // Full current schema INCLUDING all migration-4 columns AND
-                // migration 5's table + column → latest.
+                // Full current schema INCLUDING migration 6's three tables →
+                // latest.
+                hasEbSessions && hasAccounts && hasBalances && hasSyncLog &&
+                    hasBic && hasInConsent && hasIdentificationHash &&
+                    hasSyncOutcomes && hasRateLimitSkip &&
+                    hasSessions && hasFlowRecords && hasEbApplication ->
+                    BankTellerDatabase.Schema.version
+                // Migration-5 artifacts present, migration 6's tables absent:
+                // the database predates migration 6 — infer the PRIOR version
+                // so migration 6 applies.
                 hasEbSessions && hasAccounts && hasBalances && hasSyncLog &&
                     hasBic && hasInConsent && hasIdentificationHash &&
                     hasSyncOutcomes && hasRateLimitSkip ->
-                    BankTellerDatabase.Schema.version
+                    BankTellerDatabase.Schema.version - 1
                 // All four tables + the migration-4 columns, but WITHOUT the
                 // migration-5 artifacts: the database predates migration 5 —
                 // infer the PRIOR version so migration 5 applies.
                 hasEbSessions && hasAccounts && hasBalances && hasSyncLog &&
                     hasBic && hasInConsent && hasIdentificationHash ->
-                    BankTellerDatabase.Schema.version - 1
+                    BankTellerDatabase.Schema.version - 2
                 // All four tables but WITHOUT the migration-4 columns: the
                 // database predates migration 4 — infer the PRIOR version so
                 // migration 4 (the ALTERs) applies.
                 hasEbSessions && hasAccounts && hasBalances && hasSyncLog ->
-                    BankTellerDatabase.Schema.version - 2
+                    BankTellerDatabase.Schema.version - 3
                 // eb_sessions + accounts but no balances/sync_log: the database
                 // predates migration 3 — infer the PRIOR version so the pending
                 // migration applies (not "assume latest").
-                hasEbSessions && hasAccounts -> BankTellerDatabase.Schema.version - 3
-                hasSystemConfig -> BankTellerDatabase.Schema.version - 4
+                hasEbSessions && hasAccounts -> BankTellerDatabase.Schema.version - 4
+                hasSystemConfig -> BankTellerDatabase.Schema.version - 5
                 else -> 0
             }
         }
@@ -149,9 +163,10 @@ object DatabaseFactory {
         // Boot-time schema sanity check (loud path 3): a database stamped at
         // Schema.version claims to be current. If it is missing any of the
         // current schema's distinguishing objects — migration-4 columns,
-        // migration 5's sync_outcomes table or rate_limit_skip column — it is
+        // migration 5's sync_outcomes table or rate_limit_skip column,
+        // migration 6's sessions/flow_records/eb_application tables — it is
         // an intermediate pre-release state (e.g. the previous draft of
-        // migration 4/5) — the version-inference ladder only runs for
+        // migration 4/5/6) — the version-inference ladder only runs for
         // user_version = 0, so no migration will ever repair it, and without
         // this check it would fail DEFERRED with a raw SQLite "no such
         // column/table" inside the first sync or merge. Exit loudly and point
@@ -163,6 +178,9 @@ object DatabaseFactory {
                 "accounts.identification_hash".takeUnless { columnExists("accounts", "identification_hash") },
                 "eb_sessions.rate_limit_skip".takeUnless { columnExists("eb_sessions", "rate_limit_skip") },
                 "sync_outcomes".takeUnless { tableExists("sync_outcomes") },
+                "sessions".takeUnless { tableExists("sessions") },
+                "flow_records".takeUnless { tableExists("flow_records") },
+                "eb_application".takeUnless { tableExists("eb_application") },
             )
             if (missingObjects.isNotEmpty()) {
                 throw IllegalStateException(

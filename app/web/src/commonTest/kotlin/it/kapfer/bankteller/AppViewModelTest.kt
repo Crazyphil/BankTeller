@@ -43,6 +43,10 @@ class AppViewModelTest {
     @BeforeTest
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
+        // The session-expiry latch persists to the browser's real localStorage
+        // (these commonTest cases run in the Karma browser). Clear it so one
+        // test's latch can never leak into the next.
+        localStorageRemove(AppViewModel.SESSION_EXPIRED_MARKER_KEY)
         fakeApi = FakeApiClient()
         vm = AppViewModel(apiClient = fakeApi)
     }
@@ -54,6 +58,8 @@ class AppViewModelTest {
         // viewModelScope coroutines don't auto-cancel between test cases.
         vm.dispose()
         Dispatchers.resetMain()
+        // Leave no latched marker behind for the next browser-test page.
+        localStorageRemove(AppViewModel.SESSION_EXPIRED_MARKER_KEY)
     }
 
     // ---------------------------------------------------------------
@@ -559,6 +565,100 @@ class AppViewModelTest {
         assertNull(vm.onboardingStateToken)
         assertNull(vm.onboardingDerivedRedirectUrl)
         assertEquals("", vm.onboardingEmail)
+    }
+
+    // ---------------------------------------------------------------
+    // Session-expiry latch (spec: session-management — session-timeout
+    // feedback; server-side-session-storage). The latch is one-shot: set by the
+    // 401 catch-all (or restored from localStorage on boot), consumed by the
+    // login screen's panel.
+    // ---------------------------------------------------------------
+
+    @Test
+    fun sessionExpiry_handleSessionExpired_latchesTtlAndRoutesToLogin() = runTest(testDispatcher) {
+        vm.handleSessionExpired("session_expired", 15L)
+        advanceUntilIdle()
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertFalse(vm.isAuthenticated)
+        // Persisted for a page instance that dies before the panel renders
+        // (the callback's full-page redirect; a background tab).
+        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun sessionExpiry_401WithoutReason_routesToLoginButPreservesTheLatch() = runTest(testDispatcher) {
+        vm.handleSessionExpired("session_expired", 30L)
+        // A parallel poll's plain 401 (the server-side reason is one-shot and
+        // already consumed by the first response) must not clear the latch.
+        vm.handleSessionExpired(null, null)
+        advanceUntilIdle()
+        assertEquals(30L, vm.sessionExpiredTtlMinutes, "a reasonless 401 must not overwrite the latch")
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals("30", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun sessionExpiry_unauthorizedHookIsWiredToHandleSessionExpired() = runTest(testDispatcher) {
+        // The ApiClient's 401 interceptor invokes the view model's late-bound
+        // hook; constructing the view model must install it (an unset hook would
+        // leave every 401 without routing).
+        val hook = fakeApi.onUnauthorized
+        assertNotNull(hook, "AppViewModel must wire the 401 catch-all onto its ApiClient")
+        hook.invoke("session_expired", 45L)
+        assertEquals(45L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+    }
+
+    @Test
+    fun sessionExpiry_checkAuthRestoresThePersistedLatch() = runTest(testDispatcher) {
+        // A previous page instance latched the reason; this boot must render it.
+        localStorageSet(AppViewModel.SESSION_EXPIRED_MARKER_KEY, "20")
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+        vm.checkAuth()
+        advanceUntilIdle()
+        assertEquals(20L, vm.sessionExpiredTtlMinutes, "the latch survives a reload via localStorage")
+        assertEquals(Screen.Login, vm.currentScreen)
+    }
+
+    @Test
+    fun sessionExpiry_dismissClearsTheLatchAndThePersistedMarker() = runTest(testDispatcher) {
+        vm.handleSessionExpired("session_expired", 15L)
+        vm.dismissSessionExpiredPanel()
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(
+            localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY),
+            "dismissal is the one-shot consumption — no stale marker may survive",
+        )
+    }
+
+    @Test
+    fun sessionExpiry_successfulLoginClearsTheLatch() = runTest(testDispatcher) {
+        vm.handleSessionExpired("session_expired", 15L)
+        fakeApi.nextLoginResult = LoginResult.Success
+        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false)
+        fakeApi.nextOnboardingState = OnboardingState(
+            requiresRelogin = false,
+            linkingCompleted = false,
+            authCompleted = false,
+            authError = null,
+            selectedBank = null,
+        )
+        vm.login("admin", "changeme")
+        advanceUntilIdle()
+        assertNull(vm.sessionExpiredTtlMinutes, "a successful re-login consumes the latch")
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun sessionExpiry_logoutClearsTheLatch() = runTest(testDispatcher) {
+        vm.handleSessionExpired("session_expired", 15L)
+        vm.logout()
+        advanceUntilIdle()
+        // A deliberate logout shows no panel — timeout feedback is unrelated.
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertEquals(Screen.Login, vm.currentScreen)
     }
 
     // ---------------------------------------------------------------

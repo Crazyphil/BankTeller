@@ -13,6 +13,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.testApplication
+import it.kapfer.bankteller.database.seedEbApplication
 import it.kapfer.bankteller.enablebanking.ApplicationVerificationResult
 import it.kapfer.bankteller.enablebanking.CredentialResult
 import it.kapfer.bankteller.enablebanking.EnableBankingClient
@@ -187,9 +188,7 @@ class OnboardingFlowE2ETest {
         dbFile.deleteOnExit()
         System.setProperty("database.path", dbFile.absolutePath)
         val db = it.kapfer.bankteller.server.DatabaseFactory.init()
-        db.systemConfigQueries.insertOrReplace("enable_banking_application_id", "test-app-123")
-        db.systemConfigQueries.insertOrReplace("enable_banking_private_key", "dummy-key")
-        db.systemConfigQueries.insertOrReplace("enable_banking_refresh_token", "rt")
+        db.seedEbApplication(applicationId = "test-app-123", privateKey = "dummy-key", refreshToken = "rt")
 
         // CP list: app present, inactive, never linked (no whitelisted_accounts).
         val mockEngine = MockEngine { request ->

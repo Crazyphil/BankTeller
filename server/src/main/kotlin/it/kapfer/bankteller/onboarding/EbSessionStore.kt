@@ -49,30 +49,42 @@ class EbSessionStore(private val database: BankTellerDatabase) {
     fun hasAnySession(): Boolean =
         database.ebSessionsQueries.hasAnySession().executeAsOne()
 
-    companion object {
-        /**
-         * `system_config` key for the ever-onboarded marker (spec: database —
-         * ever-onboarded marker). Routing state, NOT progress authority:
-         * onboarding completion remains "at least one `eb_sessions` row"; this
-         * marker only keys the resolver's dashboard rung, so removing the last
-         * connection never regresses an ever-onboarded user to the wizard.
-         * Value is `"true"` when set; the key's absence means "never onboarded"
-         * unless a session row exists (backfill-on-read, see
-         * [isEverOnboarded]).
-         */
-        const val EVER_ONBOARDED_KEY = "ever_onboarded"
+    /**
+     * Reads the row's ever-onboarded marker (column `ever_onboarded`): `1` =
+     * set, `0`/NULL = not set. A missing row means "not set".
+     */
+    private fun everOnboardedColumn(): Long? =
+        database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()?.ever_onboarded
+
+    /**
+     * Writes the row's ever-onboarded marker (must run inside the caller's
+     * transaction). Ensures the single row exists first (a database without
+     * application keys has no row — see the 6.sqm migration).
+     */
+    private fun setEverOnboardedColumn(value: Long) {
+        database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+        database.ebApplicationQueries.updateEbApplicationEverOnboarded(value)
     }
 
     /**
      * True once the user has EVER completed onboarding — the persisted marker
-     * is set, or (backfill-on-read for users who authorized before the marker
-     * existed) at least one `eb_sessions` row exists. Survives connection
-     * removal; cleared only by the re-registration purge
-     * ([clearEverOnboarded]).
+     * is set (column `ever_onboarded` = 1), or (backfill-on-read for users who
+     * authorized before the marker existed) at least one `eb_sessions` row
+     * exists. Survives connection removal; cleared only by the
+     * re-registration purge ([clearEverOnboarded]).
+     *
+     * Backfill-on-read (preserved from the `system_config` era): when a session
+     * row exists but the marker is not set, the marker is written now.
      */
-    fun isEverOnboarded(): Boolean =
-        database.systemConfigQueries.selectValue(EVER_ONBOARDED_KEY).executeAsOneOrNull() == "true" ||
-            hasAnySession()
+    fun isEverOnboarded(): Boolean {
+        if (everOnboardedColumn() == 1L) return true
+        if (!hasAnySession()) return false
+        // Sessions exist without the marker → onboarded (backfill for
+        // pre-change databases); persist the marker so a later remove-all
+        // keeps the user onboarded.
+        database.transaction { setEverOnboardedColumn(1L) }
+        return true
+    }
 
     /**
      * Clears the ever-onboarded marker — called ONLY by the re-registration
@@ -80,7 +92,8 @@ class EbSessionStore(private val database: BankTellerDatabase) {
      * point). The caller runs inside its purge transaction.
      */
     fun clearEverOnboarded() {
-        database.systemConfigQueries.deleteValue(EVER_ONBOARDED_KEY)
+        database.ebApplicationQueries.insertEbApplicationRowIfAbsent()
+        database.ebApplicationQueries.updateEbApplicationEverOnboarded(0L)
     }
 
     /**
@@ -174,8 +187,8 @@ class EbSessionStore(private val database: BankTellerDatabase) {
             // the marker is already set — the rewrite is a harmless no-op).
             // Post-re-registration connects still fire (the purge clears
             // the marker — the user is genuinely re-onboarding).
-            val markerPresent = database.systemConfigQueries
-                .selectValue(EVER_ONBOARDED_KEY).executeAsOneOrNull() == "true"
+            val markerPresent = database.ebApplicationQueries
+                .selectEbApplication().executeAsOneOrNull()?.ever_onboarded == 1L
             if (firstSessionEver && !markerPresent) {
                 firstConnection = true
             }
@@ -190,7 +203,12 @@ class EbSessionStore(private val database: BankTellerDatabase) {
                 bic = bic,
             )
             if (firstSessionEver) {
-                database.systemConfigQueries.insertOrReplace(EVER_ONBOARDED_KEY, "true")
+                // The marker write joins THIS merge transaction (the same
+                // all-or-nothing boundary the `system_config` key write had):
+                // the row update is a plain per-column UPDATE on the same
+                // connection, so it is committed/rolled back with the session
+                // rows.
+                setEverOnboardedColumn(1L)
             }
             // insertSession returns the affected-row count, not the rowid — look
             // up the autoincrement id via the UNIQUE session_id.
@@ -362,6 +380,10 @@ class EbSessionStore(private val database: BankTellerDatabase) {
             for (accountId in accountIds) {
                 if (database.ebSessionsQueries.deleteLocalCopyAccountById(accountId).value > 0L) {
                     database.balancesQueries.deleteBalancesByAccountIds(listOf(accountId))
+                    // Outcome rows go with the account (manual-verification 8.10
+                    // audit finding — same orphan rationale as the session
+                    // cleanup: deleted accounts leave no outcome history).
+                    database.syncOutcomesQueries.deleteOutcomesByAccountIds(listOf(accountId))
                     deleted.add(accountId)
                 }
             }

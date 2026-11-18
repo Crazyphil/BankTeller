@@ -73,7 +73,7 @@ fun Route.syncRoutes(
         // The bank name rides the signal (review F4) and shares its one-shot
         // lifetime.
         val userSession = call.sessions.get<UserSession>()
-        val missingSignal = userSession?.let { MissingAccountSignalStore.take(it.username) }
+        val missingSignal = userSession?.let { MissingAccountSignalStore(engine.database).take(it.username) }
         call.respond(
             buildAccountsResponse(
                 engine,

@@ -21,6 +21,9 @@ import it.kapfer.bankteller.enablebanking.IdTokenRefreshResult
 import it.kapfer.bankteller.enablebanking.LinkAccountsResult
 import it.kapfer.bankteller.enablebanking.StartAuthResult
 import it.kapfer.bankteller.enablebanking.WhitelistedAccountEntry
+import it.kapfer.bankteller.server.FlowRecordStore
+import it.kapfer.bankteller.server.FlowKind
+import it.kapfer.bankteller.server.FlowStatus
 import it.kapfer.bankteller.server.UserSession
 import it.kapfer.bankteller.util.TtlCache
 import kotlinx.serialization.Serializable
@@ -234,12 +237,11 @@ private suspend fun fetchWhitelist(
         whitelistFailureCache.get("whitelist")?.let { return null }
     }
 
-    val refreshToken = database.systemConfigQueries
-        .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+    val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+    val refreshToken = app?.refresh_token
     if (refreshToken.isNullOrBlank()) return null
 
-    val applicationId = database.systemConfigQueries
-        .selectValue("enable_banking_application_id").executeAsOneOrNull()
+    val applicationId = app.application_id
     if (applicationId.isNullOrBlank()) return null
 
     val idToken = when (val refresh = controlPlaneClient.refreshIdToken(refreshToken)) {
@@ -311,7 +313,7 @@ fun Route.accountLinkingRoutes(
     database: BankTellerDatabase,
     controlPlaneClient: EnableBankingControlPlaneClient,
     enableBankingClientFactory: () -> EnableBankingClient,
-    stateJwt: StateJwt,
+    flowRecordStore: FlowRecordStore,
     onboardingService: OnboardingService,
 ) {
     val ebSessionStore = EbSessionStore(database)
@@ -401,10 +403,9 @@ fun Route.accountLinkingRoutes(
             )
         }
 
-        val applicationId = database.systemConfigQueries
-            .selectValue("enable_banking_application_id").executeAsOneOrNull()
-        val refreshToken = database.systemConfigQueries
-            .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+        val applicationId = app?.application_id
+        val refreshToken = app?.refresh_token
         if (applicationId.isNullOrBlank() || refreshToken.isNullOrBlank()) {
             return@post call.respond(
                 HttpStatusCode.ServiceUnavailable,
@@ -486,13 +487,6 @@ fun Route.accountLinkingRoutes(
         val session = call.sessions.get<UserSession>()
             ?: return@post call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
 
-        // Clear any stored auth_error + auth_error_kind at the start of the
-        // request — the user is starting a fresh attempt; the old error must not
-        // follow them (D9). The authorization_id is left intact until a new
-        // startAuth succeeds (it is overwritten below).
-        val cleanSession = session.copy(authError = null, authErrorKind = null)
-        call.sessions.set(cleanSession)
-
         val request = call.receive<AuthRequest>()
 
         if (request.psu_type !in listOf("personal", "business")) {
@@ -502,8 +496,8 @@ fun Route.accountLinkingRoutes(
             )
         }
 
-        val redirectUrl = database.systemConfigQueries
-            .selectValue("enable_banking_redirect_url").executeAsOneOrNull()
+        val redirectUrl = database.ebApplicationQueries
+            .selectEbApplication().executeAsOneOrNull()?.redirect_url
         if (redirectUrl.isNullOrBlank()) {
             return@post call.respond(
                 HttpStatusCode.ServiceUnavailable,
@@ -531,7 +525,27 @@ fun Route.accountLinkingRoutes(
             val validUntil = Instant.now()
                 .plusSeconds(aspsp.maximumConsentValidity)
                 .toString() // Instant.toString() is RFC3339/ISO-8601 UTC
-            val state = stateJwt.sign(session.username)
+
+            // Supersede (design D4): a new attempt discards the owner's
+            // unconsumed `bank_auth` records — queued outcomes AND any
+            // in-flight pending attempt. The pending outcome always refers to
+            // the latest attempt only; a superseded attempt's token must not
+            // complete either.
+            flowRecordStore.discardByOwnerAndKind(session.username, FlowKind.BANK_AUTH)
+
+            // The `state` parameter is an opaque flow-record key (design D3):
+            // a fresh 256-bit token; the record stages the ASPSP logo URL and
+            // BIC (from the already-fetched list — the authorize response's
+            // ASPSP schema cannot supply them) plus the authorization_id for
+            // the callback's merge and the failure diagnostics.
+            val state = flowRecordStore.insert(
+                owner = session.username,
+                kind = FlowKind.BANK_AUTH,
+                payload = FlowRecordStore.encode(
+                    BankAuthFlowPayload.serializer(),
+                    BankAuthFlowPayload(aspspLogo = aspsp.logo, aspspBic = aspsp.bic.takeIf { it.isNotBlank() }),
+                ),
+            ).token
 
             when (val result = client.startAuth(
                 aspspName = request.aspsp_name,
@@ -542,22 +556,31 @@ fun Route.accountLinkingRoutes(
                 redirectUrl = redirectUrl,
             )) {
                 is StartAuthResult.Ok -> {
-                    // Store the authorization_id in the session — the only key
-                    // into EB's control-panel request logs for diagnosing a
-                    // failed authorization (design D2). Overwritten on every new
-                    // attempt; it always refers to the current attempt only.
-                    // Also write the onboarding view position (spec:
-                    // onboarding-view-position): the user is now on the
-                    // authorization step with this bank triple.
+                    // Stage the authorization_id into the flow record (the
+                    // only key into EB's control-panel request logs for
+                    // diagnosing a failed attempt — attempt-scoped, this
+                    // record only) and write the onboarding view position
+                    // (spec: onboarding-view-position): the user is now on
+                    // the authorization step with this bank triple.
+                    flowRecordStore.updatePayload(
+                        token = state,
+                        payload = FlowRecordStore.encode(
+                            BankAuthFlowPayload.serializer(),
+                            BankAuthFlowPayload(
+                                aspspLogo = aspsp.logo,
+                                aspspBic = aspsp.bic.takeIf { it.isNotBlank() },
+                                authorizationId = result.authorizationId,
+                                aspspName = request.aspsp_name,
+                                aspspCountry = request.aspsp_country,
+                            ),
+                        ),
+                    )
                     call.sessions.set(
-                        cleanSession.copy(
-                            authorizationId = result.authorizationId,
+                        session.copy(
                             onboardingStage = OnboardingStage.AUTH_PROGRESS,
                             stageAspspName = request.aspsp_name,
                             stageAspspCountry = request.aspsp_country,
                             stagePsuType = request.psu_type,
-                            stageAspspLogo = aspsp.logo,
-                            stageAspspBic = aspsp.bic.takeIf { it.isNotBlank() },
                         ),
                     )
                     call.respond(buildJsonObject {
@@ -590,16 +613,15 @@ fun Route.accountLinkingRoutes(
         val country = call.request.queryParameters["country"]
 
         // 503 when Enable Banking is not configured (missing refresh token / app id).
-        val refreshToken = database.systemConfigQueries
-            .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+        val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+        val refreshToken = app?.refresh_token
         if (refreshToken.isNullOrBlank()) {
             return@get call.respond(
                 HttpStatusCode.ServiceUnavailable,
                 mapOf("error" to "Enable Banking refresh token not configured"),
             )
         }
-        val applicationId = database.systemConfigQueries
-            .selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val applicationId = app.application_id
         if (applicationId.isNullOrBlank()) {
             return@get call.respond(
                 HttpStatusCode.ServiceUnavailable,
@@ -635,7 +657,7 @@ fun Route.accountLinkingRoutes(
         // No stored sessionid, no stored base URL, or no stored stage →
         // `unavailable` WITHOUT contacting EB (spec: linking-session-polling
         // scenario "No stored sessionid or base URL degrades to unavailable" —
-        // a cookie issued before this change, or no stored stage).
+        // no sessionid/base URL stored, or no stored stage).
         val sessionid = session.sessionid
         val baseUrl = session.stageSessionBaseUrl
         if (session.onboardingStage != OnboardingStage.LINKING_PROGRESS ||
@@ -763,10 +785,9 @@ fun Route.accountLinkingRoutes(
         val session = call.sessions.get<UserSession>()
             ?: return@get call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
 
-        val refreshToken = database.systemConfigQueries
-            .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
-        val applicationId = database.systemConfigQueries
-            .selectValue("enable_banking_application_id").executeAsOneOrNull()
+        val app = database.ebApplicationQueries.selectEbApplication().executeAsOneOrNull()
+        val refreshToken = app?.refresh_token
+        val applicationId = app?.application_id
 
         // Cached whitelist read (60 s positive / 10 s failure TTL). On error treat
         // as null — conservative: linking_completed=false, selected_bank=null.
@@ -833,7 +854,6 @@ fun Route.accountLinkingRoutes(
         // routing state derived as marker-present OR sessions-exist
         // (backfill-on-read), resolved here so the resolver stays pure.
         val everOnboarded = ebSessionStore.isEverOnboarded()
-        val authError = session.authError
 
         // Cached control-plane application-state derivation (30 s TTL) — the
         // same source the resolver consumes. enableBankingConfigured=false or a
@@ -844,6 +864,64 @@ fun Route.accountLinkingRoutes(
         // derivation; a missing, blank, or unrecognized environment is never
         // guessed as sandbox.
         val sandboxEnvironment = status.environment == Environment.SANDBOX.name
+
+        // Flow-record outcome consumption (design D4, consume-once): the
+        // owner's unconsumed `bank_auth` outcomes — success (import signals)
+        // or failure (auth diagnostics) — surface exactly here, at the next
+        // authenticated view. Newest first; older attempts were already
+        // discarded by the supersede semantics at each new POST /api/auth.
+        val outcomes = flowRecordStore.findUnconsumedOutcomes(session.username, FlowKind.BANK_AUTH)
+        val outcome = outcomes.firstOrNull()
+        val outcomePayload = outcome?.let {
+            runCatching { FlowRecordStore.decode(BankAuthFlowPayload.serializer(), it.payload) }.getOrNull()
+        }
+        val authError = outcomePayload?.authError
+        val authErrorKind = outcomePayload?.authErrorKind
+        // The attempt-scoped authorization_id: from the consumed outcome when
+        // one exists, otherwise from the owner's latest live record (an
+        // in-flight attempt's id — the key into EB's control-panel request
+        // logs while the attempt is running).
+        val authorizationId = outcomePayload?.authorizationId
+            ?: flowRecordStore.findLatestByOwnerAndKind(session.username, FlowKind.BANK_AUTH)
+                ?.let {
+                    runCatching { FlowRecordStore.decode(BankAuthFlowPayload.serializer(), it.payload) }.getOrNull()
+                }?.authorizationId
+        val pendingInitialImport = outcomePayload?.pendingInitialImport == true
+        val firstConnectionImport = outcomePayload?.firstConnectionImport == true
+
+        // Consume the outcome (delete the record — consume-once) and clear the
+        // stored view-position stage in the same step (spec:
+        // onboarding-view-position — the clearing actor is the
+        // outcome-consumption step; the callback never touches a session).
+        // The response below reports the POST-consumption session: the stage
+        // reads and the resolver input come from the cleared record.
+        var currentSession = session
+        if (outcome != null) {
+            flowRecordStore.consumeOutcome(outcome.token, session.username, FlowKind.BANK_AUTH)
+            // The stage clears on the SUCCESS outcome only (spec:
+            // onboarding-view-position — the auth-callback success path
+            // clears the stage; the delta ties the clearing actor to the
+            // success path). A FAILURE outcome keeps the stored stage: the
+            // retry affordances need it — the SPA's "Continue to your bank"
+            // (never-onboarded, auth_progress failure panel) and the
+            // dashboard notice's direct re-authorization retry
+            // (ever-onboarded) both key on stage_bank incl. psu_type, which
+            // is exactly the session record's stage triple. Pre-change, the
+            // callback's error branch preserved the stage fields for the
+            // same reason.
+            val outcomeIsSuccess = outcomePayload?.authError == null
+            if (outcomeIsSuccess) {
+                currentSession = session.copy(
+                    onboardingStage = null,
+                    stageAspspName = null,
+                    stageAspspCountry = null,
+                    stagePsuType = null,
+                    sessionid = null,
+                    stageSessionBaseUrl = null,
+                )
+                call.sessions.set(currentSession)
+            }
+        }
 
         // auth_failed: an auth error is only meaningful once linking completed
         // (or the application is sandbox, which skips linking) and the user
@@ -868,12 +946,12 @@ fun Route.accountLinkingRoutes(
         // resolved server-side below. stage_bank requires a non-blank triple
         // (bank_selection carries none by design).
         val stageBankKnown =
-            !session.stageAspspName.isNullOrBlank() && !session.stageAspspCountry.isNullOrBlank()
-        val stageBank = if (session.onboardingStage != null && stageBankKnown) {
+            !currentSession.stageAspspName.isNullOrBlank() && !currentSession.stageAspspCountry.isNullOrBlank()
+        val stageBank = if (currentSession.onboardingStage != null && stageBankKnown) {
             buildJsonObject {
-                put("aspsp_name", session.stageAspspName)
-                put("aspsp_country", session.stageAspspCountry)
-                put("psu_type", session.stagePsuType)
+                put("aspsp_name", currentSession.stageAspspName)
+                put("aspsp_country", currentSession.stageAspspCountry)
+                put("psu_type", currentSession.stagePsuType)
             }
         } else {
             kotlinx.serialization.json.JsonNull
@@ -894,45 +972,59 @@ fun Route.accountLinkingRoutes(
                 linkingCompleted = linkingCompleted,
                 everOnboarded = everOnboarded,
                 authFailed = authFailed,
-                onboardingStage = session.onboardingStage,
+                onboardingStage = currentSession.onboardingStage,
                 stageBankKnown = stageBankKnown,
                 // The stage's bank is linked (whitelist entry matching the
                 // stored triple) → a linking_progress stage promotes to the
                 // auth step (server state outranks the fine-grained stage).
                 // Conservative false when the whitelist lookup failed.
-                stageBankLinked = whitelist.linkedForStage(session),
+                stageBankLinked = whitelist.linkedForStage(currentSession),
                 sandboxEnvironment = sandboxEnvironment,
+                // An in-flight email-link flow record outranks the email-entry
+                // rung (manual-verification 8.10): the durable record is the
+                // server-side truth that the user is mid-flow. Resumable while
+                // the registration has NOT persisted its credentials yet (the
+                // eb_application row's refresh token is the discriminator) AND
+                // the record is not terminally failed — an `auth_failed` record
+                // (GIT emailLinkSignin failed: invalid/expired oobCode) is a
+                // dead flow: the user must restart onboarding at email entry.
+                emailLinkFlowActive = refreshToken.isNullOrBlank() &&
+                    flowRecordStore
+                        .findLatestByOwnerAndKind(session.username, FlowKind.EMAIL_LINK)
+                        ?.let { it.status != FlowStatus.FAILED } == true,
             ),
         )
 
         // One-shot pending_initial_import signal (spec: wizard-initial-import)
         // and one-shot first_connection_import signal (spec: onboarding —
-        // zero-account notice, amended; review F1): both reported and cleared
-        // in the same read, in a SINGLE session write. Set at the auth callback
-        // — pendingInitialImport on every successful authorization,
-        // firstConnectionImport ONLY when the merge outcome says first-
-        // connection (eb_sessions 0 → 1; the ever-onboarded marker flips inside
-        // the same merge transaction and cannot distinguish a genuine first
-        // connection from an ever-onboarded reconnect after the redirect cold
-        // boot). The FIRST state read after the callback consumes them (the
-        // SPA then runs the wizard import step, its zero-account detection
-        // keyed on first_connection_import). A reload before the SPA consumed
-        // them re-reads them — but once consumed they never reappear.
-        //
-        // ONE call.sessions.set for both: two chained writes would emit two
-        // Set-Cookie headers from the same original session (each copy starts
-        // from the stale original), and the client may honor either — the
-        // second field would appear to "survive" its clear.
-        val pendingInitialImport = session.pendingInitialImport == true
-        val firstConnectionImport = session.firstConnectionImport == true
-        if (pendingInitialImport || firstConnectionImport) {
-            call.sessions.set(
-                session.copy(pendingInitialImport = null, firstConnectionImport = null),
-            )
+        // zero-account notice, amended; review F1): consumed from the flow
+        // record's outcome in the consumption step above — reported here,
+        // never reappearing (the record is deleted; consume-once, design D4).
+
+        // The resumable email-link flow record's state token (manual-verification
+        // 8.10, resume-after-reload — the same discriminator as the resolver's
+        // emailLinkFlowActive input: the record exists AND the registration has
+        // not persisted credentials yet).
+        val resumableFlow = if (refreshToken.isNullOrBlank()) {
+            // The same discriminator as the resolver's emailLinkFlowActive rung:
+            // no credentials yet AND the record is not terminally failed.
+            flowRecordStore.findLatestByOwnerAndKind(session.username, FlowKind.EMAIL_LINK)
+                ?.takeIf { it.status != FlowStatus.FAILED }
+        } else {
+            null
         }
 
         call.respond(buildJsonObject {
             put("requires_relogin", refreshToken.isNullOrBlank())
+            // The resumable flow record's state token: when the resolver
+            // routed to registration_review because of a mid-flight record,
+            // the reloaded SPA has no in-memory token — this hands the
+            // owner's own live flow key back on the authenticated state read
+            // (the same trust level as the start endpoint's response and the
+            // email link's continueUrl), so the completion can resolve
+            // against the durable record. Null once credentials are
+            // persisted (the app row is the truth then).
+            resumableFlow?.let { put("onboarding_flow_state", it.token) }
             put("linking_completed", linkingCompleted)
             put("auth_completed", authCompleted)
             // Ever-onboarded marker exposed to the SPA (spec: database —
@@ -942,15 +1034,15 @@ fun Route.accountLinkingRoutes(
             // wipes those).
             put("ever_onboarded", everOnboarded)
             put("auth_error", authError)
-            put("auth_error_kind", session.authErrorKind)
-            put("authorization_id", session.authorizationId)
+            put("auth_error_kind", authErrorKind)
+            put("authorization_id", authorizationId)
             put("auth_failed", authFailed)
             put("selected_bank", selectedBank)
             put("route", route)
             put("app_state", appState)
             put("pending_action", status.pendingAction)
             put("environment", status.environment)
-            put("onboarding_stage", session.onboardingStage)
+            put("onboarding_stage", currentSession.onboardingStage)
             put("stage_bank", stageBank)
             put("linked_banks", linkedBanks)
             put("pending_initial_import", pendingInitialImport)
@@ -958,11 +1050,12 @@ fun Route.accountLinkingRoutes(
         })
     }
 
-    // Cancel account linking — clears the one-shot auth_error so the user can
-    // return to the bank list and start over with a different bank. Linking
-    // progress itself is server-side (whitelist + eb_sessions), so nothing else
-    // needs clearing here. The onboarding view position is written as stage
-    // `bank_selection` with the bank triple cleared (spec:
+    // Cancel account linking. Linking progress itself is server-side
+    // (whitelist + eb_sessions), so nothing else needs clearing here. The
+    // owner's unconsumed `bank_auth` flow-record outcomes are discarded (a
+    // pending failure outcome refers to the abandoned attempt — design D4's
+    // supersede semantics), and the onboarding view position is written as
+    // stage `bank_selection` with the bank triple cleared (spec:
     // onboarding-view-position): the user deliberately returned to the bank
     // list, and a refresh there must restore the bank list, not bounce them
     // elsewhere.
@@ -973,10 +1066,9 @@ fun Route.accountLinkingRoutes(
         // (spec: onboarding-view-position scenario "Stage write at
         // cancel-linking"): the user deliberately returned to the bank list,
         // and a refresh there must not resume polling against a stale session.
+        flowRecordStore.discardByOwnerAndKind(session.username, FlowKind.BANK_AUTH)
         call.sessions.set(
             session.copy(
-                authError = null,
-                authErrorKind = null,
                 onboardingStage = OnboardingStage.BANK_SELECTION,
                 stageAspspName = null,
                 stageAspspCountry = null,
@@ -1012,8 +1104,8 @@ private suspend fun respondBankListFromControlPlane(
     controlPlaneClient: EnableBankingControlPlaneClient,
     sandboxEnvironment: Boolean,
 ) {
-    val refreshToken = database.systemConfigQueries
-        .selectValue("enable_banking_refresh_token").executeAsOneOrNull()
+    val refreshToken = database.ebApplicationQueries
+        .selectEbApplication().executeAsOneOrNull()?.refresh_token
         ?: return call.respond(
             HttpStatusCode.InternalServerError,
             mapOf("error" to "Enable Banking is not configured (missing refresh token)"),

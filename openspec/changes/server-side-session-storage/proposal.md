@@ -8,8 +8,9 @@ The login session is stored as a signed cookie payload: the `bankteller-session`
 
 - **BREAKING** (pre-release, hard cutover — no legacy-cookie import): the session cookie becomes an opaque session ID; the full session payload moves to a server-side SQLite `sessions` table behind Ktor's native `SessionStorage` interface.
 - Sliding session expiry, `.env`-configurable `SESSION_TTL_MINUTES` (default 15); expired sessions are revoked server-side, sessions survive container restarts.
+- Session-timeout feedback: a 401 caused by an expired session record carries a machine-readable reason (`session_expired`); the login screen renders a one-shot, dismissible brass attention panel (DecisionBox Tier 3, the remove-caveat grammar) explaining the automatic sign-out, naming the inactivity window from the server-provided effective TTL. Deliberate logout and fresh visits show no panel.
 - Logout becomes real revocation (`invalidate`), not just a client cookie clear.
-- `SameSite=Strict` restored (Lax was forced solely by the session-dependent callback; the callback no longer needs the cookie).
+- `SameSite=Lax` (manual-verification amendment: Strict blocked the cookie on the bank → callback cross-site navigation in Firefox, defeating the session-timeout feedback; Lax attaches on the callback's top-level GET while still blocking cross-site POSTs — the CSRF property that matters).
 - **BREAKING** for the auth flow: the `state` parameter becomes a key into a persisted `flow_records` table (opaque 256-bit random token; the `StateJwt` HMAC codec is retired). Flow records carry owner, status, outcome fields, and a `.env`-configurable `STATE_TTL_MINUTES` (default 60).
 - The Enable Banking auth callback becomes session-independent: it completes the merge on the flow record alone (success and failure outcomes stored in the record, consumed once by the owner at the next authenticated view). A user whose session expired at the bank site returns, logs in, and finds the connection completed and its signals surfaced — no lost consent.
 - The email-link onboarding flow's in-memory `OnboardingContext` map migrates onto the same `flow_records` framework (unifying both callback branches onto one mechanism; the email-link flow gains restart survival).
@@ -20,10 +21,10 @@ The login session is stored as a signed cookie payload: the `bankteller-session`
 ## Capabilities
 
 ### New Capabilities
-- `session-management`: server-side session storage — opaque session ID cookie, SQLite-backed session records, sliding TTL, revocation, and the payload-identity rule (the session record holds flow state only; nothing new ever rides the cookie).
+- `session-management`: server-side session storage — opaque session ID cookie, SQLite-backed session records, sliding TTL, revocation, the payload-identity rule (the session record holds flow state only; nothing new ever rides the cookie), and session-timeout feedback on the login screen.
 
 ### Modified Capabilities
-- `auth`: session issuance/management requirement rewritten — opaque ID cookie, server-side record, expiry, revocation, SameSite=Strict; legacy-decode machinery removed.
+- `auth`: session issuance/management requirement rewritten — opaque ID cookie, server-side record, expiry, revocation, SameSite=Lax (Strict→Lax per the manual-verification fallback); legacy-decode machinery removed; the login requirement's cookie clause follows.
 - `onboarding`: auth-callback requirement becomes session-independent (flow-record-driven); the email-link flow's context persistence moves to the persisted flow-record framework.
 - `onboarding-view-position`: the view-position storage clause changes from "user session cookie" to "server-side session record"; stage clearing at login now means session-record creation rather than fresh-cookie issuance.
 - `linking-session-polling`: the EB AIS sessionid's storage clause changes from "server-side session-cookie stage data" to "server-side session record" — the capability token never leaves the server; the poll endpoint's storage parentheticals follow.
@@ -33,12 +34,13 @@ The login session is stored as a signed cookie payload: the `bankteller-session`
 - `eb-application-status`: the lifecycle model's `kid` match and the side-effect-free deletion-detection requirement retarget their credential names from `system_config` keys to the `eb_application` row.
 - `balance-sync`: the initial-import requirement's `pendingInitialImport` signal home moves from the user session to the flow-record outcome.
 - `onboarding-view-position`: additionally, the stage-invalidation requirement's clearing actor retargets from the auth callback (which no longer touches sessions) to the outcome-consumption step.
+- `spa-shell`: the login-screen requirement gains the one-shot session-expiry informational panel (per the `session-management` capability's session-timeout feedback requirement).
 
 ## Impact
 
 - **Server**: `Application.kt` (Sessions install block, cookie config), `UserSession.kt` (sheds the fields that move to the flow record: `authError`, `authErrorKind`, `authorizationId`, `pendingInitialImport`, `firstConnectionImport` — remaining payload is the view-position flow state), `StateJwt.kt` (retired), `OnboardingRoutes.kt` (callback branches), `OnboardingService.kt` (in-memory contexts → flow records), `AccountLinkingRoutes.kt`, `ConnectionsRoutes.kt`, `SyncRoutes.kt`, `OnboardingRouteResolver.kt`, `MissingAccountSignalStore.kt` (in-memory → `eb_application` row), `DatabaseEnableBankingCredentialProvider.kt`, `EnableBankingControlPlaneClient.kt` (refresh-token lifecycle), `KeyPairGenerator.kt`, `KeyStore.kt` (signing key survives in `system_config`), `EbSessionStore.kt` (ever-onboarded marker).
 - **Database**: SQLDelight migration — `sessions`, `flow_records`, `eb_application` tables; data migration from `system_config` keys; `system_config` reduced to `jwt_signing_key` and `password_hash`.
-- **Web frontend**: no API contract changes expected; the SPA never touches the cookie (httpOnly). The callback landing page's login-redirect behavior changes (session-expired users get the login screen, then land on the dashboard with signals surfaced).
+- **Web frontend**: the only API-contract additions are the 401 reason field and the login-screen timeout panel (design D8); the SPA otherwise never touches the cookie (httpOnly). The callback landing page's login-redirect behavior changes (session-expired users get the login screen — with the informational timeout panel — then land on the dashboard with signals surfaced).
 - **Deployment**: `.env` gains `SESSION_TTL_MINUTES` (default 15) and `STATE_TTL_MINUTES` (default 60); `.env.example` updated.
-- **Tests**: server tests for session lifecycle, expiry, revocation, flow-record TTL/consumption; the full bank-redirect chain (SameSite=Strict verification) needs manual + containerized browser-test coverage.
+- **Tests**: server tests for session lifecycle, expiry, revocation, flow-record TTL/consumption; the full bank-redirect chain needs manual + containerized browser-test coverage (including the SameSite=Lax cookie behavior and the timeout panel latching on the bank-return flow).
 - **No release exists**: hard cutover, no legacy-cookie import, no wire-compat scenarios.

@@ -5,11 +5,13 @@ import kotlinx.serialization.json.Json
 import kotlin.test.*
 
 /**
- * The session cookie serializer must tolerate OLD-format cookies written by the
- * pre-onboarding-refactor server, which carried fields (psuIdHash, aspspName,
- * aspspCountry, psuType, ebSessionId, accountsJson) that no longer exist on the
- * slim [UserSession]. The configured serializer uses `ignoreUnknownKeys = true`
- * so those cookies still decode instead of failing the session read.
+ * Serialization of the server-side session payload (the `sessions.payload`
+ * TEXT blob — the cookie carries only the opaque ID; this is the store's
+ * storage format, not a wire format).
+ *
+ * The pre-change legacy-cookie decode scenarios are gone with the legacy
+ * cookie: the hard cutover means an old signed-payload cookie is simply an
+ * unknown session ID (store lookup miss), never decoded.
  */
 class UserSessionSerializerTest {
 
@@ -17,27 +19,26 @@ class UserSessionSerializerTest {
         KotlinxSessionSerializer<UserSession>(Json { ignoreUnknownKeys = true })
 
     @Test
-    fun `old-format cookie with removed fields decodes into slim UserSession`() {
-        val session = serializer().deserialize(
-            """{"username":"admin","psuIdHash":"hash-1","aspspName":"Test Bank","aspspCountry":"DE","psuType":"personal","ebSessionId":"sess-1","accountsJson":"[]","authError":null}""",
+    fun `payload round-trips username and view-position flow state`() {
+        val serializer = serializer()
+        val original = UserSession(
+            username = "admin",
+            onboardingStage = "linking_progress",
+            stageAspspName = "Test Bank",
+            stageAspspCountry = "DE",
+            stagePsuType = "personal",
+            sessionid = "sess-1",
+            stageSessionBaseUrl = "https://eb.example",
         )
-        assertEquals("admin", session.username)
-        assertNull(session.authError)
+        val session = serializer.deserialize(serializer.serialize(original))
+        assertEquals(original, session)
     }
 
     @Test
-    fun `new-format cookie without authError decodes with default null`() {
+    fun `fresh-login payload decodes with null flow state`() {
         val session = serializer().deserialize("""{"username":"admin"}""")
         assertEquals("admin", session.username)
-        assertNull(session.authError)
-    }
-
-    @Test
-    fun `serialize round-trips username and authError`() {
-        val serializer = serializer()
-        val text = serializer.serialize(UserSession("admin", authError = "boom"))
-        val session = serializer.deserialize(text)
-        assertEquals("admin", session.username)
-        assertEquals("boom", session.authError)
+        assertNull(session.onboardingStage)
+        assertNull(session.sessionid)
     }
 }
