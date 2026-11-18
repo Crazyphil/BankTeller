@@ -1,11 +1,14 @@
 # bank-connection-management Specification
 
+
+
+
+
 ## Purpose
 
 None
 
 ## Requirements
-
 ### Requirement: Intent principle
 
 Data loss SHALL follow only explicit user choice. System failures — bank outages, dead consents, Enable Banking or bank-side errors — SHALL NEVER delete data. Consequences that bind this capability and all future changes: sync failures never delete (upserts only); a first successful sync after an outage never removes data; re-authorization never silently deletes (missing accounts are kept as local copies per the missing-accounts dialog requirement); user-initiated removal deletes everything derived from the connection (per the remove-connection requirement) — an explicit, confirmed act. The retention principle governs involuntary loss: best-effort connection keep-alive, but data retention and smooth contingency when a bank goes offline and must be reconnected (or is simply unavailable for some time) come first.
@@ -17,6 +20,10 @@ Data loss SHALL follow only explicit user choice. System failures — bank outag
 #### Scenario: Re-authorization never silently deletes
 - **WHEN** a re-authorization yields fewer accounts than previously stored
 - **THEN** the missing accounts survive as kept-as-local-copy accounts (per the missing-accounts dialog requirement) — deletion happens only through the user's explicit choice
+
+
+
+
 
 ### Requirement: Connections data contract
 
@@ -41,6 +48,10 @@ The existing `GET /api/accounts` payload SHALL be extended (one source of truth 
 #### Scenario: Accounts render in deterministic name order within a bank
 - **WHEN** a bank group carries multiple accounts (regardless of the bank API's arrival order)
 - **THEN** the accounts are ordered by display name (case-insensitive, NULL names last), then IBAN — both the connections section's account rows and the dashboard's cards within the bank render in that order
+
+
+
+
 
 ### Requirement: Bank connections section
 
@@ -80,6 +91,10 @@ The section SHALL stay connection-centric: the card presents the bank's identity
 - **WHEN** a connection's bank has one failed account among healthy ones
 - **THEN** the connection card renders at most its connection-wide authorization signal — no per-account status, count, or rollup text appears on the card
 
+
+
+
+
 ### Requirement: Connect bank action
 
 The section header's "+ Connect bank" action SHALL enter the wizard at bank selection in add-mode — client-side navigation per the onboarding capability's add-mode machinery (no server-side mode). This is the absorbed dashboard control: the canonical connect entry point for the running system, alongside the dashboard empty-state trigger (a first-run call-to-action is not bank management — a brand-new user connects their first bank from the dashboard). User-facing copy uses the umbrella term "Connect", never "Add".
@@ -87,6 +102,10 @@ The section header's "+ Connect bank" action SHALL enter the wizard at bank sele
 #### Scenario: Connect bank enters the add-mode wizard
 - **WHEN** the user activates "+ Connect bank" in the bank connections section
 - **THEN** the wizard opens at bank selection in add-mode, with already-connected banks blocked (the honest already-connected explanation)
+
+
+
+
 
 ### Requirement: Refresh authorization action
 
@@ -103,6 +122,10 @@ Each connection card SHALL offer a "Refresh authorization" action for **every co
 #### Scenario: Naming distinction is preserved
 - **WHEN** a surface shows both balance refresh and authorization refresh
 - **THEN** the two are visually distinct by glyph and label: balance refresh uses the circular-arrow icon with its tooltip; authorization refresh carries explicit "Refresh authorization" text with a key glyph — the two are never conflated, and no circular arrow ever appears on an authorization action
+
+
+
+
 
 ### Requirement: Remove connection
 
@@ -124,9 +147,13 @@ Removing a bank connection SHALL follow the sequence: (1) a confirmation dialog 
 - **WHEN** the remove endpoint is called for a bank with no local session row (stale SPA state or a double-remove)
 - **THEN** the endpoint responds with an honest not-found error — no Enable Banking call is made, no local deletion runs, and the SPA re-syncs its connections state
 
+
+
+
+
 ### Requirement: Missing-accounts dialog
 
-When a re-authorization's merge reports a missing-accounts set (accounts of the previous same-bank session absent from the new authorization — user deselection, user error, or bank-side identity change are indistinguishable), the SPA SHALL render the missing-accounts dialog every time the condition is detected (no remember-preference — a rare event needs no machinery). The dialog is a post-import notice, not a gate: the merge has already kept the missing accounts as local copies (the retention-safe default; closing the tab mid-dialog leaves the safe outcome). The dialog SHALL enumerate the affected accounts — the user decides over *these* records, not an opaque count: each entry renders the account's display name, its masked IBAN in mono figures, and its last-known balance where available (joined from the accounts payload — the accounts are already kept local copies with surviving `balances` rows), with a per-entry marker distinguishing newly missing accounts from entries already kept as local copies (a repeated detection lists both — the user is never left wondering which data is new; counts alone are insufficient: the user must see *what* they are about to delete or keep). The dialog's copy names the bank of the re-authorization ("at {bank}") whenever the signal carries the bank's name: the name rides the SERVER-SIDE signal itself (the merge knows the ASPSP; the store is the in-memory signal store — never a database row), because the canonical re-auth path's bank redirect cold-boots the SPA and wipes any client-side stash of the selected bank — a client-side bank-name capture can never survive to the dialog on the real path (a null name degrades the copy by dropping the "at {bank}" clause, honestly). The two actions: **"Delete newly missing data"** (danger — calls the local-copy deletion endpoint with **only the `newlyMissing` account ids**; accounts already kept as local copies from earlier authorizations are listed for context but NEVER deleted by this action — a prior keep decision is a standing user choice that a later detection must not silently re-make, per the intent principle; the action's label states its scope so the reach cannot be misread) and "Keep as local copy" (primary — already the effective state; closes the dialog). **No-op guard**: when the signal carries ONLY already-kept entries (zero `newlyMissing` — e.g. a re-detected kept copy whose hash rotated), the danger action SHALL render DISABLED (never hidden — its absence would invite "where did it go?"; never enabled-as-no-op — a clickable button that does nothing is worse than absent) with a quiet explanatory line ("No new accounts went missing with this authorization — the listed accounts were already kept as local copies."); Keep remains the only active action and closes the dialog. Already-kept copies remain deletable only through their own confirmed affordance in the connections section (the local-copy deletion confirmation — one decision, one path).
+When a re-authorization's merge reports a missing-accounts set (accounts of the previous same-bank session absent from the new authorization — user deselection, user error, or bank-side identity change are indistinguishable), the SPA SHALL render the missing-accounts dialog every time the condition is detected (no remember-preference — a rare event needs no machinery). The dialog is a post-import notice, not a gate: the merge has already kept the missing accounts as local copies (the retention-safe default; closing the tab mid-dialog leaves the safe outcome). The dialog SHALL enumerate the affected accounts — the user decides over *these* records, not an opaque count: each entry renders the account's display name, its masked IBAN in mono figures, and its last-known balance where available (joined from the accounts payload — the accounts are already kept local copies with surviving `balances` rows), with a per-entry marker distinguishing newly missing accounts from entries already kept as local copies (a repeated detection lists both — the user is never left wondering which data is new; counts alone are insufficient: the user must see *what* they are about to delete or keep). The dialog's copy names the bank of the re-authorization ("at {bank}") whenever the signal carries the bank's name: the name rides the SERVER-SIDE signal itself (the merge knows the ASPSP; the signal is stored on the `eb_application` row per the `database` capability — durable, not in-memory), because the canonical re-auth path's bank redirect cold-boots the SPA and wipes any client-side stash of the selected bank — a client-side bank-name capture can never survive to the dialog on the real path (a null name degrades the copy by dropping the "at {bank}" clause, honestly). The two actions: **"Delete newly missing data"** (danger — calls the local-copy deletion endpoint with **only the `newlyMissing` account ids**; accounts already kept as local copies from earlier authorizations are listed for context but NEVER deleted by this action — a prior keep decision is a standing user choice that a later detection must not silently re-make, per the intent principle; the action's label states its scope so the reach cannot be misread) and "Keep as local copy" (primary — already the effective state; closes the dialog). **No-op guard**: when the signal carries ONLY already-kept entries (zero `newlyMissing` — e.g. a re-detected kept copy whose hash rotated), the danger action SHALL render DISABLED (never hidden — its absence would invite "where did it go?"; never enabled-as-no-op — a clickable button that does nothing is worse than absent) with a quiet explanatory line ("No new accounts went missing with this authorization — the listed accounts were already kept as local copies."); Keep remains the only active action and closes the dialog. Already-kept copies remain deletable only through their own confirmed affordance in the connections section (the local-copy deletion confirmation — one decision, one path). The signal's storage is the `eb_application` row's `missing_accounts` column (durable — it survives browser close, logout, and server restart; the prior in-memory volatility was a pre-release simplification, and the session-independent callback makes durability required: the dialog must surface even when the callback completes with no live session), consumed by exactly one `GET /api/accounts` response to the owner — one-shot semantics unchanged.
 
 #### Scenario: Dialog renders on every detection
 - **WHEN** a re-authorization completes with a non-empty missing-accounts set
@@ -148,6 +175,14 @@ When a re-authorization's merge reports a missing-accounts set (accounts of the 
 - **WHEN** the missing-accounts signal carries only already-kept entries (zero newly missing)
 - **THEN** "Delete newly missing data" renders disabled with the explanatory line (no new accounts went missing), and "Keep as local copy" is the only active action — the danger action is never a clickable no-op and never silently hidden
 
+#### Scenario: Signal survives a browser close and restart
+- **WHEN** a user re-authorizes a bank, closes the browser (or the server restarts) before the next `GET /api/accounts`, and returns later
+- **THEN** the signal is still present on the `eb_application` row and the dialog renders at the first authenticated dashboard view
+
+#### Scenario: Signal consumed once
+- **WHEN** `GET /api/accounts` responds with the signal payload
+- **THEN** the signal is cleared and does not render again on subsequent requests
+
 ### Requirement: Local-copy accounts
 
 Accounts marked `in_consent = 0` (kept-as-local-copy) SHALL be skipped by the sync runner (they are outside the authorization's account filter — PSD2: BankTeller shows exactly what the authorization returns; local copies are never re-fetched). Their presentation uses the existing freshness vocabulary: permanently stale ("Last updated X ago") and the "Local copy" tag — the tag is the connections section's archived-record marker for its dense account rows (which carry no status slot); on the dashboard the archived-record marker is the canonical slot's "Local copy — not synchronized" status (per the `account-overview` capability's local-copy dashboard treatment — greyed, slot status, excluded from the hero total; the bare tag is retired on dashboard cards as redundant beneath the slot line). The inline delete affordance in the connections section — the only per-account deletion path for ALREADY-KEPT local copies (the missing-accounts dialog's scoped delete covers newly missing accounts at their detection; this affordance is the standing path for kept copies) — SHALL be **confirmed** (user ruling, post-implementation: a one-click irreversible deletion of the account row and its balance history is the same data-loss class as connection removal and violates the intent principle's "an explicit, confirmed act"; a confirmation dialog, mirroring the remove-connection pattern, gates the deletion — the button is the trigger, the dialog is the gate). The confirmation dialog SHALL name the specific account (display name / masked IBAN) and state what is deleted (the kept data: last-known balance and the account record) with honest irreversibility copy; deleting removes the account row and its `balances` in one transaction (per the `database` capability's local-copy deletion transaction). Keeping a local copy is retention, not deletion — it never triggers the automation guard; the automation guard (disabled-with-generic-reason) applies to the dialog's confirm action when the workflow feature introduces automations.
@@ -160,6 +195,10 @@ Accounts marked `in_consent = 0` (kept-as-local-copy) SHALL be skipped by the sy
 - **WHEN** the dashboard or connections section renders a local-copy account
 - **THEN** it shows its last-known balance in stale styling with the surface's archived-record marker — the "Local copy" tag in the connections section's dense rows, the "Local copy — not synchronized" status slot on dashboard cards (no bare tag beside it) — never presented as currently synchronized
 
+
+
+
+
 ### Requirement: Automation guard
 
 User-initiated deletion of account data or connection data SHALL be blocked while an active automation references it. Blocking surfaces SHALL disable the action with a generic reference ("used by automations") — the enumerated automation list belongs only where the user can act on it (the remove-connection dialog, built by the future workflow feature); a user who cannot edit or delete automations on the current screen must not be asked to memorize a list and navigate elsewhere. No degraded automation states, no cascade deletes, no silent breakage: the user modifies or removes the referencing automation first. This change ships with both dialog actions enabled (no automations exist yet); the principle is binding on the workflow feature that introduces them.
@@ -167,4 +206,3 @@ User-initiated deletion of account data or connection data SHALL be blocked whil
 #### Scenario: Deletion blocked while referenced (future enforcement)
 - **WHEN** an active automation references an account or connection whose data the user attempts to delete
 - **THEN** the deletion action is disabled with a generic "used by automations" reference — the data is not deleted and the automation is not silently broken
-

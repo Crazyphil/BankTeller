@@ -1,9 +1,13 @@
+# balance-sync Specification
+
+
+
+
 ## Purpose
 
 Background balance synchronization: a sync engine with three triggers, the Enable Banking PSU-header policy, session-status refresh on every sync run, balance persistence, a sync log, initial balance import at connection time, and sync status data for the account overview.
 
 ## Requirements
-
 ### Requirement: Sync engine with three triggers
 
 The system SHALL implement a single sync runner that, for every live `eb_sessions` row, fetches the current balances of its synced accounts (`in_consent = 1` — kept-as-local-copy accounts are outside the authorization's account filter and are skipped per the `bank-connection-management` capability's local-copy accounts requirement) from Enable Banking (`GET /accounts/{uid}/balances`), upserts the latest balance per account into the `balances` table, and records the run in `sync_log`. The runner SHALL be invoked from exactly three triggers:
@@ -54,6 +58,10 @@ Every run SHALL carry a **scope**: either all live sessions, or a single named s
 - **WHEN** an initial import is triggered while an all-sessions run is in flight
 - **THEN** the scoped run executes for the new session independently — it is neither queued behind nor coalesced into the in-flight run
 
+
+
+
+
 ### Requirement: PSU-header policy
 
 The system SHALL attach PSU headers (`Psu-Ip-Address`, `Psu-User-Agent`) to Enable Banking data-plane calls ONLY when a real user browser action is the trigger (login, manual sync, wizard initial import). The background timer SHALL NOT send PSU headers. The system SHALL NOT cache, persist, or fabricate PSU context for later reuse — PSU headers exist only as parameters derived from the current HTTP request.
@@ -66,6 +74,10 @@ The system SHALL attach PSU headers (`Psu-Ip-Address`, `Psu-User-Agent`) to Enab
 - **WHEN** a sync run is triggered by the background timer
 - **THEN** the Enable Banking balance requests include no PSU headers
 
+
+
+
+
 ### Requirement: Session status refresh per sync run
 
 At the start of each sync run, for each live session, the runner SHALL call `GET /sessions/{sessionId}` (via the `enable-banking-client` capability's `getSession`) and refresh the session's stored `valid_until` and status in `eb_sessions`. The stored `valid_until` is the authoritative Enable Banking value — it SHALL NOT be recomputed from a local clock plus a validity duration. A `getSession` error for a session SHALL NOT abort that session's balance fetching; the previously stored `valid_until` remains unchanged. Both calls of the run contribute consent-dead evidence: a consent-dead error code from `getSession` (e.g. `SESSION_DOES_NOT_EXIST` for a session deleted at EB between runs) marks the session's consent broken exactly like the same code from a balance fetch — the subsequent balance fetch would fail identically, but the marking does not wait for it.
@@ -77,6 +89,10 @@ At the start of each sync run, for each live session, the runner SHALL call `GET
 #### Scenario: Session status fetch failure is non-fatal
 - **WHEN** `getSession` fails for a session during a sync run
 - **THEN** the run continues with that session's balance fetching and the previously stored `valid_until` is left unchanged
+
+
+
+
 
 ### Requirement: Balance persistence
 
@@ -103,6 +119,10 @@ Accounts with a NULL `uid` SHALL be skipped by the sync runner (no EB fetch is p
 #### Scenario: Local-copy accounts are skipped
 - **WHEN** a session has kept-as-local-copy accounts (`in_consent = 0`)
 - **THEN** the sync runner skips their fetches entirely (they are not fetchable, never re-fetched, and their `balances` rows are untouched); the run's status reflects only the fetchable accounts
+
+
+
+
 
 ### Requirement: Sync log
 
@@ -132,11 +152,15 @@ The system SHALL record every sync run in `sync_log` with: the session it ran fo
 - **WHEN** a sync run covers multiple sessions and one session's fetch fails while another succeeds
 - **THEN** the successful session's balances are persisted and logged `success`, and the failed session is logged `error` — one bank's failure does not abort the others
 
+
+
+
+
 ### Requirement: Initial balance import at connection time
 
 The initial balance import SHALL be triggered by the SPA's wizard import step via an authenticated `POST /api/onboarding/import-balances` endpoint (PSU context derived from that request — the user is present). The endpoint SHALL start the import run for the newly authorized session's accounts and return immediately with the run's status; the SPA observes completion via the sync-status data in `GET /api/accounts` (in-flight flag, per the sync-status requirement). The import SHALL be recorded in `sync_log` with type `initial`. Once started, the import run is engine-scoped and SHALL complete server-side regardless of client disconnects (a page reload mid-import does not cancel it; it completes and logs normally). On failure, the wizard step offers retry (re-calls the endpoint) and a non-blocking "Continue to dashboard" path (relabeled from "continue anyway" per the design-system-theme capability's tab bar requirement — the dashboard shell with its navigation is present around the confined step, so the action names its destination); "Continue to dashboard" completes the step and the dashboard presents the degraded/stale state. The step renders confined inside the dashboard's content zone with the tab bar visible and the greeting above it — the import is a backgroundable process; the user may edit settings or connect another bank while it runs.
 
-The auth-callback success path SHALL set a one-shot `pendingInitialImport` signal in the user session (same one-shot pattern as `authError`), consumed by the SPA after the resolver returns `dashboard` to show the import step; the signal SHALL be cleared on import completion, "Continue to dashboard", or the next `GET /api/onboarding/state` read, and SHALL NOT be a persisted onboarding view position (a reload that misses the signal routes per the normal resolver — the degraded state covers an import that never ran).
+The auth-callback success path SHALL set a one-shot `pendingInitialImport` signal in the `bank_auth` flow record's outcome (per the `onboarding` capability's session-independent auth-callback requirement — the callback never touches a session), consumed by the SPA after the resolver returns `dashboard` to show the import step; the signal SHALL be cleared on import completion, "Continue to dashboard", or the next `GET /api/onboarding/state` read, and SHALL NOT be a persisted onboarding view position (a reload that misses the signal routes per the normal resolver — the degraded state covers an import that never ran).
 
 #### Scenario: Import triggered by the wizard step
 - **WHEN** the SPA's import step calls `POST /api/onboarding/import-balances` after a newly authorized session
@@ -151,7 +175,7 @@ The auth-callback success path SHALL set a one-shot `pendingInitialImport` signa
 - **THEN** the wizard shows the failure with a retry action and a "Continue to dashboard" action; continuing completes the step and the dashboard displays the degraded/stale state with its retry affordance
 
 #### Scenario: One-shot signal gates the step
-- **WHEN** the SPA boots after a successful auth callback and the resolver returns `dashboard` while the one-shot `pendingInitialImport` signal is present
+- **WHEN** the SPA boots after a successful auth callback and the resolver returns `dashboard` while the one-shot `pendingInitialImport` signal is present (consumed from the flow record's outcome at the authenticated view)
 - **THEN** the SPA shows the import step (confined in the dashboard's content zone, greeting above, tab bar visible), triggers the initial import, and clears the signal on completion or "Continue to dashboard"
 
 ### Requirement: Sync status endpoint data
@@ -190,6 +214,10 @@ The response SHALL also include a global `sync_in_progress` flag (true while any
 - **WHEN** any existing consumer reads the response
 - **THEN** every previously existing field is present and unchanged in name and semantics; the new fields are additions
 
+
+
+
+
 ### Requirement: Remove-during-sync race guard
 
 SQLite foreign-key enforcement is not enabled for the BankTeller database, so a write against a deleted row would succeed as an invisible orphan. The sync runner SHALL therefore re-check existence before its writes: before upserting a balance, the runner SHALL confirm the account row (and its session) still exists; before writing the `sync_log` row, the runner SHALL confirm the session still exists. A user-initiated connection removal during an in-flight sync run deletes the session and its accounts mid-run — the guard turns the run's later writes into no-ops instead of orphans. A guarded no-op SHALL NOT fail the run (the removal was the user's explicit act; the run's status reflects the accounts it did fetch).
@@ -197,6 +225,10 @@ SQLite foreign-key enforcement is not enabled for the BankTeller database, so a 
 #### Scenario: Remove during in-flight sync leaves no orphans
 - **WHEN** a connection removal completes while a sync run is still processing that session's accounts
 - **THEN** the run's subsequent balance upserts and its sync-log write for that session are skipped (the existence re-check fails) and no orphaned `balances` or `sync_log` rows are created
+
+
+
+
 
 ### Requirement: Per-bank rate-limit skip
 
@@ -217,6 +249,10 @@ When a session's sync run records a rate-limited outcome (`ASPSP_RATE_LIMIT_EXCE
 #### Scenario: Skip state survives a restart
 - **WHEN** the server restarts while a session is in the rate-limit skip state
 - **THEN** the skip state persists (it is server-persisted state, not in-memory) until a background run clears it
+
+
+
+
 
 ### Requirement: Per-account sync outcomes
 

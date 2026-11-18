@@ -1,15 +1,20 @@
+# auth Specification
+
+
+
+
 ## Purpose
 
-Username and password authentication for BankTeller. Users log in with credentials defined in the `.env` file; the server issues httpOnly, SameSite=Strict session cookies signed with HMAC-SHA256, validates sessions on protected routes, and rate-limits login attempts per client IP with proxy-aware resolution.
+Username and password authentication for BankTeller. Users log in with credentials defined in the `.env` file; the server issues httpOnly, SameSite=Lax session cookies containing only an opaque session ID, with the session payload held in a server-side session record (see the `session-management` capability), validates sessions on protected routes, and rate-limits login attempts per client IP with proxy-aware resolution.
 
 ## Requirements
-
 ### Requirement: Username and password authentication
+
 The system SHALL authenticate users against credentials defined in the `.env` file (`AUTH_USERNAME` and `AUTH_PASSWORD`). On first startup, the system SHALL hash the password with bcrypt and store the hash in the database. On subsequent starts, the system SHALL compare the `.env` password against the stored bcrypt hash.
 
 #### Scenario: Successful login
 - **WHEN** a user submits the correct username and password on the login screen
-- **THEN** the system issues an httpOnly, SameSite=Strict cookie containing a signed session token and redirects to the dashboard
+- **THEN** the system issues an httpOnly, SameSite=Lax cookie containing only the opaque session ID (per this change's session-management requirement — the signed session payload is retired) and redirects to the dashboard
 
 #### Scenario: Failed login
 - **WHEN** a user submits an incorrect username or password
@@ -24,37 +29,39 @@ The system SHALL authenticate users against credentials defined in the `.env` fi
 - **THEN** the system compares `AUTH_PASSWORD` from `.env` against the stored bcrypt hash. If they don't match, the system SHALL log a warning and use the stored hash as the source of truth
 
 ### Requirement: Session management via httpOnly cookies
-The system SHALL issue httpOnly, SameSite=Strict cookies containing an HMAC-SHA256-signed session payload upon successful login. The `Secure` flag SHALL be set when the request is not from localhost. The session payload SHALL contain identity only (`username`) plus the authorization-failure diagnostics fields: `authError` (raw error detail — server-side diagnostics only, never rendered in the SPA), `authErrorKind` (the classified failure kind: `cancelled` / `technical` / `configuration` / `unexpected`), and `authorizationId` (the Enable Banking authorization ID of the current attempt, stored at `POST /api/auth`), plus the onboarding view-position fields (see the `onboarding-view-position` capability): `onboardingStage` (`linking_progress` | `auth_progress` | `bank_selection` | null) and the in-flight bank triple `stageAspspName` / `stageAspspCountry` / `stagePsuType`. **Clearing semantics differ by field:** `authError` and `authErrorKind` are one-shot — cleared at the start of every `POST /api/auth` call, cleared on auth-callback success (belt-and-suspenders), cleared by the cancel-linking endpoint, and cleared by the onboarding completion endpoint on application (re-)registration (a recorded failure refers to the defunct application and MUST NOT surface against the new one). `authorizationId` is attempt-scoped — it is NOT cleared with the one-shot fields (it must survive the failure display so the SPA can render it); it is overwritten on every successful `POST /api/auth` (it always refers to the current attempt only) and cleared by the onboarding completion endpoint on application (re-)registration together with the one-shot fields. The view-position fields are ephemeral flow-control data, never progress authority: overwritten at the link-accounts / auth / cancel-linking touchpoints (`linking_progress` / `auth_progress` / `bank_selection` respectively — `bank_selection` carries no bank triple), cleared by auth-callback success, the onboarding completion endpoint on application (re-)registration (a stored position refers to the defunct application's flow and MUST NOT survive into the new one), and login (fresh cookie). The session cookie SHALL NOT carry onboarding progress (no `psuIdHash`, `aspspName`, `aspspCountry`, `psuType`, `ebSessionId`, `accountsJson`) — onboarding progress is derived server-side from the Enable Banking API and from the `eb_sessions` / `accounts` tables. The session serializer SHALL be pinned to kotlinx.serialization `Json { ignoreUnknownKeys = true }` so cookies issued before this change (still containing the removed fields, or lacking the new fields) decode cleanly to `UserSession` defaults without forcing logout. **Legacy cookies are not imported:** the login handler performs no legacy-cookie import — the pre-slim-cookie format was never released, no legacy cookies exist in the wild, and the import (gated on `eb_sessions` emptiness) would re-import dead-application rows after the stale-session purge; it is removed entirely. An incoming legacy cookie is simply overwritten by the fresh slim cookie issued at login.
+
+The system SHALL issue, upon successful login, an httpOnly `bankteller-session` cookie with `SameSite=Lax` containing ONLY an opaque session ID; the session payload (identity and session-scoped flow state) SHALL live in a server-side session record (see the `session-management` capability). The `Secure` flag SHALL be set per `COOKIE_SECURE`. **SameSite=Lax (manual-verification amendment):** Strict was the original setting, but Firefox drops the Strict cookie both on the bank → callback cross-site top-level GET and on the same-origin follow-up navigation after a cross-site redirect chain — the session-timeout classification (see the `session-management` capability's session-timeout feedback requirement) can never see the expired ID on those document routes, so the expiry panel never latches in the bank-return flow. Lax attaches the cookie on top-level GET navigations (the bank's redirect back to the callback) while still blocking cross-site POSTs (the CSRF property that matters); the session-independent callback design (see the `onboarding` capability) means the cookie policy no longer gates the callback itself. The session record SHALL contain identity (`username`) plus the onboarding view-position fields (see `onboarding-view-position`) — all stored server-side. The session record SHALL NOT carry onboarding progress — progress is derived server-side from the Enable Banking API and the `eb_sessions`/`accounts` tables. The cookie SHALL NOT be signed with a payload MAC — the ID is an unguessable random token whose validity is decided by the session store alone. **No legacy-cookie import and no legacy decode:** the pre-change signed-payload cookie format is not recognized, not decoded, and not imported; a legacy cookie is treated as no session and is simply overwritten at the next login (no release carried it). **Auth-callback failure diagnostics move to the flow record:** the auth callback's failure outcomes (`authError`, `authErrorKind`, `authorizationId` of the failed attempt) are stored in the flow record (see the `onboarding` capability's session-independent auth-callback requirement), not in the session; they surface to the owner's next authenticated view, consume-once, with the one-shot and attempt-scoped semantics preserved (a newer flow's outcome supersedes an unconsumed older one).
 
 #### Scenario: Cookie issued on login
-- **WHEN** a user successfully authenticates
-- **THEN** the system sets an httpOnly, SameSite=Strict cookie named `bankteller-session` whose payload contains only the username — the transient authorization-failure diagnostics fields and the view-position fields are all absent (null) in a fresh login cookie (a recorded failure or stored position dies with the previous session by design) — and no onboarding-progress fields
+- **WHEN** a user logs in with valid credentials
+- **THEN** the system issues an httpOnly, SameSite=Lax `bankteller-session` cookie containing only the opaque session ID, backed by a server-side session record holding the username, and redirects to the dashboard
 
 #### Scenario: Session validated on protected routes
-- **WHEN** a request arrives at a protected route with a valid session cookie
-- **THEN** the system allows the request to proceed
+- **WHEN** a request arrives at a protected route with a session cookie whose ID resolves to a live server-side session record
+- **THEN** the session is resolved from the record and the request proceeds
 
 #### Scenario: Invalid session redirects to login
-- **WHEN** a request arrives at a protected route without a valid session cookie
-- **THEN** the system returns 401 Unauthorized for API routes or redirects to login for page routes
+- **WHEN** a request arrives at a protected route without a valid session cookie (no cookie, unknown ID, expired or revoked record)
+- **THEN** the request is unauthenticated — a page route redirects to login, an API route answers 401 (the 401 body MAY carry the expiry reason per the `session-management` capability's session-timeout feedback requirement)
 
 #### Scenario: Old-format cookie decodes without logout
-- **WHEN** a cookie issued before this change (payload containing `psuIdHash`, `aspspName`, `ebSessionId`, `accountsJson`, …) is presented
-- **THEN** the session serializer (`Json { ignoreUnknownKeys = true }`) decodes it to `UserSession` defaults and the user is NOT forced to log out
+- **WHEN** a cookie issued before this change (a signed payload containing `psuIdHash`, `aspspName`, `ebSessionId`, `accountsJson`, …) is presented
+- **THEN** it is not decoded (the pre-change format is not recognized post-cutover) — the ID lookup misses and the request is unauthenticated; the next login overwrites the cookie with the opaque-ID form (the pre-change format never shipped, so no deployed user is affected)
 
 #### Scenario: Authorization-failure fields are one-shot; authorization ID is attempt-scoped
-- **WHEN** an auth-failure callback records `authError`/`authErrorKind`/`authorizationId` and the user subsequently starts a new authorization attempt (`POST /api/auth`), completes one (auth-callback success), or aborts (cancel-linking)
-- **THEN** `authError` and `authErrorKind` are cleared from the session payload in all three cases; `authorizationId` is attempt-scoped — it is NOT cleared in any of them (it must survive the failure display so the SPA can render it) and is overwritten by the next successful `POST /api/auth` (it always refers to the current attempt)
+- **WHEN** an auth-failure callback records `authError`/`authErrorKind`/`authorizationId` in the flow record and the user subsequently starts a new authorization attempt (`POST /api/auth`), completes one (auth-callback success), or aborts (cancel-linking)
+- **THEN** the recorded failure outcome is discarded/superseded (the new attempt's flow record replaces the pending outcome — see the `onboarding` capability's session-independent auth-callback supersede semantics); `authorizationId` remains attempt-scoped (each flow record's outcome refers only to its own attempt)
 - **AND WHEN** the onboarding completion endpoint registers a new application (fresh or re-registration)
-- **THEN** all three fields are cleared — they refer to the defunct application
+- **THEN** pending flow-record outcomes refer to the defunct application and SHALL NOT surface against the new one (consumed/discarded at registration)
 
 #### Scenario: View-position fields survive refresh but not logout
-- **WHEN** a user mid-onboarding refreshes the page (cookie re-sent) versus logs out and back in (fresh cookie at login)
-- **THEN** the view-position fields survive the refresh and are absent after the fresh login
+- **WHEN** a user mid-onboarding refreshes the page (same session, record re-read) versus logs out and back in (fresh session record at login)
+- **THEN** the view-position fields survive the refresh and are absent in the fresh login's session record
 
 #### Scenario: Legacy cookie is not imported
-- **WHEN** a user logs in with an incoming cookie that still carries legacy progress fields (`ebSessionId`, `accountsJson`, `psuIdHash`, `aspsp*`, `psuType`)
-- **THEN** nothing is imported — no `eb_sessions`/`accounts` rows are created from cookie data; the login issues the slim identity-only cookie (legacy fields dropped), and the login gate routes purely on the server-derived state
+- **WHEN** a user logs in with an incoming cookie in any pre-change format
+- **THEN** nothing is imported — no `eb_sessions`/`accounts` rows are created from cookie data; the login issues a fresh opaque-ID cookie backed by a new session record, and the login gate routes purely on the server-derived state
+
 ### Requirement: Login rate limiting with proxy-aware IP resolution
 The system SHALL limit login attempts to 5 per client IP address per 15-minute sliding window. Failed attempts beyond this limit SHALL return HTTP 429 with a `Retry-After` header. The system SHALL use Ktor's `XForwardedHeader` plugin to resolve the actual client IP from `X-Forwarded-For` headers when a reverse proxy is present. Without a proxy, the direct request IP SHALL be used.
 
@@ -74,12 +81,20 @@ The system SHALL limit login attempts to 5 per client IP address per 15-minute s
 - **WHEN** a request arrives with an `X-Forwarded-For` header (e.g., from Traefik or Caddy)
 - **THEN** the rate limiter uses the resolved client IP from the forwarded header, not the proxy's IP
 
+
+
+
+
 ### Requirement: Logout
 The system SHALL provide a logout endpoint that clears the session cookie.
 
 #### Scenario: Successful logout
 - **WHEN** an authenticated user invokes the logout endpoint
 - **THEN** the system clears the `bankteller-session` cookie and the user is redirected to the login screen
+
+
+
+
 
 ### Requirement: Default password warning
 The system SHALL log a warning at startup if `AUTH_PASSWORD` equals `changeme`, but SHALL NOT refuse to start.

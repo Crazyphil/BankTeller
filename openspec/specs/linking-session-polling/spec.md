@@ -1,11 +1,15 @@
+# linking-session-polling Specification
+
+
+
+
 ## Purpose
 
 Server-side polling of the in-flight Enable Banking AIS linking session: BankTeller polls the EB AIS session-status endpoint on behalf of the SPA, maps the result onto a closed seven-state model (waiting/confirming/done/unconfirmed/cancelled/failed/unavailable), confirms completion via the account whitelist with a sticky per-sessionid marker, and keeps the EB AIS sessionid entirely server-side.
 
 ## Requirements
-
 ### Requirement: Linking session status poll endpoint
-The system SHALL expose an authenticated `GET /api/onboarding/linking-session-status` endpoint (BankTeller session cookie required) that reports the state of the in-flight Enable Banking account-linking session to the SPA. The endpoint SHALL read the EB AIS sessionid and the poll base URL (the linking `authorization_url`'s scheme + host, persisted at link time) from the stored `linking_progress` view-position stage data (session cookie, per the `onboarding-view-position` capability); when no sessionid or no base URL is stored (a cookie issued before this change, or no stored stage), the endpoint SHALL return `{ "state": "unavailable" }` without contacting Enable Banking. When both are stored **and no `AuthDone` marker is active for the sessionid**, the endpoint SHALL call the EB AIS session-status client method (per the `enable-banking-client` capability) and map the result to exactly one state:
+The system SHALL expose an authenticated `GET /api/onboarding/linking-session-status` endpoint (BankTeller session cookie required) that reports the state of the in-flight Enable Banking account-linking session to the SPA. The endpoint SHALL read the EB AIS sessionid and the poll base URL (the linking `authorization_url`'s scheme + host, persisted at link time) from the stored `linking_progress` view-position stage data in the server-side session record (per the `onboarding-view-position` capability as modified by this change); when no sessionid or no base URL is stored (no sessionid or base URL stored — no stage data stored; the pre-change-cookie clause is retired by the hard cutover), the endpoint SHALL return `{ "state": "unavailable" }` without contacting Enable Banking. When both are stored **and no `AuthDone` marker is active for the sessionid**, the endpoint SHALL call the EB AIS session-status client method (per the `enable-banking-client` capability) and map the result to exactly one state:
 
 - `waiting` — the poll reported any status *value* other than the three terminal statuses, including unknown values (the vocabulary is closed by reverse-engineering of the Tilisy AIS frontend bundle — dynamic dispatch over `handle*` methods — so an unrecognized value is with certainty an intermediate; only `AuthDone`, `Cancelled`, and `Invalid` are interpreted).
 - `confirming` — `AuthDone` has been observed for this session (a sticky in-memory marker keyed by sessionid) but the whitelist confirmation has not yet succeeded and the retry budget is not exhausted. The endpoint SHALL NOT re-call the EB AIS endpoint while the marker is active — the marker is the session's state (this also makes the design robust against the tilisy session being cleaned up after `AuthDone`, e.g. `INVALID_SESSION` on subsequent calls). The SPA keeps its normal poll cadence through this state.
@@ -80,7 +84,8 @@ The endpoint SHALL log every status value observed from the EB AIS endpoint (inc
 - **THEN** the endpoint returns `{ "state": "waiting" }` and logs the observed status value (info level) without logging the sessionid
 
 ### Requirement: Linking sessionid privacy
-The EB AIS sessionid SHALL be handled as a capability token: it SHALL be stored only in the server-side session-cookie stage data (per the `onboarding-view-position` capability), SHALL NOT be exposed by `GET /api/onboarding/state` or any other SPA-facing endpoint, SHALL NOT be sent to the SPA outside the `authorization_url` it is embedded in, and SHALL NOT be written to logs. The SPA never parses, stores, or transmits the sessionid — it polls the BankTeller endpoint, which reads the sessionid server-side.
+
+The EB AIS sessionid SHALL be handled as a capability token: it SHALL be stored only in the server-side session record's stage data (per the `onboarding-view-position` capability as modified by this change — the cookie carries only the opaque session ID), SHALL NOT be exposed by `GET /api/onboarding/state` or any other SPA-facing endpoint, SHALL NOT be sent to the SPA outside the `authorization_url` it is embedded in, and SHALL NOT be written to logs. The SPA never parses, stores, or transmits the sessionid — it polls the BankTeller endpoint, which reads the sessionid server-side.
 
 #### Scenario: Sessionid is not exposed to the SPA
 - **WHEN** `GET /api/onboarding/state` responds with the stored `linking_progress` stage data
@@ -89,3 +94,7 @@ The EB AIS sessionid SHALL be handled as a capability token: it SHALL be stored 
 #### Scenario: Sessionid is not logged
 - **WHEN** the poll endpoint or client method logs a poll result or error
 - **THEN** the log line contains the observed status/error but not the sessionid value
+
+#### Scenario: Sessionid never reaches the client transport
+- **WHEN** any response or the session cookie value is inspected for the EB AIS sessionid
+- **THEN** it appears nowhere — the cookie holds only the opaque session ID, the state payload omits the sessionid, and no log line carries it

@@ -1,9 +1,13 @@
+# database Specification
+
+
+
+
 ## Purpose
 
 SQLite database infrastructure for BankTeller. The database is accessed through SQLDelight with the JDBC SQLite driver, runs in WAL journal mode with a busy timeout for safe concurrent access, and uses SQLDelight's migration framework for schema evolution. The `system_config` key/value table stores configuration such as the auto-generated JWT signing key.
 
 ## Requirements
-
 ### Requirement: SQLite database with SQLDelight
 The system SHALL use SQLite as its database, accessed through SQLDelight with the JDBC SQLite driver. The database file SHALL be located at `/data/bankteller.db` inside the container.
 
@@ -15,6 +19,10 @@ The system SHALL use SQLite as its database, accessed through SQLDelight with th
 - **WHEN** the server starts and a database file exists at `/data/bankteller.db`
 - **THEN** the system opens the existing database and applies any new pending migrations
 
+
+
+
+
 ### Requirement: WAL mode and busy timeout
 The system SHALL enable WAL journal mode and set a busy timeout of 5 seconds on every database connection. This enables safe concurrent reads and writes from background sync, on-demand requests, and workflow evaluation.
 
@@ -25,6 +33,10 @@ The system SHALL enable WAL journal mode and set a busy timeout of 5 seconds on 
 #### Scenario: Busy timeout set
 - **WHEN** a database connection is opened
 - **THEN** the system executes `PRAGMA busy_timeout=5000` before any queries
+
+
+
+
 
 ### Requirement: Schema migration framework with initial migration
 The system SHALL use SQLDelight's built-in migration mechanism (`SqlSchema.migrate()`) to manage database schema changes. The migration framework SHALL be wired up and functional from the first deployment. The initial migration SHALL create the `system_config` table. Future migrations add business tables.
@@ -41,6 +53,10 @@ The system SHALL use SQLDelight's built-in migration mechanism (`SqlSchema.migra
 - **WHEN** the server starts with a database at the current schema version
 - **THEN** the system skips the migration step and proceeds normally
 
+
+
+
+
 ### Requirement: System configuration table
 The system SHALL create a `system_config` table on first startup with columns `key TEXT PRIMARY KEY` and `value TEXT NOT NULL`. This table stores auto-generated keys and system-level configuration.
 
@@ -48,16 +64,21 @@ The system SHALL create a `system_config` table on first startup with columns `k
 - **WHEN** the database is initialized
 - **THEN** the `system_config` table exists with the correct schema
 
+
+
+
+
 ### Requirement: Auto-generated JWT signing key
-The system SHALL auto-generate a JWT signing key on first startup (256-bit random, stored as hex in the `system_config` table under key `jwt_signing_key`). The key SHALL be generated only once — if it already exists in the database, it SHALL NOT be regenerated.
+
+The system SHALL auto-generate a JWT signing key on first startup (256-bit random, stored as hex in the `system_config` table under key `jwt_signing_key`). The key SHALL be generated only once — if it already exists in the database, it SHALL NOT be regenerated. After this change the key is retained for deployment continuity but has no active consumer (session cookies carry opaque store keys and the state JWT is retired); generation-once semantics are unchanged.
 
 #### Scenario: JWT signing key generated on first startup
 - **WHEN** the server starts for the first time and no JWT signing key exists in `system_config`
-- **THEN** the system generates a 256-bit random key, stores it under key `jwt_signing_key`, and uses it for session token signing
+- **THEN** the system generates a 256-bit random key and stores it under key `jwt_signing_key`
 
 #### Scenario: JWT signing key reused on subsequent startups
 - **WHEN** the server starts and a JWT signing key already exists in `system_config`
-- **THEN** the system loads the existing key and uses it for session token signing
+- **THEN** the system loads the existing key without regenerating it
 
 ### Requirement: Balances and sync log tables
 
@@ -80,6 +101,10 @@ The migration SHALL apply on startup per the existing migration framework. The `
 - **WHEN** a sync run executes for a session
 - **THEN** a `sync_log` row is inserted with the trigger type, start timestamp, and — on completion — the end timestamp and status
 
+
+
+
+
 ### Requirement: Consent expiry and logo columns on eb_sessions
 
 The same migration SHALL extend the `eb_sessions` table with two nullable columns: `valid_until` (TEXT — the consent-expiry timestamp exactly as returned by Enable Banking; authoritative, never recomputed from a local clock plus validity) and `logo` (TEXT — the ASPSP logo URL persisted at authorization time; the image itself is never stored, it is fetched on demand via the existing logo proxy). Both columns are nullable and consumers SHALL degrade gracefully when they are NULL (no consent label rendered; no logo rendered).
@@ -94,6 +119,10 @@ The session-merge deletion paths SHALL clean up dependent rows: when a re-author
 - **WHEN** a re-authorization merges accounts and deletes a previous session of the same bank
 - **THEN** the deleted session's `sync_log` rows are removed in the same transaction, while accounts missing from the new authorization are re-pointed to the new session row with `in_consent = 0` and their `balances` rows survive
 
+
+
+
+
 ### Requirement: Migration version inference accounts for new tables
 
 The `DatabaseFactory` version-inference ladder for databases with `user_version = 0` (created before the migration framework existed) SHALL distinguish the new schema: a database containing `eb_sessions` and `accounts` but NOT `balances`/`sync_log` SHALL be inferred as the PRIOR schema version and migrated to current, not assumed to be latest. The inference SHALL be covered by a JVM test exercising the `user_version = 0` partial-table path.
@@ -101,6 +130,10 @@ The `DatabaseFactory` version-inference ladder for databases with `user_version 
 #### Scenario: Pre-migration-framework database migrates
 - **WHEN** the server starts against a `user_version = 0` database that has `eb_sessions` and `accounts` but no `balances`/`sync_log` tables
 - **THEN** the inference ladder resolves the prior schema version, the pending migration applies, and the new tables and columns exist afterwards
+
+
+
+
 
 ### Requirement: BIC and local-copy columns
 
@@ -117,6 +150,10 @@ The schema extension is one amended migration (pre-release ruling: the change ha
 #### Scenario: Pre-migration-framework database migrates
 - **WHEN** the server starts against a `user_version = 0` database in a prior schema state
 - **THEN** the inference ladder resolves the correct prior version, the pending migrations apply, and the new columns exist afterwards
+
+
+
+
 
 
 ### Requirement: Ever-onboarded marker
@@ -140,6 +177,10 @@ The system SHALL persist an ever-onboarded marker (a `system_config` key, e.g. `
 - **THEN** the marker read treats the user as onboarded — no pre-change user regresses on upgrade
 
 
+
+
+
+
 ### Requirement: Remove-connection cleanup transaction
 
 Removing a bank connection SHALL delete everything derived from that connection in ONE transaction: the `eb_sessions` row, its `accounts` rows (including kept-as-local-copy accounts), those accounts' `balances` rows, and the session's `sync_log` rows. The phrase "everything derived from this connection" is the contract the future transaction and workflow features inherit — when those features add derived data (transactions, automation references), their removal joins this transaction.
@@ -147,6 +188,10 @@ Removing a bank connection SHALL delete everything derived from that connection 
 #### Scenario: Remove deletes all derived rows atomically
 - **WHEN** a bank connection is removed
 - **THEN** the session row, its accounts (synced and local-copy), their balances, and the session's sync-log rows are all deleted in a single transaction — no partial state survives a failure mid-removal
+
+
+
+
 
 
 ### Requirement: Cross-session account matching by identification hash with IBAN fallback
@@ -170,6 +215,10 @@ The same-bank re-authorization merge SHALL match incoming accounts against the p
 - **THEN** the hash match updates the row in place (including the new IBAN) — the account is recognized as the same real-world account, not duplicated and not reported missing
 
 
+
+
+
+
 ### Requirement: Local-copy deletion transaction
 
 Deleting a kept-as-local-copy account SHALL remove the account row and its `balances` rows in one transaction. This is the only per-account deletion path for already-kept local copies (the remove-connection flow deletes whole connections; the merge never deletes accounts; the missing-accounts dialog's scoped delete covers newly missing accounts at their detection) — gated by a confirmation dialog at the UI layer (per the `bank-connection-management` capability's local-copy accounts requirement).
@@ -178,3 +227,44 @@ Deleting a kept-as-local-copy account SHALL remove the account row and its `bala
 - **WHEN** a user deletes a kept-as-local-copy account from the bank connections section
 - **THEN** the account row and its `balances` rows are removed in a single transaction
 
+
+
+
+
+
+### Requirement: Sessions and flow-records tables
+
+The system SHALL add two tables via a new SQLDelight migration:
+
+- `sessions`: one row per live login session — `id` (TEXT PRIMARY KEY, the opaque cookie token), `username` (TEXT NOT NULL), `payload` (TEXT NOT NULL — the serialized session flow state), `created_at` (INTEGER), `expires_at` (INTEGER). Expiry is sliding: `expires_at` is extended on each authenticated request (on session read as well as write — a read-only browsing pattern must not expire). Expired rows are pruned lazily on access and by a background sweep. The session store SHALL implement Ktor's `SessionStorage` interface (`read`/`write`/`invalidate`) against this table.
+- `flow_records`: one row per in-flight bank-redirect flow — `state_token` (TEXT PRIMARY KEY, the opaque OAuth `state` value), `kind` (TEXT NOT NULL — `bank_auth` | `email_link`), `owner` (TEXT NOT NULL — the owning username), `status` (TEXT NOT NULL), `payload` (TEXT NOT NULL — kind-specific JSON: `bank_auth` records carry the staged ASPSP logo URL and BIC at initiation and the outcome fields after the callback; `email_link` records carry the email-link context), `created_at` (INTEGER), `expires_at` (INTEGER, `STATE_TTL_MINUTES` default 60). Expired rows are pruned lazily on access.
+
+Both tables are owner-keyed (`username` / `owner` indexed), making the storage multi-user-ready without further schema change.
+
+#### Scenario: Login writes a session row
+- **WHEN** a user logs in
+- **THEN** a `sessions` row exists keyed by the new opaque ID with the username, serialized flow-state payload, and a sliding `expires_at`
+
+#### Scenario: Auth initiation writes a flow-record row
+- **WHEN** `POST /api/auth` succeeds
+- **THEN** a `flow_records` row exists with kind `bank_auth`, the session owner, status pending, and `expires_at` set by `STATE_TTL_MINUTES`
+
+#### Scenario: Expired rows are pruned
+- **WHEN** a session or flow record past its expiry is accessed (or the background sweep runs)
+- **THEN** the row is deleted and the corresponding token is treated as unknown
+
+### Requirement: EB application table
+
+The system SHALL add an `eb_application` table via the same migration, holding the Enable Banking application's state as a typed single row (`id INTEGER PRIMARY KEY` row identity — one row today, row-per-application in a multi-user/multi-application future): `application_id` (TEXT), `private_key` (TEXT — PKCS#8 PEM), `refresh_token` (TEXT), `email` (TEXT), `redirect_url` (TEXT), `ever_onboarded` (INTEGER — the marker set at the first successful authorization), `missing_accounts` (TEXT — the one-shot missing-accounts signal payload). The existing `system_config` values `enable_banking_application_id`, `enable_banking_private_key`, `enable_banking_refresh_token`, `enable_banking_email`, `enable_banking_redirect_url`, and `ever_onboarded` SHALL be migrated into this row at migration time, and the retired `enable_banking_previously_active` key SHALL be deleted if present (pre-release: a development database's values may simply be dropped — no released deployment exists). The missing-accounts signal has NO `system_config` predecessor — it is today the volatile in-memory `MissingAccountSignalStore` (never a database row, by its pre-change design) and becomes durable on the `eb_application` row. After the migration, `system_config` SHALL contain only `jwt_signing_key` and `password_hash` (the auth capability's bcrypt password hash — retained). All Enable Banking credential reads and writes (credential provider, control-plane client refresh-token lifecycle, onboarding registration, ever-onboarded marker, missing-accounts signal store) SHALL target the `eb_application` row.
+
+#### Scenario: Application state is one typed row
+- **WHEN** the system checks whether the Enable Banking application is configured
+- **THEN** it checks the `eb_application` row's `application_id` and `private_key` — no `system_config` application-key reads
+
+#### Scenario: Missing-accounts signal lives on the application row
+- **WHEN** a re-authorization merge computes a missing-accounts set
+- **THEN** the signal is stored on the `eb_application` row's `missing_accounts` column (durable — it was in-memory before this change) and consumed once by the next `GET /api/accounts` response, exactly as before the move (application-scoped semantics unchanged)
+
+#### Scenario: system_config is reduced
+- **WHEN** the migration has run
+- **THEN** `system_config` contains only `jwt_signing_key` and `password_hash`

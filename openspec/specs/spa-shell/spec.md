@@ -1,11 +1,13 @@
+# spa-shell Specification
+
 ## Purpose
 
 Compose Multiplatform wasmJs/JS web frontend for BankTeller — the browser-delivered single-page application. Provides the login screen, the post-login account overview (per the `account-overview` capability), session-aware routing (unauthenticated users are redirected to login; authenticated users cannot reach the login screen), a logout action, the onboarding gate shown when Enable Banking credentials are missing, invalid, or the application is inactive, and public routes (`/privacy`, `/terms`, `/enable-banking-callback`, `/sandbox-credentials`) rendered without the auth gate.
 
 ## Requirements
-
 ### Requirement: Login screen
-The SPA SHALL present a login screen with username and password fields and a submit button. The login screen SHALL be the default route when no authenticated session exists. The login screen SHALL render inside `BankTellerTheme` and use the theme mode persisted in browser storage (defaulting to the system preference). It SHALL use the ScreenShell layout with width `Form` and display the brand logo lockup above the credentials form. The login screen SHALL have no top app bar (per DESIGN-LANGUAGE §5.1); the theme toggle SHALL float at the top-end corner over the content, not in a top bar. The submit button SHALL be styled as a pill (fully rounded) primary action per the design system's button standards.
+
+The SPA SHALL present a login screen with username and password fields and a submit button. The login screen SHALL be the default route when no authenticated session exists. The login screen SHALL render inside `BankTellerTheme` and use the theme mode persisted in browser storage (defaulting to the system preference). It SHALL use the ScreenShell layout with width `Form` and display the brand logo lockup above the credentials form. The login screen SHALL have no top app bar (per DESIGN-LANGUAGE §5.1); the theme toggle SHALL float at the top-end corner over the content, not in a top bar. The submit button SHALL be styled as a pill (fully rounded) primary action per the design system's button standards. When the login gate latched a session-expiry reason (per the `session-management` capability's session-timeout feedback requirement), the login screen SHALL render the one-shot, dismissible brass `DecisionBox` panel (Tier 3 — leading 18dp `Icons.Outlined.WarningAmber` outlined glyph, trailing dismiss affordance, the remove-caveat panel's grammar) above the credentials form — never inside the dashboard shell or the wizard — with the copy naming the inactivity window; the panel does not alter the form's behavior or layout contract otherwise.
 
 #### Scenario: Unauthenticated user sees login
 - **WHEN** a user navigates to the application without an authenticated session
@@ -43,6 +45,10 @@ The SPA SHALL present a login screen with username and password fields and a sub
 - **WHEN** the onboarding gate renders
 - **THEN** the `BrandedTopBar` actions row contains the `ThemeToggle` followed by the logout control and nothing else
 
+#### Scenario: Session-expiry panel renders above the credentials form
+- **WHEN** the login screen renders with a latched session-expiry reason
+- **THEN** the brass DecisionBox panel (leading warning glyph, trailing dismiss affordance) renders between the brand lockup and the credentials form, and the form fields and submit button behave as before
+
 ### Requirement: Session-aware routing
 The SPA SHALL check authentication state before rendering the dashboard. Unauthenticated users SHALL be redirected to the login screen. The login screen SHALL NOT be accessible to already-authenticated users (they are redirected to the dashboard).
 
@@ -54,12 +60,14 @@ The SPA SHALL check authentication state before rendering the dashboard. Unauthe
 - **WHEN** an authenticated user navigates to the login screen
 - **THEN** the SPA redirects to the dashboard
 
+
 ### Requirement: Logout action
 The SPA SHALL provide a logout action on the dashboard that calls the server logout endpoint and clears the local session state.
 
 #### Scenario: User logs out
 - **WHEN** an authenticated user clicks the logout action
 - **THEN** the SPA calls the logout endpoint, clears session state, and redirects to the login screen
+
 
 ### Requirement: Onboarding gate screen
 The SPA SHALL render a transient onboarding gate screen when Enable Banking credentials are missing, invalid, or the application is not yet active, layered over the dashboard rather than integrated into any navigation structure. The gate SHALL be reachable only via the missing/invalid/inactive-credentials condition — there SHALL be no navigation entry that opens onboarding once credentials are valid and active. The gate SHALL guide the user through the automated flow: (1) enter Enable Banking email ONLY — no environment, redirect URL, or production fields at this step; the SPA displays the server-derived redirect URL as informational text so the user can spot a misconfigured reverse proxy before sending the email; (2) the SPA calls `POST /api/onboarding/enable-banking/start` (receiving a `state` token in the response) and enters a "waiting for authentication…" state in which it polls `GET /api/onboarding/enable-banking/wait?state=<token>` every 1-2 seconds (with backoff); the polling returns one of three statuses: `pending` (no callback yet), `complete` (auth validated — the callback ran `emailLinkSignin` successfully and cached the Firebase idToken), or `auth_failed` (the callback's `emailLinkSignin` failed — invalid/expired oobCode); the waiting step shows the derived redirect URL that was used, with a "something wrong?" troubleshooting hint so the user can spot a misconfigured proxy if the email-link click never arrives; (3) when the poll reports `complete` (because the user has clicked the email link, possibly on a different device, and the server's callback route ran `emailLinkSignin` successfully via the `state` token), the SPA **auto-advances** to the RegistrationReview step (see design D13) — the completion endpoint is NOT yet called; on `auth_failed`, the SPA surfaces an error and returns the user to the email-entry step; (4) the RegistrationReview step shows: an environment selector (defaulting to PRODUCTION — production access is what users typically want; SANDBOX is a deliberate opt-in for testing) with inline help text (or a tooltip via an info icon next to each option) explaining what each environment means per design D13, the redirect URL (pre-filled with the derived value from `GET /api/onboarding/enable-banking/redirect-url`, editable), and (when environment=PRODUCTION, which is the default) the auto-derived `description`, `gdpr_email`, `privacy_url`, `terms_url` per D13 (all editable); on submit, the SPA calls `POST /api/onboarding/enable-banking/complete` with the `state` token and the user-confirmed environment, redirect URL, and optional production-field overrides; (5) the SPA shows a "verifying…" spinner while the server runs the GIT login → key generation → registration → verification sequence; (6) on success with `active: true`, the gate closes and the dashboard renders; (7) on success with `active: false`, the SPA shows the activation guide. The SPA may display a hint that the user may click the email link on another device and the waiting tab will auto-advance.
@@ -112,6 +120,7 @@ The SPA SHALL render a transient onboarding gate screen when Enable Banking cred
 - **WHEN** any step of the automated flow fails (GIT login error, registration error, verification error)
 - **THEN** the SPA displays the error message; for retryable registration failures (EB validation error, transient error), the SPA returns the user to the RegistrationReview step with the error banner (the cached idToken is still valid for ~1hr, so resubmission does NOT require a new email link); for non-retryable failures (expired idToken, auth failure), the SPA offers a "restart onboarding" action that returns the user to the email-entry step
 
+
 ### Requirement: Public routes rendered by the SPA without auth gate
 
 The existing requirement is modified: the SPA SHALL render **four** public routes — `/privacy`, `/terms`, `/enable-banking-callback`, and `/sandbox-credentials` — WITHOUT going through the authenticated `checkAuth()` + `Screen`-enum flow. The single early-return mechanism at the top of `App()` is unchanged (path inspection before any auth check; no routing library). The three existing public screens are unchanged (ScreenShell with floating ThemeToggle, no API calls). The new `/sandbox-credentials` screen renders the sandbox credentials popup per the `onboarding` capability's sandbox credentials popup route requirement and deviates from the existing public-screen conventions in two scoped ways: (1) it uses a compact brand lockup with a quiet `SANDBOX` chip and NO theme toggle (the theme is inherited from the origin tab via shared localStorage — a utility window is not a theme-switching surface); (2) it is the SOLE public screen that makes an API call — the session-cookie-authenticated `GET /api/aspsps` — because its content is bank data, not static prose. The endpoint enforces its own session check: a 401 renders the in-window error presentation (per the popup route requirement's edge-case matrix), never a redirect to the login screen. The route's URL parameters carry bank identity only, never credentials, and untrusted parameter values SHALL NOT be echoed in any rendered copy.
@@ -127,6 +136,7 @@ The existing requirement is modified: the SPA SHALL render **four** public route
 #### Scenario: Non-public path falls through to auth-gated flow
 - **WHEN** the SPA loads at any path other than the four public routes (e.g., `/`, `/login`, `/dashboard`)
 - **THEN** the public-route early-return does NOT fire; the SPA falls through to the existing `checkAuth()` + `when (viewModel.currentScreen)` flow, exactly as before this change
+
 
 ### Requirement: Post-implementation Layout and Affordance Fixes
 The SPA SHALL apply the following corrections identified during code review of the initial implementation. These build on the Shell and Wizard requirements and SHALL override any conflicting patterns in pre-change specifications.
