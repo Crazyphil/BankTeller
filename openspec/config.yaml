@@ -44,9 +44,10 @@ context: |
 rules:
   tasks:
     - >
-      As a last section of the tasks, include a manual verification section
-      with tasks that are followed by the human to give the change's final
-      result a last manual test. Don't write these tasks from a technical
-      perspective, instead they should demonstrate what happens when you
-      interact with the system like a user would and the various situations a
-      user could get into affected by the change.
+      As a last section of the tasks, include a manual verification section with
+      tasks that are followed by the human to give the change's final result a
+      last manual test. Don't write these tasks from a technical perspective,
+      instead they should demonstrate what happens when you interact with the
+      system like a user would and the various situations a user could get into
+      affected by the change.
+skillsScope: project
