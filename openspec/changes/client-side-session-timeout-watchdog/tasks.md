@@ -1,0 +1,43 @@
+# Tasks
+
+## 1. Server: TTL provisioning
+
+- [ ] 1.1 Add the effective `SESSION_TTL_MINUTES` (`ttlMinutes`) field to the `/api/login` success response and the `/api/me` authenticated response in `Application.kt`; verify with a server test asserting both payloads carry the configured TTL (and the default 15 when unset).
+- [ ] 1.2 Extend `ApiClient.checkAuth` (and the login response parse) to surface `ttlMinutes` to `AppViewModel`; verify the existing `AppViewModelTest` auth flows still pass and a new assertion sees the captured TTL after login/checkAuth.
+
+## 2. Server: remove the reason machinery
+
+- [ ] 2.1 Reduce the SessionAuth middleware in `Application.kt` to a plain 401 gate: delete the `classifyExpired` call, the `X-Session-Reason`/`X-Session-Ttl-Minutes` headers, and the `UnauthorizedBody` reason/TTL fields (keep the plain error message). Rework `ApplicationTest.kt`'s reason-header/one-shot assertions into the new expectation. Verify a server test: an authenticated request with an expired/unknown session answers a plain 401 with no reason headers and a plain body.
+- [ ] 2.2 Remove the page-route classification and latch-script injection from ALL THREE page-serving sites: the `/` root route and the `/{path...}` SPA-fallback in `Application.kt`, AND `OnboardingRoutes.kt`'s `serveSpaBundle` (the bank-return document routes); each serves plain cacheable `index.html` (drop the `no-store` special case). Delete `SessionExpiryLatchRouteTest.kt` (root, serveSpaBundle, and one-shot injection are all gone) and add a replaced-behavior test. Verify server tests: GET `/` and the onboarding callback document route with an expired session cookie each serve unmodified `index.html` (no injected script, no `no-store`).
+- [ ] 2.3 Delete `classifyExpired` from `SqlDelightSessionStorage` and restore lazy read-prune: `read` treats an expired record as absent AND prunes the row in the same access. Remove the classify test suite and the sweep-tripwire characterization test (`SqlDelightSessionStorageTest:124`) with it; add storage tests: expired row → `read` throws/absent AND row is gone after the read. Verify `./gradlew :server:test` passes.
+- [ ] 2.4 Sweep the codebase for leftover reason-channel references (grep `Session-Reason`, `session_expired`, `X-Session`, `classifyExpired`, the injected `bankteller_session_expired_ttl` literal) in BOTH `server/src/main` and `server/src/test` and remove dead fixtures/comments. Verify the grep comes back empty in both trees.
+
+## 3. Client: activity clock and TTL state
+
+- [ ] 3.1 Add the `bankteller_session_last_activity` shared timestamp: the response-pipeline interceptor writes `now` to localStorage on every successful authenticated response, and a successful login RESETS it (a fresh session must not inherit the prior session's stale clock). Verify a karma-container browser test: after a successful API call the key holds the current time, and after a fresh login it is reset to now; jvm `AppViewModelTest` equivalents use the in-memory `Platform.jvm.kt` storage.
+- [ ] 3.2 Store the latest provisioned TTL in `AppViewModel` (from login/checkAuth payloads per 1.2) with a localStorage-backed copy under the `bankteller_session_ttl_minutes` key. Verify a unit test: TTL survives a ViewModel re-init (localStorage restore) and updates on a re-login with a changed value.
+
+## 4. Client: watchdog evaluation path
+
+- [ ] 4.1 Implement `evaluateSessionLiveness()` in `AppViewModel`: if in-session (or boot-evaluating) and `now - lastActivity > ttlMinutes` → probe `/api/me` once (in-flight guard against concurrent triggers) with a TRI-STATE verdict: 200 → refresh `lastActivity` + TTL; 401 → latch the TTL and route to Login; network error/timeout → NOT a verdict, stay put (retry on next trigger — requires splitting `ApiClient.checkAuth`'s conflated Unauthenticated-on-exception return or issuing the probe as a raw call). Verify unit tests: expired-and-probe-401 → Login + panel latch; expired-but-probe-200 (clock-skew self-heal) → no routing, clock refreshed; probe-network-error → nothing happens, no latch; not-expired → no probe sent.
+- [ ] 4.2 Wire the three triggers to the same evaluation path: a `delay`-loop timer coroutine scheduled to the remaining TTL window; a window-focus listener (wasmJs `Platform.wasmJs.kt` external, jvm no-op or injectable hook — follow the sandbox-popup pattern); and the boot branch — when `checkAuth` resolves Unauthenticated, a stale persisted activity clock latches the expiry feedback and routes to Login with the panel (the cold-boot/browser-reopen-overnight case; a live clock renders the plain unauthenticated login). Verify unit tests: each trigger drives the shared path; the boot branch with a stale clock latches + routes, with a live clock does not.
+- [ ] 4.3 Update `handleSessionExpired` to the backstop semantics: any 401 while `isAuthenticated` latches the known TTL (restored from the `bankteller_session_ttl_minutes` store when the in-memory copy is null — the cross-tab/cold-boot case) and routes to Login; deliberate logout keeps clearing the latch first, and BOTH dismissal and logout clear the persisted activity clock (so a reload cannot re-latch via the boot branch). Delete the reason-parameter semantics and REWORK the existing latch suite (`AppViewModelTest`'s `handleSessionExpired("session_expired", …)` call sites) into the new probe/backstop-shaped tests (they cannot compile/route as written after the signature change). Verify unit tests: in-session plain 401 latches the panel; another-tab latch restore works; logout latches nothing (including after a "reload"); re-login consumes the latch; dismissal survives a "reload" (one-shot semantics carry over after rework).
+
+## 5. Client: panel and integration
+
+- [ ] 5.1 Confirm `LoginScreen.kt` needs no change (the latch key and DecisionBox rendering are untouched) and remove any client-side code that parsed 401 reason headers (`ApiClient.kt:49-56` interceptor simplification — every 401 is plain). Verify the full `AppViewModelTest` latch suite passes in the karma container along with the panel browser test: panel renders on watchdog-confirmed expiry, not after logout/fresh visit, one-shot dismissal.
+- [ ] 5.2 Run the full verification: `./gradlew :server:test` and `./gradlew :app:web:containerWasmJsBrowserTest` (after `./scripts/build-browser-tests-image.sh` if the image is missing) — both green.
+
+## 6. Manual verification
+
+- [ ] 6.1 Log in, open the dashboard, and do nothing for longer than the configured TTL with the tab visible: the app redirects to the login screen on its own and the brass panel names the inactivity window ("Your session expired after 15 minutes of inactivity. Please sign in again." — or the configured TTL).
+- [ ] 6.2 Log in, switch to another application/tab for well past the TTL, then return to the BankTeller tab: you land directly on the login screen with the expiry panel — you never get to type into a dead form, and no error toast appears.
+- [ ] 6.3 Manually distort the client clock (or lower the TTL in `.env` mid-session): on the next focus/timer evaluation you are briefly considered expired, but the probe's 200 keeps you where you are — no redirect, no panel, work continues.
+- [ ] 6.4 Log in, stay active (click around) for longer than a single TTL window: no redirect happens — activity keeps the session alive.
+- [ ] 6.5 Deliberately log out, then visit the login screen (including a page reload): no expiry panel. Log in again after a timeout redirect: the panel is gone (one-shot), the dashboard loads normally. Dismiss the expiry panel after a timeout redirect and press F5: the panel does not come back.
+- [ ] 6.6 Overnight case, both reboot paths (the reported bug): (a) with the tab still open — force `sessions.expires_at` into the past in the active database (the container loop's `bankteller-data` volume at `/data/bankteller.db`, or the local `./data/bankteller.db` when on the `:server:run` loop; or leave the app overnight) and refocus the tab; (b) with a fresh page load — same forced expiry, then reload the page / reopen the browser. In BOTH cases the login screen shows WITH the expiry panel naming the inactivity window — the panel no longer depends on any server-side record surviving or on a live page instance.
+
+## Workflow follow-up
+
+- Archive the change after the project's review requirements are satisfied.
+- Verify the archived result.
