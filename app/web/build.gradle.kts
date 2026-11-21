@@ -1,4 +1,5 @@
 import org.gradle.api.tasks.Exec
+import org.gradle.api.tasks.testing.Test
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpack
 
@@ -43,6 +44,17 @@ kotlin {
         binaries.executable()
     }
 
+    // -----------------------------------------------------------------------
+    // Test-only JVM target (accessibility change D5, module-structure spec
+    // delta): a hermetic JVM runner for the WCAG contrast verification.
+    // Registers NO production code — jvmMain exists only to satisfy the
+    // expect/actual contract so commonMain (and thus commonTest, which is
+    // what this target really compiles) can build on the JVM. The module's
+    // production target set stays wasmJs-only: this target contributes no
+    // distribution artifact, no js fallback, and nothing the server consumes.
+    // See src/jvmMain/.../*.jvm.kt for the throwaway actuals.
+    jvm()
+
     sourceSets {
         commonMain.dependencies {
             api(projects.core)
@@ -66,6 +78,29 @@ kotlin {
             implementation(libs.wrappers.browser)
             implementation(libs.ktor.client.js)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// jvmTest runs ONLY the hermetic contrast test (accessibility D5)
+// ---------------------------------------------------------------------------
+// The commonTest suite is wasmJs-shaped: AppViewModel/localStorage/browser-
+// actual tests dominate it, and the JVM actuals under src/jvmMain are inert
+// throwaways that merely satisfy the expect/actual contract (createHttpClient
+// throws, localStorage is an in-memory map, browser navigation throws). Running
+// that suite on the JVM would produce misleading failures, not signal. The one
+// JVM-worthy test is ThemeContrastTest — pure token arithmetic over the color
+// constants with zero browser/ViewModel dependencies. Filter jvmTest to it so
+// `./gradlew :app:web:jvmTest` stays hermetic and fast, while the containerized
+// wasmJs Karma run keeps exercising the full suite.
+tasks.named("jvmTest", Test::class) {
+    filter {
+        // The hermetic pair: the contrast matrix and the DecisionBox
+        // brass-rule resolution — both pure arithmetic, zero browser or
+        // ViewModel dependencies (DecisionBoxBorderColorTest pins the
+        // structural two-state rule, reviewer finding 4).
+        includeTestsMatching("it.kapfer.bankteller.ThemeContrastTest")
+        includeTestsMatching("it.kapfer.bankteller.DecisionBoxBorderColorTest")
     }
 }
 
@@ -246,4 +281,13 @@ val containerWasmJsBrowserTest = tasks.register("containerWasmJsBrowserTest", Ex
 // `check` so a normal `./gradlew test` / `check` exercises it.
 tasks.named("check") {
     dependsOn(containerWasmJsBrowserTest)
+    // Hermetic compile gate (review finding 1, wcag-color-conformance):
+    // commonTest compiles for EVERY target — wasmJs included — and JVM-only
+    // idioms there compile green on jvmTest while silently breaking the
+    // wasmJs test compilation (the containerized Karma suite's
+    // prerequisite). Without a container engine on the host, nothing else
+    // ever compiles these sources; wiring the compile task into check
+    // makes an ordinary `./gradlew check` fail fast on any future
+    // target-specific idiom that slips into commonTest.
+    dependsOn(tasks.named("compileTestKotlinWasmJs"))
 }

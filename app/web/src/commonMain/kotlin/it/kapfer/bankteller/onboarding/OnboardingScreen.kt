@@ -204,6 +204,7 @@ private fun StatusNote(
 ) {
     DecisionBox(
         tint = LocalBankTellerColors.current.brass,
+        borderColor = LocalBankTellerColors.current.brassText,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
@@ -213,7 +214,12 @@ private fun StatusNote(
             Icon(
                 imageVector = Icons.Filled.Warning,
                 contentDescription = null,
-                tint = LocalBankTellerColors.current.brass,
+                // Two-state brass on the wash mount: the glyph reads
+                // brassText (bronze) — the gold glyph on its own wash
+                // over sc measured 2.9969:1, under the 3:1 non-text
+                // threshold (the D2 sideline precedent, applied to the
+                // glyph carrier).
+                tint = LocalBankTellerColors.current.brassText,
                 modifier = Modifier.size(18.dp),
             )
             Text(
@@ -1928,15 +1934,18 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
         if (isReAuth && viewModel.reAuthBank?.hasStoredAccounts == true) {
             Spacer(modifier = Modifier.height(Dimens.sm))
             val brass = LocalBankTellerColors.current.brass
+            val brassText = LocalBankTellerColors.current.brassText
             DecisionBox(
+                // Two-state brass: gold wash, bronze sideline (accessibility D2).
                 tint = brass,
-                borderColor = brass,
+                borderColor = brassText,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
                     text = "ACCOUNT SELECTION NOTICE",
                     style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 0.15.sp),
-                    color = brass,
+                    // Two-state brass: the notice headline is TEXT → bronze.
+                    color = brassText,
                 )
                 Spacer(modifier = Modifier.height(Dimens.xs))
                 Text(
@@ -2195,8 +2204,11 @@ private fun BankStatusBadge(status: String) {
     if (!isYellow && !isRed) return
 
     val brass = LocalBankTellerColors.current.brass
+    val brassText = LocalBankTellerColors.current.brassText
     val error = MaterialTheme.colorScheme.error
-    val textColor = if (isYellow) brass else error
+    // Two-state brass: the yellow badge's "Issues" label and glyph are
+    // TEXT/glyph carriers → bronze; the 12% wash stays ornament gold.
+    val textColor = if (isYellow) brassText else error
     val bgColor = if (isYellow) brass.copy(alpha = 0.12f) else error.copy(alpha = 0.12f)
     val label = if (isYellow) "Issues" else "Outage"
     val tooltip = if (isYellow) "Possible issues" else "Major issues"
@@ -2249,6 +2261,9 @@ private fun CommitmentStatusWarning(
     if (!isYellow && !isRed) return
 
     val tint = if (isYellow) LocalBankTellerColors.current.brass else MaterialTheme.colorScheme.error
+    // Two-state brass: the yellow headline is TEXT → bronze; the wash and
+    // the 18dp warning glyph keep the ornament token.
+    val headlineColor = if (isYellow) LocalBankTellerColors.current.brassText else MaterialTheme.colorScheme.error
     val headline = if (isYellow) {
         "Bank reporting possible issues"
     } else {
@@ -2271,6 +2286,9 @@ private fun CommitmentStatusWarning(
 
     DecisionBox(
         tint = tint,
+        // Two-state brass: bronze sideline on the brass variant; the
+        // error variant keeps the danger sideline.
+        borderColor = if (isYellow) LocalBankTellerColors.current.brassText else tint,
         modifier = modifier.fillMaxWidth(),
     ) {
         Row(
@@ -2281,13 +2299,18 @@ private fun CommitmentStatusWarning(
                 imageVector = icon,
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
-                tint = tint,
+                // Two-state brass on the yellow wash mount: the glyph reads
+                // bronze when the tier is brass (the gold glyph on its own
+                // wash over sc measured 2.9969:1, under 3:1 — the D2
+                // sideline precedent, applied to the glyph carrier);
+                // the danger tier keeps the error token.
+                tint = if (isYellow) LocalBankTellerColors.current.brassText else tint,
             )
             Text(
                 text = headline,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = tint,
+                color = headlineColor,
             )
         }
         Spacer(modifier = Modifier.height(Dimens.xs))

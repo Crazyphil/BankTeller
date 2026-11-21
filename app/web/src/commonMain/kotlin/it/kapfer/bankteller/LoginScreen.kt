@@ -97,6 +97,7 @@ fun LoginScreen(viewModel: AppViewModel) {
             // or after a re-login.
             viewModel.sessionExpiredTtlMinutes?.let { ttl ->
                 val brass = LocalBankTellerColors.current.brass
+                val brassText = LocalBankTellerColors.current.brassText
                 // Calm fade-in (task 2.5): the panel materializes gently rather
                 // than appearing abruptly alongside the form.
                 var visible by remember { mutableStateOf(false) }
@@ -105,7 +106,8 @@ fun LoginScreen(viewModel: AppViewModel) {
                     visible = visible,
                     enter = androidx.compose.animation.fadeIn(),
                 ) {
-                    DecisionBox(tint = brass, borderColor = brass, modifier = Modifier.fillMaxWidth()) {
+                    // Two-state brass: gold wash, bronze sideline (accessibility D2).
+                    DecisionBox(tint = brass, borderColor = brassText, modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -114,7 +116,12 @@ fun LoginScreen(viewModel: AppViewModel) {
                         Icon(
                             imageVector = Icons.Outlined.WarningAmber,
                             contentDescription = null,
-                            tint = brass,
+                            // Two-state brass on the wash mount: the glyph
+                            // reads brassText (bronze) — the gold glyph on
+                            // its own wash over sc measured 2.9969:1, under
+                            // the 3:1 non-text threshold (the D2 sideline
+                            // precedent applied to the glyph carrier).
+                            tint = brassText,
                             modifier = Modifier.size(18.dp),
                         )
                         Text(

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.WarningAmber
@@ -60,7 +61,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -733,7 +736,9 @@ private fun BankConnectionsSection(
         // an error. Rendered until dismissed (clearRemoveCaveat).
         viewModel.removeCaveat?.let { caveat ->
             val brass = LocalBankTellerColors.current.brass
-            DecisionBox(tint = brass, borderColor = brass, modifier = Modifier.fillMaxWidth()) {
+            val brassText = LocalBankTellerColors.current.brassText
+            // Two-state brass: gold wash, bronze sideline (accessibility D2).
+            DecisionBox(tint = brass, borderColor = brassText, modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -742,7 +747,12 @@ private fun BankConnectionsSection(
                     Icon(
                         imageVector = Icons.Outlined.WarningAmber,
                         contentDescription = null,
-                        tint = brass,
+                        // Two-state brass on the wash mount: the glyph reads
+                        // brassText (bronze) — the gold glyph on its own wash
+                        // over sc measured 2.9969:1, under the 3:1 non-text
+                        // threshold (the D2 sideline precedent, applied to
+                        // the glyph carrier).
+                        tint = brassText,
                         modifier = Modifier.size(18.dp),
                     )
                     Text(
@@ -960,10 +970,16 @@ private fun ConnectionCard(viewModel: AppViewModel, bank: BankData) {
 
 @Composable
 private fun ConnectionHeader(bank: BankData) {
-    val brass = LocalBankTellerColors.current.brass
+    // TOP-anchored (wcag-color-conformance manual-verification 6.1 finding, the
+    // long-name overflow case): the badge pins to the header's TOP RIGHT no
+    // matter how many lines the bank name wraps to — a vertically CENTERed
+    // row would sink the badge toward the middle of a tall wrapped name
+    // block. Top alignment anchors logo, text block, and badge to one top
+    // edge: the badge reads as belonging to the header's top-right corner
+    // for every bank, short-named or wrapped.
     Row(
         modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = Alignment.Top,
         horizontalArrangement = Arrangement.spacedBy(Dimens.md),
     ) {
         BankLogo(
@@ -984,18 +1000,124 @@ private fun ConnectionHeader(bank: BankData) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        // Consent-health badge (D5): quiet on healthy, brass within the
-        // 7-day threshold, danger on dead/expired — the same derivation
-        // as the dashboard's per-card labels.
+        // Consent-health badge (D5, wcag-color-conformance 3.1–3.2): quiet
+        // plain text when healthy, a 12% brass pill with a leading warning
+        // glyph when expiring, the same pill in danger when dead — see
+        // [ConnectionConsentBadge] for the two-state brass and fixed-
+        // footprint rules. The row's TOP alignment (above) keeps the badge
+        // pinned to the header's top-right under name wrap.
         val health = consentBadgeHealth(bank.validUntil, bank.consentBroken)
+        ConnectionConsentBadge(health)
+    }
+}
+
+/**
+ * The badge's fixed row height. The expiring/dead pill (labelSmall +
+ * 2dp vertical padding) naturally measures 20.dp; the healthy plain text
+ * is shorter. The badge must never inflate the card header row or shift
+ * layout as a bank moves between consent states (wcag-color-conformance
+ * task 3.2), so [ConnectionConsentBadge] pins both renderings to this
+ * single bounding height.
+ */
+private val ConsentBadgeHeight = 20.dp
+
+/**
+ * Consent-health badge (D5; wcag-color-conformance 3.1–3.2): the row-
+ * trailing signal for a bank's authorization state.
+ *
+ * - Healthy renders as quiet plain TEXT (no pill, no glyph) — the calm
+ *   default, onSurfaceVariant.
+ * - Expiring renders as a 12% brass wash pill with a leading outlined
+ *   [Icons.Outlined.WarningAmber] glyph and "Consent expiring · N days
+ *   left" in brassText.
+ * - Dead/expired renders the same pill treatment with an outlined
+ *   [Icons.Outlined.ErrorOutline] glyph and "Consent ended · Re-
+ *   authorization required" in danger.
+ *
+ * The warning states read through glyph shape and container geometry, not
+ * hue alone — the semantic-color-is-never-the-only-carrier guarantee. The
+ * earlier text-only badge relied on a brass hue that both failed 4.5:1 and
+ * was indistinguishable from regular text (user + designer ruling, spec
+ * scenario "Expiring consent badge warns without hue alone").
+ *
+ * Fixed-footprint rule (task 3.2): both renderings live inside the same
+ * fixed-height box ([ConsentBadgeHeight], the pill's natural height) — the
+ * healthy plain text and the taller pill+glyph occupy identical row height,
+ * so the card header never inflates or shifts between states.
+ */
+@Composable
+private fun ConnectionConsentBadge(health: ConsentBadgeHealth) {
+    Box(
+        modifier = Modifier.height(ConsentBadgeHeight),
+        contentAlignment = Alignment.CenterEnd,
+    ) {
+        when (health) {
+            is ConsentBadgeHealth.Active -> Text(
+                text = consentBadgeText(health),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            is ConsentBadgeHealth.Expiring -> ConnectionConsentBadgePill(
+                icon = Icons.Outlined.WarningAmber,
+                label = consentBadgeText(health),
+                // Two-state brass (design D3): glyph + label are TEXT
+                // carriers → bronze; the pill tint stays ornament gold.
+                textColor = LocalBankTellerColors.current.brassText,
+                tint = LocalBankTellerColors.current.brass,
+            )
+            ConsentBadgeHealth.Dead -> ConnectionConsentBadgePill(
+                icon = Icons.Outlined.ErrorOutline,
+                label = consentBadgeText(health),
+                textColor = MaterialTheme.colorScheme.error,
+                tint = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+/**
+ * The pill variant of the consent badge — the shared SANDBOX-chip /
+ * BankStatusBadge treatment (shapes.small, 12% wash, glyph + labelSmall
+ * label). The glyph and label share the semantic state color
+ * (brassText / danger); the wash stays at 12% of the ornament/danger
+ * token. The glyph is decorative (`contentDescription = null`): the badge
+ * text itself carries the semantics (aria work is out of scope here).
+ */
+@Composable
+private fun ConnectionConsentBadgePill(
+    icon: ImageVector,
+    label: String,
+    textColor: Color,
+    tint: Color,
+) {
+    // OPAQUE pill (D3 pill-opacity ruling, wcag-color-conformance 3.3):
+    // the background is the token at 12% composited over PLAIN
+    // surfaceContainer — a solid color, never a translucent wash. The
+    // badge renders inside tier-tinted connection cards; a translucent
+    // pill would compound with the card's tier tint and drop the dead
+    // badge's danger text to ≈4.09 (dark) / ≈4.16 (light). The opaque
+    // pill is invariant under the card's tint by construction.
+    val pillBackground = tint.copy(alpha = 0.12f).compositeOver(
+        MaterialTheme.colorScheme.surfaceContainer,
+    )
+    Row(
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.small)
+            .background(pillBackground)
+            .padding(horizontal = Dimens.xs, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Dimens.xs),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = textColor,
+            modifier = Modifier.size(13.dp),
+        )
         Text(
-            text = consentBadgeText(health),
+            text = label,
             style = MaterialTheme.typography.labelSmall,
-            color = when (health) {
-                is ConsentBadgeHealth.Active -> MaterialTheme.colorScheme.onSurfaceVariant
-                is ConsentBadgeHealth.Expiring -> brass
-                ConsentBadgeHealth.Dead -> MaterialTheme.colorScheme.error
-            },
+            color = textColor,
         )
     }
 }

@@ -101,6 +101,55 @@ class SqlDelightSessionStorageTest {
         assertNotNull(sessionRow(db, "id-2"))
     }
 
+    /**
+     * Sweep-vs-reason interaction (session bug 2026-11-20, council
+     * diagnosis — the tripwire for the deferred session-timeout fix):
+     * the background janitor (Application.kt's ~6h loop calling
+     * [SqlDelightSessionStorage.pruneExpired]) deletes an expired row
+     * BEFORE the user's first post-idle request. The classification then
+     * finds no row: the request reads as an unknown-ID plain 401, the
+     * one-shot `session_expired` reason is gone forever, and the client's
+     * login screen cannot render its expiry panel (the reported defect:
+     * "returned to the login screen, but the 'You were logged out' panel
+     * doesn't show").
+     *
+     * This test CHARACTERIZES that interaction on the storage level so the
+     * deferred durable-signal fix has a failing-red starting point (the
+     * moment the reason survives the sweep, this assertion flips). It is
+     * the documented behavior per the current design — not a bug in this
+     * class; the client-side mitigation is tracked as a separate change
+     * against the session-management capability.
+     */
+    @Test
+    fun `janitor sweep consumes the one-shot expiry reason - expired row reads as unknown after pruneExpired`() {
+        val db = freshDatabase()
+        val clock = FakeClock()
+        val store = storage(db, clock, ttlMinutes = 15)
+
+        // A live session goes idle past its TTL (the overnight case).
+        store.writeFor("id-1", "admin", "payload")
+        clock.advanceMillis(15 * 60_000L + 1)
+
+        // Without the sweep, the classification sees the expired row and
+        // the first request carries the reason (the one-shot contract).
+        assertTrue(store.classifyExpired("id-1"))
+
+        // The ACTUAL overnight sequence: the sweep prunes first.
+        store.writeFor("id-2", "admin", "payload")
+        clock.advanceMillis(15 * 60_000L + 1)
+        store.pruneExpired()
+
+        // The user's first request after the sweep: the row is gone, the
+        // classification reads UNKNOWN — no reason rides the 401.
+        assertEquals(null, sessionRow(db, "id-2"), "the sweep prunes the expired row")
+        assertFalse(
+            store.classifyExpired("id-2"),
+            "after the janitor sweep, the expired session is indistinguishable from an unknown ID - " +
+                "the one-shot expiry reason cannot be delivered; flip this assertion when the durable " +
+                "expiry signal lands (session-timeout fix)",
+        )
+    }
+
     @Test
     fun `invalidate revokes the session`() = runBlocking<Unit> {
         val db = freshDatabase()

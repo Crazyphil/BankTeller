@@ -109,7 +109,10 @@ fun WizardScaffold(
                 Text(
                     text = eyebrow.uppercase(),
                     style = MaterialTheme.typography.labelSmall,
-                    color = LocalBankTellerColors.current.brass,
+                    // Two-state brass: the eyebrow is TEXT — the bronze
+                    // text token (4.5:1 on all light surfaces), never the
+                    // ornament gold.
+                    color = LocalBankTellerColors.current.brassText,
                     letterSpacing = 0.15.sp,
                 )
             }

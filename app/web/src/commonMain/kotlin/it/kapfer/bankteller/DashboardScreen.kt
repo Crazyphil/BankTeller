@@ -575,12 +575,17 @@ private fun ImportStep(viewModel: AppViewModel) {
  */
 @Composable
 private fun ZeroAccountNotice(viewModel: AppViewModel) {
+    // Two-state brass: the wash keeps the ornament gold, the 3dp sideline
+    // uses the bronze text token (4.71:1 on the wash vs the old gold's
+    // zero-margin 3.00:1) — the sideline pairs with the bronze text it
+    // borders (accessibility D2).
     val brass = LocalBankTellerColors.current.brass
-    DecisionBox(tint = brass, borderColor = brass, modifier = Modifier.fillMaxWidth()) {
+    val brassText = LocalBankTellerColors.current.brassText
+    DecisionBox(tint = brass, borderColor = brassText, modifier = Modifier.fillMaxWidth()) {
         Text(
             text = "Your bank did not share any accounts yet",
             style = MaterialTheme.typography.titleMedium,
-            color = brass,
+            color = brassText,
         )
         Spacer(modifier = Modifier.height(Dimens.xs))
         Text(
@@ -1016,7 +1021,8 @@ private fun GlobalSyncLine(viewModel: AppViewModel, banks: List<BankData>) {
                     color = if (segment.tier == GlobalSyncSummaryTier.Danger) {
                         MaterialTheme.colorScheme.error
                     } else {
-                        colors.brass
+                        // Two-state brass: attention segment text → bronze.
+                        colors.brassText
                     },
                 )
             }
@@ -1166,8 +1172,15 @@ internal fun deadPanelCopy(bankName: String, severity: PanelSeverity): String = 
 @Composable
 private fun ConsentPanelBody(viewModel: AppViewModel, panel: ConsentPanelData, colors: BankTellerColors) {
     val danger = panel.severity != PanelSeverity.Expiring
+    // Two-state brass: expiring panels wash with the ornament gold but
+    // carry the bronze sideline (accessibility D2); danger keeps the
+    // error token for both.
     val tint = if (danger) MaterialTheme.colorScheme.error else colors.brass
-    DecisionBox(tint = tint, borderColor = tint) {
+    val borderColor = if (danger) tint else colors.brassText
+    // Two-state brass: the panel title is TEXT → bronze when expiring
+    // (the DecisionBox wash/sideline split above carries the ornament).
+    val titleColor = if (danger) tint else colors.brassText
+    DecisionBox(tint = tint, borderColor = borderColor) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
@@ -1187,7 +1200,7 @@ private fun ConsentPanelBody(viewModel: AppViewModel, panel: ConsentPanelData, c
                     deadPanelCopy(panel.bank.bankName, panel.severity)
                 },
                 style = MaterialTheme.typography.titleMedium,
-                color = tint,
+                color = titleColor,
             )
         }
         Spacer(modifier = Modifier.height(Dimens.sm))
@@ -1242,10 +1255,14 @@ private fun ConsentAccordion(
 ) {
     val anyDanger = panels.any { it.severity != PanelSeverity.Expiring }
     val tint = if (anyDanger) MaterialTheme.colorScheme.error else colors.brass
+    // Two-state brass: the summary title is TEXT → bronze when the tier
+    // is brass; the wash, sideline, and 18dp Error glyph keep the tier
+    // token (glyph-paired with the title).
+    val titleColor = if (anyDanger) tint else colors.brassText
     var expanded by rememberSaveable { mutableStateOf(false) }
     val interactionSource = remember { MutableInteractionSource() }
 
-    DecisionBox(tint = tint, borderColor = tint) {
+    DecisionBox(tint = tint, borderColor = if (anyDanger) tint else colors.brassText) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
@@ -1268,7 +1285,7 @@ private fun ConsentAccordion(
             Text(
                 text = "${panels.size} bank connections need re-authorization",
                 style = MaterialTheme.typography.titleMedium,
-                color = tint,
+                color = titleColor,
                 modifier = Modifier.weight(1f),
             )
             // Persistent non-color affordance: the trailing chevron rotates
@@ -1992,6 +2009,13 @@ private fun AccountStatusSlot(
         SyncPresentationTier.Brass -> LocalBankTellerColors.current.brass
         SyncPresentationTier.Archived -> MaterialTheme.colorScheme.onSurfaceVariant
     }
+    // Two-state brass: the status line is TEXT → bronze when the tier is
+    // brass; the 16dp glyph keeps the ornament token (glyph-paired, 3:1).
+    val textColor = when (slot.tier) {
+        SyncPresentationTier.Danger -> MaterialTheme.colorScheme.error
+        SyncPresentationTier.Brass -> LocalBankTellerColors.current.brassText
+        SyncPresentationTier.Archived -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
     val tooltipState = rememberTooltipState(isPersistent = true)
     LaunchedEffect(tooltipState.isVisible) {
         diagnosticTooltipOpenState.value = tooltipState.isVisible
@@ -2033,7 +2057,7 @@ private fun AccountStatusSlot(
             Text(
                 text = slot.text,
                 style = MaterialTheme.typography.labelSmall,
-                color = tint,
+                color = textColor,
                 modifier = Modifier.weight(1f),
             )
         }

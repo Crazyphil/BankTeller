@@ -76,7 +76,8 @@ internal val appTabBarEntries = listOf(dashboardTab, settingsTab)
  * an outlined Material icon over an Inter labelSmall label. The ACTIVE
  * tab renders in primary with a discrete 2dp brass hairline indicator
  * BENEATH it (a quiet underline, not a filled pill); inactive tabs
- * render onSurfaceVariant at 60%.
+ * render onSurfaceVariant at 85% (4.5:1 — interactive navigation is
+ * not exempt; see the inactiveColor comment below).
  *
  * Tab switches are pure client state (no routing library, no back stack,
  * no reload) — the selected-tab handle lives in the view model.
@@ -90,7 +91,13 @@ internal fun AppTabBar(
 ) {
     val brass = LocalBankTellerColors.current.brass
     val activeColor = MaterialTheme.colorScheme.primary
-    val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.60f)
+    // Inactive tabs are interactive navigation, not disabled components —
+    // the inactive-component exemption does not apply, so the label must
+    // meet 4.5:1 (the all-tokens contrast guarantee). 85% onSurfaceVariant
+    // composites to #747068 on bg → 4.64:1 (the old 60% measured 2.71:1);
+    // the active tab's primary label + brass indicator still carry the
+    // hierarchy (accessibility change, Tab bar component delta).
+    val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f)
 
     Row(
         modifier = modifier

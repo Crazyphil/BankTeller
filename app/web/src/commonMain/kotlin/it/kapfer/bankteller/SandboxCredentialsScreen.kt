@@ -238,7 +238,9 @@ private fun CompactBrandLockup() {
             Text(
                 text = "SANDBOX",
                 style = MaterialTheme.typography.labelSmall,
-                color = brass,
+                // Two-state brass: the chip label is TEXT → bronze; the
+                // chip container stays the ornament-brass 12% wash.
+                color = LocalBankTellerColors.current.brassText,
                 modifier = Modifier.padding(horizontal = Dimens.xs, vertical = 2.dp),
             )
         }

@@ -164,7 +164,8 @@ internal fun SandboxCredentialsPanel(
                         "SANDBOX ACCESS"
                     },
                     style = MaterialTheme.typography.labelSmall,
-                    color = LocalBankTellerColors.current.brass,
+                    // Two-state brass: eyebrow text → bronze.
+                    color = LocalBankTellerColors.current.brassText,
                     modifier = Modifier.weight(1f),
                 )
                 if (showPopOut && variant == SandboxCredentialsVariant.CREDENTIALS) {
