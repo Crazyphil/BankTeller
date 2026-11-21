@@ -10,11 +10,13 @@ Kotlin Multiplatform project: Ktor server + Compose web app, deployed as a singl
 
 ## Commands
 
-- Server dev: `./gradlew :server:run` (serves on port from `.env`, default 8080).
-- Web dev: `./gradlew :app:web:wasmJsBrowserDevelopmentRun`.
+- **Primary dev loop (full stack, tests the real deployment artifact):** `./gradlew :server:containerUp` — builds the fat JAR (incremental), rebuilds the `bankteller:latest` image via `scripts/build-image.sh` (Podman preferred, Docker fallback), then `docker compose up -d` recreates the service. The app serves on the mapped port (`.env` `SERVER_PORT`, default 8080) and its database is the named volume `bankteller-data` at `/data/bankteller.db` (compose sets `DATABASE_PATH` explicitly). Siblings: `./gradlew :server:containerDown` (stop), `./gradlew :server:containerLogs` (follow logs).
+- **Secondary dev loop (backend quick iteration, no container):** `./gradlew :server:run` (serves on **8080**, hardcoded — unlike the container loop this does not read `.env`). Database: `./data/bankteller.db` (repo-root-relative, auto-created, persistent across restarts). Resolution order: `database.path` system property → `DATABASE_PATH` env → local default. This loop has its own local database, separate from the container loop's volume.
+- Web dev (frontend-only iteration, serves no backend): `./gradlew :app:web:wasmJsBrowserDevelopmentRun` — the app boots from the dev bundle with no server behind it.
 - Tests: `./gradlew :server:test`, single test via `--tests "fqcn.ClassName"`. JVM tests are hermetic.
-- Container image: `scripts/build-image.sh` (host `shadowJar` → `bankteller:latest`, Podman preferred, Docker fallback, auto-prunes dangling images).
+- Container image only (no compose): `scripts/build-image.sh` (host `shadowJar` → `bankteller:latest`, Podman preferred, Docker fallback, auto-prunes dangling images).
 - Deploy: `docker-compose.yml` consumes the prebuilt image; env vars `AUTH_USERNAME` / `AUTH_PASSWORD` / `SERVER_PORT` come from `.env` (copy from `.env.example`).
+- Maintenance note: intermediate image-layer buildup across rebuilds is cleaned by `podman build prune` — deliberately not an automation default (heavier prunes would remove the browser-tests image and unrelated content).
 
 ## Browser tests (quirky, read before touching the test setup)
 

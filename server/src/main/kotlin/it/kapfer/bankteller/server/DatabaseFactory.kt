@@ -5,9 +5,18 @@ import it.kapfer.bankteller.database.BankTellerDatabase
 
 object DatabaseFactory {
     fun init(): BankTellerDatabase {
+        // Resolution order: database.path system property → DATABASE_PATH env
+        // → project-relative default. The container deployment sets
+        // DATABASE_PATH=/data/bankteller.db explicitly in compose; this
+        // default serves only unconfigured local runs, so it must not point
+        // at a container-only absolute path (the pre-change /data default
+        // crashed bare local runs).
         val dbPath = System.getProperty("database.path")
             ?: System.getenv("DATABASE_PATH")
-            ?: "/data/bankteller.db"
+            ?: "./data/bankteller.db"
+        java.nio.file.Files.createDirectories(
+            java.nio.file.Paths.get(dbPath).toAbsolutePath().parent,
+        )
         val driver = JdbcSqliteDriver("jdbc:sqlite:$dbPath")
         driver.execute(null, "PRAGMA journal_mode=WAL", 0)
         driver.execute(null, "PRAGMA busy_timeout=5000", 0)

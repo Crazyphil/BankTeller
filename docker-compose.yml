@@ -8,6 +8,10 @@ services:
       - "${SERVER_PORT:-8080}:8080"
     volumes:
       - bankteller-data:/data
+    environment:
+      # The volume's database path is declared here, not inherited from the
+      # application's local-run default (which points at ./data instead).
+      DATABASE_PATH: /data/bankteller.db
     env_file:
       - .env
     restart: unless-stopped

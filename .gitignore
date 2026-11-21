@@ -19,6 +19,9 @@ captures
 **/xcshareddata/WorkspaceSettings.xcsettings
 node_modules/
 
+# Local dev database (./data/bankteller.db — the :server:run default)
+data/
+
 # Extracted epub knowledge bases (copyrighted books, not for commit)
 aux-docs/*
 !aux-docs/README.md

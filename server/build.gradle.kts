@@ -40,7 +40,9 @@ val generatedResourcesDir = layout.buildDirectory.dir("generated/resources")
 tasks.register<Sync>("copyWebDist") {
     dependsOn(":app:web:wasmJsBrowserDistribution")
     from("${rootProject.projectDir}/app/web/build/dist/wasmJs/productionExecutable")
-    from("${rootProject.projectDir}/app/web/index.html")
+    // index.html arrives in the dist via wasmJsMain/resources — KGP copies it
+    // into the distribution, so no separate from() is needed (the pre-fix
+    // explicit copy duplicated it; Sync rejected the duplicate).
     into(generatedResourcesDir.map { it.dir("static") })
 }
 
@@ -52,6 +54,60 @@ sourceSets {
 
 tasks.named("processResources") {
     dependsOn("copyWebDist")
+}
+
+// Gradle does not propagate command-line -D system properties into JavaExec
+// applications — forward `database.path` explicitly so
+// `./gradlew :server:run -Ddatabase.path=...` reaches the server JVM (the
+// highest-precedence rung of the database path resolution chain).
+tasks.named<JavaExec>("run") {
+    // JavaExec's default working directory is the module dir (server/), so
+    // the DatabaseFactory's project-relative default (./data/bankteller.db)
+    // would land in server/data/ — pin it to the repo root so the
+    // documented location holds.
+    workingDir = rootProject.projectDir
+    System.getProperty("database.path")?.let { systemProperty("database.path", it) }
+}
+
+// Container lifecycle tasks (the local-dev-workflow dev loop). containerUp
+// reuses scripts/build-image.sh — the script owns podman→docker engine
+// selection, the Gradle-driven incremental shadowJar build, and the
+// dangling-image prune; the Gradle task adds the compose step and brings
+// the whole loop under one command. No cleanup logic here: compose
+// recreates the service on image drift, and the script already prunes
+// dangling images.
+tasks.register<Exec>("containerBuildImage") {
+    group = "container"
+    description = "Builds the deployment image via scripts/build-image.sh (engine fallback inherited from the script)."
+    workingDir = rootProject.projectDir
+    commandLine("${rootProject.projectDir}/scripts/build-image.sh")
+}
+
+tasks.register<Exec>("containerUp") {
+    group = "container"
+    description = "Builds the deployment image and starts/recreates the compose service."
+    dependsOn("containerBuildImage")
+    workingDir = rootProject.projectDir
+    commandLine("docker", "compose", "up", "-d")
+}
+
+tasks.register<Exec>("containerDown") {
+    group = "container"
+    description = "Stops the compose service (docker compose down)."
+    workingDir = rootProject.projectDir
+    commandLine("docker", "compose", "down")
+}
+
+tasks.register<Exec>("containerLogs") {
+    group = "container"
+    description = "Streams the compose service logs (docker compose logs -f)."
+    workingDir = rootProject.projectDir
+    commandLine("docker", "compose", "logs", "-f")
+    // podman-compose buffers its log-formatter output and only flushes on
+    // exit — and `logs -f` never exits, so a piped (non-TTY) caller like
+    // Gradle Exec would never see a line. Unbuffered Python fixes the
+    // podman wrapper and is a no-op on real Docker hosts.
+    environment("PYTHONUNBUFFERED", "1")
 }
 
 tasks.test {
