@@ -21,10 +21,6 @@ Data loss SHALL follow only explicit user choice. System failures — bank outag
 - **WHEN** a re-authorization yields fewer accounts than previously stored
 - **THEN** the missing accounts survive as kept-as-local-copy accounts (per the missing-accounts dialog requirement) — deletion happens only through the user's explicit choice
 
-
-
-
-
 ### Requirement: Connections data contract
 
 The existing `GET /api/accounts` payload SHALL be extended (one source of truth — the dashboard and the bank connections section consume the same payload): each bank group gains `bic` (nullable — the ASPSP BIC persisted at authorization time; consumers degrade gracefully when NULL: no BIC rendered) and `connected_at` (the `eb_sessions.created_at` timestamp — the connection's add date), and each account gains `in_consent` (1 = synced within the authorization's filter; 0 = kept-as-local-copy). The payload SHALL include every connected bank — including banks whose authorization shares zero accounts (the current implementation's empty-bank skip is removed): a zero-account bank renders in the connections list with its info box, and the dashboard's empty-state distinction between zero connections and connected-but-zero-accounts depends on its presence. The bank groups SHALL be deterministically ordered by ASPSP name (case-insensitive), then country (case-insensitive) — the same ordering contract as the onboarding capability's bank listing endpoint ("Deterministic ordering"), a server-side contract so both sources and both consumers present identically and the SPA needs no client-side sorting; the sort SHALL be stable, preserving source order for full ties. Account rows within a bank group SHALL be deterministically ordered likewise: by account display name (case-insensitive; accounts with a NULL name sort last — the name is the user-facing identity), then IBAN as the tiebreaker (names can repeat or be generic within a bank; the IBAN makes the order fully deterministic regardless of the source's arrival order). No separate connections endpoint exists.
@@ -49,13 +45,8 @@ The existing `GET /api/accounts` payload SHALL be extended (one source of truth 
 - **WHEN** a bank group carries multiple accounts (regardless of the bank API's arrival order)
 - **THEN** the accounts are ordered by display name (case-insensitive, NULL names last), then IBAN — both the connections section's account rows and the dashboard's cards within the bank render in that order
 
-
-
-
-
 ### Requirement: Bank connections section
-
-The Settings screen's Bank connections section SHALL list the user's connected banks, one `OutlinedCard` per bank: a header zone (40dp logo, bank name `titleMedium`, "country · PSU type" subtitle, consent-health badge on the right — healthy: quiet "Consent active · Valid for N days"; within the 7-day urgency threshold: brass "Consent expiring · N days left" (the day count renders in the expiring state too — the number is the actionable part: it answers "act now or delay until the weekend?", and dropping it exactly when it matters most forces a trip to the bank's portal to judge urgency; user ruling); dead or expired: danger "Consent ended · Re-authorization required"), an informational read-only accounts list ("ACCOUNTS (N)" label; per row: account name, masked IBAN in mono, trailing balance in mono tabular figures), capped at 4 visible rows with a "Show N more accounts" expander that carries a persistent non-color affordance (a trailing 14dp chevron) plus underline-on-hover — color alone is insufficient in the light theme, where the ink-navy `primary` passes as body text (per the design system's dense-control hover rules; the expander disappears when expanded), and a footer action strip (last-synced timestamp on the left; the per-bank actions on the right as **Inline Text XS controls** — §6.1.1's 28dp dense tier with min-touch-size opt-out, never the standard 40dp text buttons: "Refresh authorization" as an XS action button with explicit text + leading 14dp key glyph (`Icons.Outlined.Key` — NEVER a circular-arrow/Refresh glyph, which is reserved for balance sync; the action never renders unlabeled); "Remove" as an XS danger action with explicit danger text + leading 14dp delete glyph (`Icons.Outlined.Delete` — the glyph aids scanning, the danger text keeps the destructive anchor; the confirmation dialog remains the gate, not the button); separated by 8dp). The row-height invariant bounds the strip at a single quiet line — the actions take no meaningful screen estate. The card SHALL display the connection's BIC (when present) and add date. A bank whose authorization shares zero accounts SHALL render an info box ("No accounts shared under this authorization") with the actions still available. Kept-as-local-copy accounts SHALL render with a "Local copy" tag, their stale balance in `onSurfaceVariant`, and an inline extra-small danger delete affordance — gated by a confirmation dialog (per the local-copy accounts requirement: the button is the trigger, the dialog is the gate; one-click deletion without confirmation is a data-loss hazard the intent principle forbids). The section header carries the canonical "+ Connect bank" action button (top-right) — a section-level creation action, deliberately NOT an icon (visual weight maps to consequence; connecting an institution is the section's loudest action). The "Refresh authorization" action SHALL render for every connected bank regardless of consent state (see the refresh authorization action requirement — dead/expired banks get the action in place, not a pointer to another screen).
+The Settings screen's Bank connections section SHALL list the user's connected banks, one `OutlinedCard` per bank: a header zone (40dp logo, bank name `titleMedium`, "country · PSU type" subtitle, consent-health badge on the right — healthy: quiet "Consent active · Valid for N days"; within the 7-day urgency threshold: brass "Consent expiring · N days left" rendered as a 12% brass pill container with a leading outlined `WarningAmber` glyph and text-brass text (per the semantic-color-is-never-the-only-carrier guarantee: the warning reads through glyph shape and container geometry, not hue alone — the earlier text-only brass badge relied on a hue that both failed 4.5:1 and was indistinguishable from regular text; user + designer ruling); dead or expired: danger "Consent ended · Re-authorization required" with a leading outlined `ErrorOutline` glyph in the same pill treatment (the day count renders in the expiring state too — the number is the actionable part: it answers "act now or delay until the weekend?", and dropping it exactly when it matters most forces a trip to the bank's portal to judge urgency; user ruling)), an informational read-only accounts list ("ACCOUNTS (N)" label; per row: account name, masked IBAN in mono, trailing balance in mono tabular figures), capped at 4 visible rows with a "Show N more accounts" expander that carries a persistent non-color affordance (a trailing 14dp chevron) plus underline-on-hover — color alone is insufficient in the light theme, where the ink-navy `primary` passes as body text (per the design system's dense-control hover rules; the expander disappears when expanded), and a footer action strip (last-synced timestamp on the left; the per-bank actions on the right as **Inline Text XS controls** — §6.1.1's 28dp dense tier with min-touch-size opt-out, never the standard 40dp text buttons: "Refresh authorization" as an XS action button with explicit text + leading 14dp key glyph (`Icons.Outlined.Key` — NEVER a circular-arrow/Refresh glyph, which is reserved for balance sync; the action never renders unlabeled); "Remove" as an XS danger action with explicit danger text + leading 14dp delete glyph (`Icons.Outlined.Delete` — the glyph aids scanning while the explicit danger text keeps the destructive anchor; the confirmation dialog remains the gate, not the button); separated by 8dp). The row-height invariant bounds the strip at a single quiet line — the actions take no meaningful screen estate. The card SHALL display the connection's BIC (when present) and add date. A bank whose authorization shares zero accounts SHALL render an info box ("No accounts shared under this authorization") with the actions still available. Kept-as-local-copy accounts SHALL render with a "Local copy" tag, their stale balance in `onSurfaceVariant`, and an inline extra-small danger delete affordance — gated by a confirmation dialog (per the local-copy accounts requirement: the button is the trigger, the dialog is the gate; one-click deletion without confirmation is a data-loss hazard the intent principle forbids). The section header carries the canonical "+ Connect bank" action button (top-right) — a section-level creation action, deliberately NOT an icon (visual weight maps to consequence; connecting an institution is the section's loudest action). The "Refresh authorization" action SHALL render for every connected bank regardless of consent state (see the refresh authorization action requirement — dead/expired banks get the action in place, not a pointer to another screen).
 
 The section SHALL stay connection-centric: the card presents the bank's identity, consent state, and connection-level information — never per-account sync detail or account rollups (the dashboard is the account-centric surface; settings is the connection-centric surface; displaying account status here would blur the two screens' purposes). The degradation signal keys on **connection-wide authorization states only** (user ruling: each surface shows the problems solvable on that page — the dashboard answers "do my balances update correctly?" with resync as the remedy; the bank list answers "do my bank connections work?" with re-authorization as the remedy): a connection whose consent is dead or expired SHALL render the `danger` border+tint signal (per the `sync-error-presentation` capability — the same *mechanism* as dashboard cards) with the "Refresh authorization" action elevated (prominent button tier) so the remedy is visible at scanning level; a connection whose consent is expiring within the 7-day urgency threshold SHALL render the `brass` signal (the bank-wide warning). **Sync-domain states render NO signal on the connection card** — a bank in the error/rate-limited/stale state, or whose accounts have failed outcomes (individual or bank-wide), carries no border or tint on this surface: these are balance-sync problems, solvable by resync on the dashboard, and their presentation lives there (per-account status slots and the global sync line); coloring the connection card for them would assert a connection problem the connection does not have, with no remedy on this page. Healthy connections render unmarked.
 
@@ -81,7 +72,19 @@ The section SHALL stay connection-centric: the card presents the bank's identity
 
 #### Scenario: Expiring consent renders brass
 - **WHEN** a connection's consent expires within the 7-day urgency threshold
-- **THEN** the card carries the brass border+tint signal (the bank-wide authorization warning) with the quiet "Refresh authorization" action still available
+- **THEN** the card carries the brass border+tint signal (the bank-wide warning) with the quiet "Refresh authorization" action still available
+
+#### Scenario: Expiring consent badge warns without hue alone
+- **WHEN** a connection's consent is within the 7-day urgency threshold
+- **THEN** the badge renders as a 12% brass pill with a leading outlined `WarningAmber` glyph and text-brass "Consent expiring · N days left" — the warning state is identifiable by glyph and container, meeting 4.5:1 text contrast
+
+#### Scenario: Badge pills are compound-mount independent
+- **WHEN** the badge pill renders inside a tier-tinted connection card (the danger or brass tier tint over the card surface)
+- **THEN** the pill renders as an OPAQUE solid color — the token at 12% composited over plain `surfaceContainer` — never a translucent wash over the tinted card, so the pill's text contrast is invariant under the card's tier tint (a translucent pill compounds the blends with the card tint: the dead badge's danger text drops to ≈4.09 dark / ≈4.16 light, below 4.5:1; the opaque pill holds 4.51 dark / 4.50 light)
+
+#### Scenario: Dead consent badge carries the danger glyph
+- **WHEN** a connection's consent is dead or expired
+- **THEN** the badge renders the danger pill treatment with a leading outlined `ErrorOutline` glyph and danger "Consent ended · Re-authorization required"
 
 #### Scenario: Sync-domain states render no connection signal
 - **WHEN** a connection's bank is in the error or rate-limited state, or has failed account outcomes (individual or bank-wide), while its consent is live and outside the urgency threshold
@@ -91,10 +94,6 @@ The section SHALL stay connection-centric: the card presents the bank's identity
 - **WHEN** a connection's bank has one failed account among healthy ones
 - **THEN** the connection card renders at most its connection-wide authorization signal — no per-account status, count, or rollup text appears on the card
 
-
-
-
-
 ### Requirement: Connect bank action
 
 The section header's "+ Connect bank" action SHALL enter the wizard at bank selection in add-mode — client-side navigation per the onboarding capability's add-mode machinery (no server-side mode). This is the absorbed dashboard control: the canonical connect entry point for the running system, alongside the dashboard empty-state trigger (a first-run call-to-action is not bank management — a brand-new user connects their first bank from the dashboard). User-facing copy uses the umbrella term "Connect", never "Add".
@@ -102,10 +101,6 @@ The section header's "+ Connect bank" action SHALL enter the wizard at bank sele
 #### Scenario: Connect bank enters the add-mode wizard
 - **WHEN** the user activates "+ Connect bank" in the bank connections section
 - **THEN** the wizard opens at bank selection in add-mode, with already-connected banks blocked (the honest already-connected explanation)
-
-
-
-
 
 ### Requirement: Refresh authorization action
 
@@ -122,10 +117,6 @@ Each connection card SHALL offer a "Refresh authorization" action for **every co
 #### Scenario: Naming distinction is preserved
 - **WHEN** a surface shows both balance refresh and authorization refresh
 - **THEN** the two are visually distinct by glyph and label: balance refresh uses the circular-arrow icon with its tooltip; authorization refresh carries explicit "Refresh authorization" text with a key glyph — the two are never conflated, and no circular arrow ever appears on an authorization action
-
-
-
-
 
 ### Requirement: Remove connection
 
@@ -146,10 +137,6 @@ Removing a bank connection SHALL follow the sequence: (1) a confirmation dialog 
 #### Scenario: Bank not found locally is an honest error
 - **WHEN** the remove endpoint is called for a bank with no local session row (stale SPA state or a double-remove)
 - **THEN** the endpoint responds with an honest not-found error — no Enable Banking call is made, no local deletion runs, and the SPA re-syncs its connections state
-
-
-
-
 
 ### Requirement: Missing-accounts dialog
 
@@ -194,10 +181,6 @@ Accounts marked `in_consent = 0` (kept-as-local-copy) SHALL be skipped by the sy
 #### Scenario: Local copies present as permanently stale
 - **WHEN** the dashboard or connections section renders a local-copy account
 - **THEN** it shows its last-known balance in stale styling with the surface's archived-record marker — the "Local copy" tag in the connections section's dense rows, the "Local copy — not synchronized" status slot on dashboard cards (no bare tag beside it) — never presented as currently synchronized
-
-
-
-
 
 ### Requirement: Automation guard
 
