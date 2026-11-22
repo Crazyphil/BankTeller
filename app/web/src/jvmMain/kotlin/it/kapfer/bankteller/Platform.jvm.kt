@@ -88,6 +88,9 @@ actual fun closeNamedSandboxCredentialsPopup(): Boolean = false
 
 actual fun setDocumentTitle(title: String) = Unit
 
+/** Non-web target — no window focus event exists (inert no-op). */
+actual fun registerWindowFocusListener(callback: () -> Unit) = Unit
+
 actual fun decodeUriComponent(value: String): String? = try {
     URLDecoder.decode(value, Charsets.UTF_8)
 } catch (_: Exception) {

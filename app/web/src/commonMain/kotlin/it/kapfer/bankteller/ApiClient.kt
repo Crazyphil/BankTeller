@@ -12,48 +12,80 @@ import io.ktor.util.pipeline.*
 expect fun createHttpClient(): HttpClient
 
 /**
+ * localStorage key for the client-side activity clock (client-side/watchdog
+ * D3): a Unix-millis timestamp written by the response pipeline on every 2xx
+ * from an authenticated endpoint and read by the session watchdog. Shared
+ * across tabs by construction (localStorage is origin-wide).
+ */
+const val SESSION_LAST_ACTIVITY_KEY = "bankteller_session_last_activity"
+
+/**
+ * localStorage key persisting the latest provisioned effective
+ * `SESSION_TTL_MINUTES` (client-side/watchdog D2): re-read on every latch
+ * evaluation so a TTL change (env restart) is picked up on the next
+ * login/checkAuth.
+ */
+const val SESSION_TTL_MINUTES_KEY = "bankteller_session_ttl_minutes"
+
+/**
  * Minimal HTTP API client for the BankTeller SPA.
  * All calls are relative (the browser handles the origin and httpOnly cookies automatically).
  *
- * @param onUnauthorized Session-expiry catch-all (server-side-session-storage):
- *   invoked when ANY API call answers 401 — the server-side session record is
- *   gone (expired/revoked), so the cookie is worthless. The view model routes
- *   to the login screen and cancels its polls. Null disables the hook (tests).
+ * @param onUnauthorized Session-expiry backstop (client-side/watchdog D5):
+ *   invoked when ANY API call answers 401 — every 401 is plain now (the
+ *   server no longer carries a reason). The view model routes to the login
+ *   screen and latches the expiry panel when it still believes it is
+ *   in-session. Null disables the hook (tests).
  */
 open class ApiClient(
-    onUnauthorized: ((reason: String?, ttlMinutes: Long?) -> Unit)? = null,
+    onUnauthorized: (() -> Unit)? = null,
 ) {
     /**
-     * Session-expiry catch-all (server-side-session-storage): invoked when
-     * ANY API call answers 401 — the server-side session record is gone
-     * (expired/revoked), so the cookie is worthless. The view model routes to
-     * the login screen and cancels its polls. Late-bindable so the view model
-     * can point it at its own handler after construction. The callback
-     * receives the 401's parsed `reason` when present (spec:
-     * session-management — session-timeout feedback): `session_expired`
-     * carries the effective TTL payload for the login panel.
+     * Session-expiry backstop (client-side/watchdog D5): invoked when ANY API
+     * call answers 401 — no reason/TTL parameters, every 401 is plain. The
+     * view model decides whether the 401 represents a surprising in-session
+     * loss (latch + route) or an expected unauthenticated response. Late-
+     * bindable so the view model can point it at its own handler after
+     * construction.
      */
-    var onUnauthorized: ((reason: String?, ttlMinutes: Long?) -> Unit)? = onUnauthorized
+    var onUnauthorized: (() -> Unit)? = onUnauthorized
 
     private val client = createHttpClient()
 
     init {
-        // Response observer: fires the hook on any 401. The pipeline's subject
-        // at the Transform phase is the response BODY container — the
+        // Response observer: fires on every response. The pipeline's subject at
+        // the Transform phase is the response BODY container — the
         // [io.ktor.client.HttpClientCall] hangs off the pipeline `context`
-        // (context.response); casting the subject to HttpResponse (an earlier
-        // attempt) always failed silently and the hook never fired. Status +
-        // headers only — the body is NOT read here (the caller owns it); the
-        // server mirrors the reason in the X-Session-* response headers
-        // precisely so this interceptor can latch it cheaply.
+        // (context.request / context.response). Two responsibilities:
+        //  1. the activity clock (D3) — every 2xx to an authenticated endpoint
+        //     refreshes the persisted timestamp (login/logout excluded);
+        //  2. the plain-401 backstop hook (D5).
+        // Status + path only — the body is NOT read here (the caller owns it).
         client.responsePipeline.intercept(HttpResponsePipeline.Transform) {
             val response = context.response
+            this@ApiClient.handleResponseForActivityClock(
+                path = context.request.url.encodedPath,
+                status = response.status.value,
+            )
             if (response.status.value == 401) {
-                val reason = response.headers["X-Session-Reason"]
-                val ttlMinutes = response.headers["X-Session-Ttl-Minutes"]?.toLongOrNull()
-                this@ApiClient.onUnauthorized?.invoke(reason, ttlMinutes)
+                this@ApiClient.onUnauthorized?.invoke()
             }
         }
+    }
+
+    /**
+     * Activity-clock rule (client-side/watchdog D3, task 3.1): a 2xx to any
+     * endpoint except `/api/login` and `/api/logout` refreshes the shared
+     * `lastActivity` timestamp. Login resets the clock itself (a fresh session
+     * must never inherit the prior session's stale clock); logout must not
+     * look like activity. Pure in its inputs (`path` + `status`, the clock read
+     * from the platform) so tests can exercise it directly — the karma fakes
+     * override the API methods and bypass the real response pipeline.
+     */
+    internal fun handleResponseForActivityClock(path: String, status: Int) {
+        if (status !in 200..299) return
+        if (path.endsWith("/api/login") || path.endsWith("/api/logout")) return
+        localStorageSet(SESSION_LAST_ACTIVITY_KEY, getCurrentEpochMillis().toString())
     }
 
     open suspend fun login(username: String, password: String): LoginResult {
@@ -63,7 +95,21 @@ open class ApiClient(
                 setBody("""{"username":"${escapeJsonString(username)}","password":"${escapeJsonString(password)}"}""")
             }
             return when (response.status.value) {
-                200 -> LoginResult.Success
+                200 -> {
+                    // TTL provisioning (D2): the effective SESSION_TTL_MINUTES
+                    // rides the login success payload. Persist it right here so
+                    // the client is self-contained on storage (mirroring the
+                    // latch), and RESET the activity clock — a fresh session
+                    // must not inherit the previous session's stale clock
+                    // (which would spuriously trip the first post-login
+                    // evaluation).
+                    val body = response.bodyAsText()
+                    extractJsonLong(body, "ttlMinutes")?.let {
+                        localStorageSet(SESSION_TTL_MINUTES_KEY, it.toString())
+                    }
+                    localStorageSet(SESSION_LAST_ACTIVITY_KEY, getCurrentEpochMillis().toString())
+                    LoginResult.Success
+                }
                 429 -> LoginResult.RateLimited
                 else -> LoginResult.Failure("Invalid credentials")
             }
@@ -87,11 +133,42 @@ open class ApiClient(
             if (response.status.value == 200) {
                 val body = response.bodyAsText()
                 val username = extractJsonString(body, "username")
-                return AuthState.Authenticated(username)
+                // TTL provisioning (client-side/watchdog D2, task 1.2): the
+                // effective TTL rides the /api/me payload so the client knows
+                // the window at boot without a separate call.
+                val ttlMinutes = extractJsonLong(body, "ttlMinutes")
+                return AuthState.Authenticated(username, ttlMinutes)
             }
             return AuthState.Unauthenticated
         } catch (_: Exception) {
             return AuthState.Unauthenticated
+        }
+    }
+
+    /**
+     * Tri-state session-liveness probe (client-side/watchdog D4, task 4.1):
+     * `GET /api/me` — authenticated, idempotent, zero side effects apart from
+     * the sliding renewal (a 200 verdict IS "session still alive, refreshed").
+     *
+     * The verdict is deliberately NOT [checkAuth]: that method conflates a
+     * network failure with [AuthState.Unauthenticated] (`Unauthenticated` on
+     * exception), so a transient error would latch the expiry panel. Here a
+     * request exception is [SessionProbeResult.Unknown] — not a verdict; the
+     * watchdog stays put and retries on the next trigger.
+     */
+    open suspend fun probeSession(): SessionProbeResult {
+        return try {
+            val response = client.get("/api/me")
+            when (response.status.value) {
+                200 -> {
+                    val body = response.bodyAsText()
+                    SessionProbeResult.Alive(extractJsonLong(body, "ttlMinutes"))
+                }
+                401 -> SessionProbeResult.Expired
+                else -> SessionProbeResult.Unknown
+            }
+        } catch (_: Exception) {
+            SessionProbeResult.Unknown
         }
     }
 
@@ -1142,8 +1219,34 @@ sealed class LoginResult {
 
 /** Whether the current session is authenticated. */
 sealed class AuthState {
-    data class Authenticated(val username: String) : AuthState()
+    data class Authenticated(
+        val username: String,
+        /**
+         * The effective `SESSION_TTL_MINUTES` provisioned by `/api/me` (D2).
+         * Null on a pre-change server payload; the view model keeps any
+         * previously persisted TTL then.
+         */
+        val ttlMinutes: Long? = null,
+    ) : AuthState()
     data object Unauthenticated : AuthState()
+}
+
+/**
+ * Tri-state verdict of the client-side session-liveness probe
+ * (client-side/watchdog D4, task 4.1).
+ *
+ * [Unknown] is explicitly NOT an expiry verdict: a network error/timeout must
+ * never latch the expiry panel or redirect an active user.
+ */
+sealed class SessionProbeResult {
+    /** 200 — the session is alive (and was just renewed). */
+    data class Alive(val ttlMinutes: Long? = null) : SessionProbeResult()
+
+    /** 401 — the session is gone; the watchdog latches + routes to login. */
+    data object Expired : SessionProbeResult()
+
+    /** Transient failure (exception/non-401 non-200) — not a verdict. */
+    data object Unknown : SessionProbeResult()
 }
 
 /** Detailed onboarding state returned by GET /api/onboarding/state. */

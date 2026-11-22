@@ -100,43 +100,24 @@ class SqlDelightSessionStorage(
     /**
      * Reads the payload for [id], sliding its expiry (D2). Unknown, expired, or
      * invalidated IDs → `NoSuchElementException` (Ktor's absent-session
-     * contract); an expired row is treated as absent WITHOUT pruning it — the
-     * prune belongs to [classifyExpired] (spec: session-management —
-     * session-timeout feedback; the classification preserves the
-     * expired-vs-unknown distinction for the 401 reason payload).
+     * contract). An expired row is treated as absent AND pruned in the same
+     * access (lazy read-prune — the background sweep is only a redundant mop);
+     * the ID is unknown from then on.
      */
     override suspend fun read(id: String): String {
         val now = clock()
         val row = database.sessionsQueries.selectSession(id).executeAsOneOrNull()
             ?: throw NoSuchElementException("Session is unknown")
         if (row.expires_at <= now) {
-            // No prune here (see [classifyExpired]); the row stays until the
-            // classification (or the background sweep) removes it.
+            // Lazy prune: an expired record is absent and removed on access, so
+            // stale rows do not wait for the background sweep.
+            database.sessionsQueries.deleteSession(id)
             throw NoSuchElementException("Session expired")
         }
         if (row.expires_at < now + sessionTtlMillis()) {
             database.sessionsQueries.extendSessionExpiry(expires_at = now + sessionTtlMillis(), id = id)
         }
         return row.payload
-    }
-
-    /**
-     * Session-resolution failure classification (spec: session-management —
-     * session-timeout feedback): distinguishes an EXPIRED session record (row
-     * exists, `expires_at` past) from an UNKNOWN ID (no row). An expired record
-     * is pruned BY this classification — making the reason one-shot (the first
-     * failed request after expiry carries it; subsequent requests read as
-     * unknown-ID plain unauthenticated).
-     *
-     * @return true when [id] resolved to a now-pruned expired record (the 401
-     *   should carry `reason: session_expired` + the effective TTL), false for
-     *   an unknown/absent ID (plain unauthenticated).
-     */
-    fun classifyExpired(id: String): Boolean {
-        val row = database.sessionsQueries.selectSession(id).executeAsOneOrNull() ?: return false
-        if (row.expires_at > clock()) return false
-        database.sessionsQueries.deleteSession(id)
-        return true
     }
 
     /** Revokes the session: the row is deleted, the ID is unknown afterwards. */

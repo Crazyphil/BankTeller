@@ -22,6 +22,44 @@ class ApplicationTest {
         assertEquals(HttpStatusCode.OK, response.status)
     }
 
+    /**
+     * TTL provisioning (design D2): the login success body carries the
+     * effective SESSION_TTL_MINUTES under `ttlMinutes` (default 15 — env vars
+     * cannot be set in-test).
+     */
+    @Test
+    fun `login success body carries the effective ttl minutes`() = testApplication {
+        application { module() }
+        val response = client.post("/api/login") {
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            setBody("""{"username":"admin","password":"changeme"}""")
+        }
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = response.bodyAsText()
+        assertTrue(body.contains("\"ttlMinutes\":15"), "login body must carry ttlMinutes=15: $body")
+    }
+
+    /**
+     * TTL provisioning (design D2): the authenticated /api/me body carries the
+     * effective SESSION_TTL_MINUTES under `ttlMinutes` (default 15).
+     */
+    @Test
+    fun `me body carries the effective ttl minutes`() = testApplication {
+        application { module() }
+        val sessionClient = createClient { install(HttpCookies) }
+        val login = sessionClient.post("/api/login") {
+            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+            setBody("""{"username":"admin","password":"changeme"}""")
+        }
+        assertEquals(HttpStatusCode.OK, login.status)
+
+        val me = sessionClient.get("/api/me")
+        assertEquals(HttpStatusCode.OK, me.status)
+        val body = me.bodyAsText()
+        assertTrue(body.contains("\"username\":\"admin\""), "me body must carry the username: $body")
+        assertTrue(body.contains("\"ttlMinutes\":15"), "me body must carry ttlMinutes=15: $body")
+    }
+
     // =====================================================================
     // Session transport cutover (server-side-session-storage, tasks 2.2/2.3)
     // =====================================================================
@@ -78,41 +116,23 @@ class ApplicationTest {
     }
 
     /**
-     * Session-timeout feedback (spec: session-management): an expired session's
-     * first failed request answers 401 — never 500 — with the machine-readable
-     * reason and effective TTL in body AND headers; the classification prune
-     * makes the reason one-shot (the second request is a plain 401).
+     * A failed session resolution is a PLAIN 401 (spec: session-management —
+     * timeout detection is client-owned): an unknown ID carries no reason/TTL
+     * channel, and the body is serializable JSON (the regression: a
+     * Map<String, Any> mixing types crashed the converter with a 500).
      */
     @Test
-    fun `expired session 401 carries reason and ttl exactly once`() = testApplication {
+    fun `unknown session API 401 is plain with no reason channel`() = testApplication {
         application { module() }
-        // Log in and capture the opaque ID.
-        val login = client.post("/api/login") {
-            header(HttpHeaders.ContentType, ContentType.Application.Json.toString())
-            setBody("""{"username":"admin","password":"changeme"}""")
-        }
-        assertEquals(HttpStatusCode.OK, login.status)
-        val cookieId = login.headers[HttpHeaders.SetCookie]!!
-            .substringAfter("bankteller-session=").substringBefore(';')
-
-        // Wait out the TTL (test default is 15 min — advance via a fresh row is
-        // not possible here; instead delete the row's liveness by writing a row
-        // already expired through a direct store classification is out of
-        // scope; the simplest hermetic route: use the 1-minute env var).
-        // Instead of sleeping, we assert the classification contract directly:
-        // an unknown ID answers a plain 401 with no reason header.
         val plain = createClient { }.get("/api/me") {
             header(HttpHeaders.Cookie, "bankteller-session=unknown-id-aaaaaaaaaaaaaaaaaaaaaaaa")
         }
         assertEquals(HttpStatusCode.Unauthorized, plain.status)
-        assertNull(plain.headers["X-Session-Reason"], "unknown ID must be a plain 401")
-
-        // The reason-carrying path is covered by the classification unit tests
-        // (SqlDelightSessionStorageTest.classifyExpired...); this test pins the
-        // wire shape: a plain 401 body IS serializable JSON (the regression: a
-        // Map<String, Any> mixing types crashed the converter with a 500).
+        assertNoReasonHeaders(plain.headers)
         val body = plain.bodyAsText()
         assertTrue(body.contains("Not authenticated"), "401 body must be JSON: $body")
+        assertFalse(body.contains("expired"), "no expiry reason rides the 401: $body")
+        assertFalse(body.contains("ttl_minutes"), "no TTL channel rides the 401: $body")
     }
     /**
      * Restart survival: a session record written by one storage instance is
@@ -216,17 +236,15 @@ class ApplicationTest {
     }
 
     /**
-     * Session-timeout feedback (spec: session-management): the REASON-carrying API
-     * 401 — an expired session's first failed API request answers 401 with the
-     * machine-readable reason in body AND X-Session-* headers (the SPA's
-     * interceptor latches from the header), exactly once (the classification
-     * prunes the row; a replay is a plain 401).
+     * An EXPIRED session row also answers a PLAIN 401 (no reason headers, plain
+     * body) — and the failed read prunes the row (lazy read-prune). Replaying
+     * the same cookie is likewise a plain 401 (the ID is now unknown).
      */
     @Test
-    fun `expired session API 401 carries the reason exactly once`() = testApplication {
+    fun `expired session API 401 is plain and the row is pruned`() = testApplication {
         // A temp-FILE database (shared across DatabaseFactory.init() connections —
         // `:memory:` would give the module and this test separate DBs).
-        val dbPath = "/tmp/opencode/bt-reason401-${System.nanoTime()}.db"
+        val dbPath = "/tmp/opencode/bt-expired401-${System.nanoTime()}.db"
         System.setProperty("database.path", dbPath)
         try {
             application { module() }
@@ -253,19 +271,25 @@ class ApplicationTest {
                 header(HttpHeaders.Cookie, "bankteller-session=$cookieId")
             }
             assertEquals(HttpStatusCode.Unauthorized, first.status)
-            assertEquals("session_expired", first.headers["X-Session-Reason"])
-            assertEquals("15", first.headers["X-Session-Ttl-Minutes"])
+            assertNoReasonHeaders(first.headers)
             val body = first.bodyAsText()
-            assertTrue(body.contains("session_expired"), "401 body carries the reason: $body")
-            assertTrue(body.contains("\"ttl_minutes\""), "401 body carries the TTL: $body")
+            assertTrue(body.contains("Not authenticated"), "401 body: $body")
+            assertFalse(body.contains("expired"), "no expiry reason rides the 401: $body")
+            assertFalse(body.contains("ttl_minutes"), "no TTL channel rides the 401: $body")
 
-            // One-shot: the classification pruned the row — the replay is a plain 401.
+            // The failed read pruned the expired row (lazy read-prune).
+            assertNull(
+                db.sessionsQueries.selectSession(cookieId).executeAsOneOrNull(),
+                "the expired row must be pruned by the failed read",
+            )
+
+            // Replay: the ID is unknown now — still a plain 401.
             val replay = createClient { }.get("/api/me") {
                 header(HttpHeaders.Cookie, "bankteller-session=$cookieId")
             }
             assertEquals(HttpStatusCode.Unauthorized, replay.status)
-            assertNull(replay.headers["X-Session-Reason"], "the reason is one-shot")
-            assertFalse(replay.bodyAsText().contains("session_expired"), "the replayed 401 is plain: ${replay.bodyAsText()}")
+            assertNoReasonHeaders(replay.headers)
+            assertFalse(replay.bodyAsText().contains("expired"), "the replay is plain too")
         } finally {
             System.setProperty("database.path", ":memory:")
             java.io.File(dbPath).delete()
@@ -286,13 +310,23 @@ class ApplicationTest {
             ?: fail("login must set the bankteller-session cookie")
         // Lax (manual-verification 8.4 amendment, the task's documented fallback):
         // Firefox drops the Strict cookie on the bank → callback cross-site GET and on
-        // the same-origin follow-up after a cross-site redirect chain — the expiry
-        // classification could never run on those document routes. Lax attaches on
+        // the same-origin follow-up after a cross-site redirect chain. Lax attaches on
         // top-level GET navigations (the callback) while blocking cross-site POSTs.
         assertTrue(
             setCookie.contains("SameSite=Lax", ignoreCase = true),
             "session cookie must be SameSite=Lax, was: $setCookie",
         )
+    }
+
+    /**
+     * A failed session resolution is a plain 401: it must not carry any
+     * expiry-reason/TTL header (the reason channel was removed — timeout
+     * feedback is client-owned).
+     */
+    private fun assertNoReasonHeaders(headers: Headers) {
+        val names = headers.entries().map { it.key.lowercase() }
+        assertTrue(names.none { it.contains("reason") }, "a failed session must carry no reason header: $names")
+        assertTrue(names.none { it.contains("ttl") }, "a failed session must carry no ttl header: $names")
     }
 
     companion object {

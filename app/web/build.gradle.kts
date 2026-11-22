@@ -227,12 +227,18 @@ val containerWasmJsBrowserTest = tasks.register("containerWasmJsBrowserTest", Ex
         )
     }
 
-    // Karma's exit code is unreliable in containers: Chrome may disconnect
-    // repeatedly during webpack re-bundling (especially for the large wasmJs
-    // bundle with skiko.wasm ~8MB), causing Karma to exit 1 even when ALL
-    // tests passed. We capture the output and check for actual test failures
-    // (##teamcity[testFailed ...] messages). If zero test failures occurred,
-    // we treat the run as successful regardless of Karma's exit code.
+    // Karma's exit code is unreliable in containers, so the result is judged
+    // from the captured output. Policy (hardened per the review finding,
+    // client-side-session-timeout-watchdog 5.2): the run is green ONLY when
+    // zero testFailed messages occurred AND at least one testFinished AND no
+    // browser-disconnect/restart/launcher-failure line appears — Karma's
+    // browserNoActivityTimeout (60s) disconnects a wedged browser, so a
+    // hung suite ALWAYS leaves disconnect/restart lines (e.g. the wasmJs
+    // bundle wedging the browser event loop); exit code is ignored either
+    // way. Healthy runs contain none of those lines (verified empirically:
+    // a healthy run's log has zero matches; a wedged run's log is nothing
+    // but matches). Failure direction is fail-closed: a legitimate run with
+    // a trailing benign disconnect also fails — accepted (rerun).
     commandLine(
         engine, "run", "--rm",
         "-v", "$repoRoot:/work$mountFlag",
@@ -267,7 +273,14 @@ val containerWasmJsBrowserTest = tasks.register("containerWasmJsBrowserTest", Ex
             // no files (or the bundle failed to load), no testFinished messages
             // appear and the run "succeeds" while verifying nothing.
             "finished=\$(tr '#' '\\n' < /tmp/karma-output.log | grep -c 'testFinished' || true); " +
-            "if [ \"\$failures\" -gt 0 ] || [ \"\$finished\" -eq 0 ]; then " +
+            // Guard against the browser-hang failure mode (review finding,
+            // client-side-session-timeout-watchdog 5.2): a suite that wedges the
+            // browser produces disconnect/restart cycles; Karma exits after its
+            // retry budget with zero testFailures, which the heuristic above
+            // would mask as a green run. Any launcher failure, browser
+            // disconnect, or restart indicates a broken run — fail it.
+            "hangs=\$(tr '#' '\\n' < /tmp/karma-output.log | grep -c -E 'Disconnected|Restarting Chrome|CLIENT_RUN_FAILED|CLIENT_ERROR' || true); " +
+            "if [ \"\$failures\" -gt 0 ] || [ \"\$finished\" -eq 0 ] || [ \"\$hangs\" -gt 0 ]; then " +
             "  cat /tmp/karma-output.log; " +
             "  exit 1; " +
             "else " +

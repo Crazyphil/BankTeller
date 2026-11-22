@@ -37,18 +37,39 @@ import kotlin.test.assertTrue
 class AppViewModelTest {
 
     private val testDispatcher = StandardTestDispatcher()
+
+    /** Realistic epoch base for the virtual clock (arbitrary, fixed). */
+    private val VIRTUAL_CLOCK_EPOCH_MILLIS = 1_700_000_000_000L
     private lateinit var fakeApi: FakeApiClient
     private lateinit var vm: AppViewModel
+
+    /**
+     * SCHEDULER-VIRTUAL clock for the watchdog (review finding, 5.2): the
+     * ViewModel's `now` seam reads the test scheduler's virtual time, so
+     * `advanceTimeBy` moves the watchdog's world and `delay`-armed liveness
+     * chains terminate under `runTest` (a wall clock never advances in
+     * virtual time — the self-rescheduling chains looped forever and hung
+     * the browser suite).
+     */
+    private fun virtualNow(): Long =
+        testDispatcher.scheduler.currentTime + VIRTUAL_CLOCK_EPOCH_MILLIS
 
     @BeforeTest
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
-        // The session-expiry latch persists to the browser's real localStorage
-        // (these commonTest cases run in the Karma browser). Clear it so one
-        // test's latch can never leak into the next.
+        // The session-expiry latch and the watchdog clock/TTL persist to the
+        // browser's real localStorage (these commonTest cases run in the Karma
+        // browser). Clear them so one test's state can never leak into the next.
         localStorageRemove(AppViewModel.SESSION_EXPIRED_MARKER_KEY)
-        fakeApi = FakeApiClient()
-        vm = AppViewModel(apiClient = fakeApi)
+        localStorageRemove(AppViewModel.LAST_ACTIVITY_KEY)
+        localStorageRemove(AppViewModel.TTL_KEY)
+        fakeApi = FakeApiClient(now = ::virtualNow)
+        vm = AppViewModel(apiClient = fakeApi, now = ::virtualNow)
+        // TEST CIRCUIT BREAKER (review finding, 5.2): the production watchdog
+        // reschedules itself indefinitely — under the virtual scheduler that
+        // chain would loop forever and hang `advanceUntilIdle`. Cap the
+        // self-rescheduling budget for every test so all chains terminate.
+        vm.sessionLivenessEvaluationBudget = 32
     }
 
     @AfterTest
@@ -58,8 +79,10 @@ class AppViewModelTest {
         // viewModelScope coroutines don't auto-cancel between test cases.
         vm.dispose()
         Dispatchers.resetMain()
-        // Leave no latched marker behind for the next browser-test page.
+        // Leave no latched marker or clock/TTL behind for the next browser-test page.
         localStorageRemove(AppViewModel.SESSION_EXPIRED_MARKER_KEY)
+        localStorageRemove(AppViewModel.LAST_ACTIVITY_KEY)
+        localStorageRemove(AppViewModel.TTL_KEY)
     }
 
     // ---------------------------------------------------------------
@@ -568,51 +591,25 @@ class AppViewModelTest {
     }
 
     // ---------------------------------------------------------------
-    // Session-expiry latch (spec: session-management — session-timeout
-    // feedback; server-side-session-storage). The latch is one-shot: set by the
-    // 401 catch-all (or restored from localStorage on boot), consumed by the
-    // login screen's panel.
+    // Session-expiry watchdog + backstop (spec: session-management —
+    // session-timeout feedback; client-side-session-timeout-watchdog). The
+    // latch is one-shot: set by the watchdog verdict (probe/timer/focus/boot)
+    // or the in-session plain-401 backstop, consumed by the login screen's
+    // panel.
     // ---------------------------------------------------------------
 
-    @Test
-    fun sessionExpiry_handleSessionExpired_latchesTtlAndRoutesToLogin() = runTest(testDispatcher) {
-        vm.handleSessionExpired("session_expired", 15L)
-        advanceUntilIdle()
-        assertEquals(15L, vm.sessionExpiredTtlMinutes)
-        assertEquals(Screen.Login, vm.currentScreen)
-        assertFalse(vm.isAuthenticated)
-        // Persisted for a page instance that dies before the panel renders
-        // (the callback's full-page redirect; a background tab).
-        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
-    }
+    /** A persisted activity clock that is already past its TTL window. */
+    private fun staleClock(ttlMinutes: Long): Long =
+        virtualNow() - ttlMinutes * 60_000L - 1_000L
 
-    @Test
-    fun sessionExpiry_401WithoutReason_routesToLoginButPreservesTheLatch() = runTest(testDispatcher) {
-        vm.handleSessionExpired("session_expired", 30L)
-        // A parallel poll's plain 401 (the server-side reason is one-shot and
-        // already consumed by the first response) must not clear the latch.
-        vm.handleSessionExpired(null, null)
-        advanceUntilIdle()
-        assertEquals(30L, vm.sessionExpiredTtlMinutes, "a reasonless 401 must not overwrite the latch")
-        assertEquals(Screen.Login, vm.currentScreen)
-        assertEquals("30", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
-    }
-
-    @Test
-    fun sessionExpiry_unauthorizedHookIsWiredToHandleSessionExpired() = runTest(testDispatcher) {
-        // The ApiClient's 401 interceptor invokes the view model's late-bound
-        // hook; constructing the view model must install it (an unset hook would
-        // leave every 401 without routing).
-        val hook = fakeApi.onUnauthorized
-        assertNotNull(hook, "AppViewModel must wire the 401 catch-all onto its ApiClient")
-        hook.invoke("session_expired", 45L)
-        assertEquals(45L, vm.sessionExpiredTtlMinutes)
-        assertEquals(Screen.Login, vm.currentScreen)
+    /** Authenticates [vm] through the boot check with a payload TTL. */
+    private fun authenticateWithTtl(ttlMinutes: Long) {
+        fakeApi.nextAuthState = AuthState.Authenticated("admin", ttlMinutes)
     }
 
     @Test
     fun sessionExpiry_checkAuthRestoresThePersistedLatch() = runTest(testDispatcher) {
-        // A previous page instance latched the reason; this boot must render it.
+        // A previous page instance latched the expiry; this boot must render it.
         localStorageSet(AppViewModel.SESSION_EXPIRED_MARKER_KEY, "20")
         fakeApi.nextAuthState = AuthState.Unauthenticated
         vm.checkAuth()
@@ -622,43 +619,481 @@ class AppViewModelTest {
     }
 
     @Test
-    fun sessionExpiry_dismissClearsTheLatchAndThePersistedMarker() = runTest(testDispatcher) {
-        vm.handleSessionExpired("session_expired", 15L)
-        vm.dismissSessionExpiredPanel()
-        assertNull(vm.sessionExpiredTtlMinutes)
-        assertNull(
-            localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY),
-            "dismissal is the one-shot consumption — no stale marker may survive",
-        )
+    fun sessionExpiry_backstop_inSession401LatchesKnownTtlAndRoutes() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin") // no payload TTL
+        vm.checkAuth()
+        runCurrent()
+        assertTrue(vm.isAuthenticated)
+
+        vm.handleSessionExpired()
+
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertFalse(vm.isAuthenticated)
+        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
     }
 
     @Test
-    fun sessionExpiry_successfulLoginClearsTheLatch() = runTest(testDispatcher) {
-        vm.handleSessionExpired("session_expired", 15L)
-        fakeApi.nextLoginResult = LoginResult.Success
-        fakeApi.nextOnboardingStatus = OnboardingStatus(enableBankingConfigured = false)
-        fakeApi.nextOnboardingState = OnboardingState(
-            requiresRelogin = false,
-            linkingCompleted = false,
-            authCompleted = false,
-            authError = null,
-            selectedBank = null,
+    fun sessionExpiry_backstop_anotherTabTtlRestoredFromStore() = runTest(testDispatcher) {
+        // The in-memory TTL is null (the VM predates the other tab's write);
+        // the latch must fall back to the persisted store.
+        localStorageSet(AppViewModel.TTL_KEY, "20")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        vm.checkAuth()
+        runCurrent()
+        assertNull(vm.sessionTtlMinutes, "no payload TTL was provisioned")
+
+        vm.handleSessionExpired()
+
+        assertEquals(20L, vm.sessionExpiredTtlMinutes)
+        assertEquals("20", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun sessionExpiry_unauthorizedHookIsWiredToTheBackstop() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.TTL_KEY, "45")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        vm.checkAuth()
+        runCurrent()
+        // The ApiClient's 401 interceptor invokes the view model's late-bound
+        // hook; constructing the view model must install it (an unset hook
+        // would leave every 401 without routing). Every 401 is plain now.
+        val hook = fakeApi.onUnauthorized
+        assertNotNull(hook, "AppViewModel must wire the 401 backstop onto its ApiClient")
+        hook.invoke()
+
+        assertEquals(45L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+    }
+
+    @Test
+    fun sessionExpiry_logoutLatchesNothingEvenAfterReload() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        vm.checkAuth()
+        runCurrent()
+
+        vm.logout()
+        advanceUntilIdle()
+
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertNull(
+            localStorageGet(AppViewModel.LAST_ACTIVITY_KEY),
+            "logout clears the persisted clock so a reload cannot re-latch",
         )
+
+        // Simulated reload: no panel from the boot branch.
+        val reloaded = AppViewModel(apiClient = fakeApi, now = ::virtualNow).apply { sessionLivenessEvaluationBudget = 32 }
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+        reloaded.checkAuth()
+        advanceUntilIdle()
+        assertNull(reloaded.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertEquals(Screen.Login, reloaded.currentScreen)
+        reloaded.dispose()
+    }
+
+    @Test
+    fun sessionExpiry_reLoginConsumesTheLatch() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        vm.checkAuth()
+        runCurrent()
+        vm.handleSessionExpired()
+        assertNotNull(vm.sessionExpiredTtlMinutes)
+
+        fakeApi.nextLoginResult = LoginResult.Success
         vm.login("admin", "changeme")
         advanceUntilIdle()
+
         assertNull(vm.sessionExpiredTtlMinutes, "a successful re-login consumes the latch")
         assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
     }
 
     @Test
-    fun sessionExpiry_logoutClearsTheLatch() = runTest(testDispatcher) {
-        vm.handleSessionExpired("session_expired", 15L)
-        vm.logout()
+    fun sessionExpiry_dismissalSurvivesReloadViaBootBranch() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        fakeApi.nextAuthState = AuthState.Authenticated("admin")
+        vm.checkAuth()
+        runCurrent()
+        vm.handleSessionExpired()
+        assertNotNull(vm.sessionExpiredTtlMinutes)
+
+        vm.dismissSessionExpiredPanel()
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertNull(
+            localStorageGet(AppViewModel.LAST_ACTIVITY_KEY),
+            "dismissal clears the persisted clock so the boot branch cannot re-latch",
+        )
+
+        val reloaded = AppViewModel(apiClient = fakeApi, now = ::virtualNow).apply { sessionLivenessEvaluationBudget = 32 }
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+        reloaded.checkAuth()
         advanceUntilIdle()
-        // A deliberate logout shows no panel — timeout feedback is unrelated.
+        assertNull(reloaded.sessionExpiredTtlMinutes)
+        reloaded.dispose()
+    }
+
+    // ---------------------------------------------------------------
+    // Watchdog evaluation path (client-side-session-timeout-watchdog 4.1)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun watchdog_expiredProbe401_latchesTtlAndRoutesToLogin() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Expired
+
+        vm.checkAuth()
+        advanceUntilIdle()
+
+        assertEquals(1, fakeApi.probeCalls)
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertFalse(vm.isAuthenticated)
+        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun watchdog_expiredProbe200_refreshesClockWithoutRouting() = runTest(testDispatcher) {
+        val stale = staleClock(15)
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, stale.toString())
+        authenticateWithTtl(15L)
+
+        // A SEQUENCE: the first probe answers Alive (clock-skew self-heal);
+        // the retry-cycle budget bounds the then-healthy chain.
+        fakeApi.nextProbeResult = SessionProbeResult.Alive(15L)
+
+        vm.checkAuth()
+        // Precision (review finding 5.2): runCurrent processes exactly the
+        // boot's checkAuth + first evaluation; a full advanceUntilIdle would
+        // drain the (correctly) still-running healthy chain and blur the
+        // probe-call count.
+        runCurrent()
+
+        assertEquals(1, fakeApi.probeCalls)
+        assertTrue(vm.isAuthenticated, "a 200 probe verdict keeps the user in-session")
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertTrue(vm.currentScreen != Screen.Login)
+        val refreshed = localStorageGet(AppViewModel.LAST_ACTIVITY_KEY)?.toLongOrNull()
+        assertNotNull(refreshed)
+        assertTrue(refreshed > stale, "the probe's 200 refreshes the activity clock")
+    }
+
+    @Test
+    fun watchdog_probeUnknown_staysPutWithoutLatch() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Unknown
+
+        vm.checkAuth()
+        // Precision: exactly one evaluation so the probe count is exact; the
+        // bounded retry chain (still scheduled, by design) is not drained.
+        runCurrent()
+
+        assertEquals(1, fakeApi.probeCalls)
+        assertTrue(vm.isAuthenticated, "a network error is NOT an expiry verdict")
+        assertNull(vm.sessionExpiredTtlMinutes)
+        assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertTrue(vm.currentScreen != Screen.Login)
+    }
+
+    @Test
+    fun watchdog_liveClockDoesNotProbe() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        authenticateWithTtl(15L)
+
+        vm.checkAuth()
+        runCurrent()
+
+        assertEquals(0, fakeApi.probeCalls, "a live clock is never probed")
+        assertTrue(vm.isAuthenticated)
+        assertNull(vm.sessionExpiredTtlMinutes)
+    }
+
+    @Test
+    fun watchdog_timerFiresAfterRemainingWindowAndDrivesEvaluation() = runTest(testDispatcher) {
+        // The clock is 5s shy of expiry: the timer arms for ~5s.
+        localeClockShortOfExpiry(15L, 5_000L)
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Expired
+
+        vm.checkAuth()
+        runCurrent()
+        assertEquals(0, fakeApi.probeCalls, "the timer must not fire before the window elapses")
+
+        advanceTimeBy(1_000L)
+        runCurrent()
+        assertEquals(0, fakeApi.probeCalls)
+
+        // The window elapses; the persisted clock now reads stale at fire time.
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        advanceTimeBy(10_000L)
+        runCurrent()
+
+        assertEquals(1, fakeApi.probeCalls, "the timer trigger runs the shared evaluation path")
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+    }
+
+    private fun localeClockShortOfExpiry(ttlMinutes: Long, remainingMillis: Long) {
+        localStorageSet(
+            AppViewModel.LAST_ACTIVITY_KEY,
+            (virtualNow() - ttlMinutes * 60_000L + remainingMillis).toString(),
+        )
+    }
+
+    @Test
+    fun watchdog_timerReArmsAfterNotExpiredEvaluation() = runTest(testDispatcher) {
+        // Regression (manual-verification 6.3 finding, silent-disarm class):
+        // an evaluation that finds the clock LIVE must RE-ARM the timer —
+        // the old clock-unchanged re-arm guard killed the timer here,
+        // leaving the tab silent until a manual focus. Shape: a barely-live
+        // clock (minutes shy of the window), a focus evaluation → live, no
+        // probe → the re-armed TIMER then fires past the window and delivers
+        // the expiry. The production code's live-then-stale sequence is the
+        // exact manual-observation (evaluate "not expired" at the boundary;
+        // the user idles on; the timer must still be alive to catch it).
+        localeClockShortOfExpiry(15L, 120_000L) // 2 min left of a 15-min window
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Expired
+
+        vm.checkAuth()
+        runCurrent() // boots authenticated; the boot arms the timer (~2 min)
+
+        // A focus evaluation while the clock is still live: "not expired",
+        // no probe — and the re-arm must have happened. Precision: assert
+        // BEFORE draining any scheduled timer work.
+        vm.onWindowFocusTrigger()
+        runCurrent()
+        assertEquals(0, fakeApi.probeCalls, "a live clock is never probed (focus)")
+
+        // The idle window truly elapses (virtual time): the re-armed timer
+        // fires, finds the clock stale, probes, and routes. If the focus
+        // evaluation had disarmed the timer (the regression), this never
+        // happens and the assertions below fail.
+        advanceTimeBy(3_000_000L) // 50 min — far past the window
+        runCurrent()
+
+        assertEquals(1, fakeApi.probeCalls, "the re-armed timer must deliver the expiry")
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+    }
+
+    @Test
+    fun watchdog_unknownProbeRetriesAfterBoundedDelay() = runTest(testDispatcher) {
+        // Regression (silent-disarm class): an inconclusive probe verdict
+        // (network error/timeout) stays put, but the fired timer's job is
+        // gone — without a scheduled retry a visible tab would never evaluate
+        // again (no focus event, no API activity refreshing the clock).
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Unknown
+
+        vm.checkAuth()
+        // First evaluation only (precision): the retry chain stays scheduled.
+        runCurrent()
+        assertEquals(1, fakeApi.probeCalls, "the stale clock is probed once")
+        assertTrue(vm.isAuthenticated, "an inconclusive verdict is NOT an expiry — stay put")
+        assertNull(vm.sessionExpiredTtlMinutes, "no latch on a network failure")
+
+        // The bounded retry delay elapses → evaluation again (still Unknown
+        // → still stays put, but the chain continues instead of dying).
+        advanceTimeBy(AppViewModel.SESSION_LIVENESS_RETRY_DELAY_MS + 1_000L)
+        runCurrent()
+        assertEquals(2, fakeApi.probeCalls, "the retry delay drives a fresh evaluation")
+        assertTrue(vm.isAuthenticated)
+
+        // And the verdict CAN still conclude later: flip to Expired and let
+        // the next retry fire.
+        fakeApi.nextProbeResult = SessionProbeResult.Expired
+        advanceTimeBy(AppViewModel.SESSION_LIVENESS_RETRY_DELAY_MS + 1_000L)
+        runCurrent()
+        assertEquals(3, fakeApi.probeCalls)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+    }
+
+    @Test
+    fun watchdog_focusTriggerRunsTheSharedEvaluationPath() = runTest(testDispatcher) {
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        authenticateWithTtl(15L)
+        fakeApi.nextProbeResult = SessionProbeResult.Expired
+
+        vm.checkAuth()
+        runCurrent()
+        assertEquals(0, fakeApi.probeCalls)
+
+        // The user returns after idling past the window.
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        vm.onWindowFocusTrigger()
+        runCurrent()
+
+        assertEquals(1, fakeApi.probeCalls)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+    }
+
+    // ---------------------------------------------------------------
+    // Boot branch (client-side-session-timeout-watchdog 4.2 trigger #3)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun boot_staleClockLatchesThePanel() = runTest(testDispatcher) {
+        // 6.6(b) amendment (manual verification: server verdict wins over the
+        // client's own clock reading): the boot branch is PRESENCE-based —
+        // any persisted activity clock (written only by authenticated
+        // responses, cleared on logout/dismissal) turns the boot's 401 into
+        // the timeout verdict, regardless of how fresh the client clock
+        // looks (time sync to the past, TTL shortened server-side).
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, staleClock(15).toString())
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+
+        vm.checkAuth()
+        advanceUntilIdle()
+
+        assertEquals(15L, vm.sessionExpiredTtlMinutes)
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+        assertEquals(0, fakeApi.probeCalls, "the boot check's 401 IS the verdict — no probe")
+    }
+
+    @Test
+    fun boot_liveClockLatchesThePanel() = runTest(testDispatcher) {
+        // Regression for the manual-verification 6.6(b) finding: a session
+        // deleted/expired SERVER-side with the client clock still inside its
+        // window (session pruned seconds after login; TTL shortened
+        // server-side mid-session; client clock skewed to the past) must
+        // STILL latch — the server's 401 is authoritative, the clock is
+        // evidence of a non-deliberate end, not a staleness measurement.
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+
+        vm.checkAuth()
+        advanceUntilIdle()
+
+        assertEquals(Screen.Login, vm.currentScreen)
+        assertNotNull(vm.sessionExpiredTtlMinutes, "a live-looking clock must not mask the server's 401 verdict")
+        assertEquals("15", localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
+    }
+
+    @Test
+    fun boot_liveClockWithoutKnownTtlLatchesUntimedCopy() = runTest(testDispatcher) {
+        // The TTL store may be empty (pre-change server, cleared storage):
+        // the PRESENCE verdict still latches, with the untimed panel copy.
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, virtualNow().toString())
+        localStorageRemove(AppViewModel.TTL_KEY)
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+
+        vm.checkAuth()
+        advanceUntilIdle()
+
+        assertEquals(
+            AppViewModel.UNTIMED_SESSION_EXPIRY_TTL_MINUTES,
+            vm.sessionExpiredTtlMinutes,
+            "unknown TTL latches the untimed copy, never a fabricated window",
+        )
+        assertEquals(Screen.Login, vm.currentScreen)
+    }
+
+    @Test
+    fun boot_absentClockDoesNotLatch() = runTest(testDispatcher) {
+        // Fresh visit: no activity clock, never a panel.
+        localStorageSet(AppViewModel.TTL_KEY, "15")
+        fakeApi.nextAuthState = AuthState.Unauthenticated
+
+        vm.checkAuth()
+        advanceUntilIdle()
+
         assertNull(vm.sessionExpiredTtlMinutes)
         assertNull(localStorageGet(AppViewModel.SESSION_EXPIRED_MARKER_KEY))
         assertEquals(Screen.Login, vm.currentScreen)
+    }
+
+    // ---------------------------------------------------------------
+    // Activity clock + TTL provisioning (tasks 3.1 / 3.2)
+    // ---------------------------------------------------------------
+
+    @Test
+    fun activityClock_successfulAuthenticatedResponseUpdatesTheClock() {
+        localStorageRemove(AppViewModel.LAST_ACTIVITY_KEY)
+        val before = getCurrentEpochMillis()
+
+        fakeApi.handleResponseForActivityClock("/api/accounts", 200)
+
+        val stored = localStorageGet(AppViewModel.LAST_ACTIVITY_KEY)?.toLongOrNull()
+        assertNotNull(stored, "a 2xx on an authenticated endpoint writes the clock")
+        assertTrue(stored >= before)
+    }
+
+    @Test
+    fun activityClock_loginLogoutAndErrorResponsesDoNotUpdateTheClock() {
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, "12345")
+
+        fakeApi.handleResponseForActivityClock("/api/login", 200)
+        assertEquals("12345", localStorageGet(AppViewModel.LAST_ACTIVITY_KEY), "login resets the clock itself, not via the pipeline")
+
+        fakeApi.handleResponseForActivityClock("/api/logout", 200)
+        assertEquals("12345", localStorageGet(AppViewModel.LAST_ACTIVITY_KEY), "logout must not look like activity")
+
+        fakeApi.handleResponseForActivityClock("/api/accounts", 500)
+        assertEquals("12345", localStorageGet(AppViewModel.LAST_ACTIVITY_KEY), "a non-2xx is not activity")
+
+        fakeApi.handleResponseForActivityClock("/api/accounts", 401)
+        assertEquals("12345", localStorageGet(AppViewModel.LAST_ACTIVITY_KEY))
+    }
+
+    @Test
+    fun ttl_successfulLoginProvisionsTtlAndResetsTheClock() = runTest(testDispatcher) {
+        // A stale clock from the prior session must not survive the login.
+        localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, "1000")
+        fakeApi.nextLoginResult = LoginResult.Success
+        fakeApi.nextLoginTtlMinutes = 15L
+
+        val before = virtualNow()
+        vm.login("admin", "changeme")
+        advanceUntilIdle()
+        val after = virtualNow()
+
+        assertEquals("15", localStorageGet(AppViewModel.TTL_KEY))
+        assertEquals(15L, vm.sessionTtlMinutes)
+        val stored = localStorageGet(AppViewModel.LAST_ACTIVITY_KEY)?.toLongOrNull()
+        assertNotNull(stored)
+        assertTrue(stored in before..after, "a successful login RESETS the activity clock to now")
+    }
+
+    @Test
+    fun ttl_survivesViewModelReinitAndUpdatesOnRelogin() = runTest(testDispatcher) {
+        fakeApi.nextLoginResult = LoginResult.Success
+        fakeApi.nextLoginTtlMinutes = 20L
+        vm.login("admin", "pw")
+        advanceUntilIdle()
+        assertEquals(20L, vm.sessionTtlMinutes)
+        assertEquals("20", localStorageGet(AppViewModel.TTL_KEY))
+
+        // A fresh page instance restores the provisioned TTL from storage.
+        val reloaded = AppViewModel(apiClient = fakeApi, now = ::virtualNow).apply { sessionLivenessEvaluationBudget = 32 }
+        assertEquals(20L, reloaded.sessionTtlMinutes)
+        reloaded.dispose()
+
+        // Re-login with a changed TTL (env restart) picks up the new value.
+        fakeApi.nextLoginTtlMinutes = 35L
+        vm.login("admin", "pw")
+        advanceUntilIdle()
+        assertEquals(35L, vm.sessionTtlMinutes)
+        assertEquals("35", localStorageGet(AppViewModel.TTL_KEY))
     }
 
     // ---------------------------------------------------------------
@@ -4107,7 +4542,7 @@ class AppViewModelTest {
  * Properties prefixed `next` are returned by the corresponding API method.
  * Lists prefixed with calls record every invocation.
  */
-private class FakeApiClient : ApiClient() {
+private class FakeApiClient(private val now: () -> Long = ::getCurrentEpochMillis) : ApiClient() {
     var nextAuthState: AuthState = AuthState.Unauthenticated
     var nextLoginResult: LoginResult = LoginResult.Failure("not configured")
     var nextOnboardingStatus: OnboardingStatus? = null
@@ -4115,6 +4550,21 @@ private class FakeApiClient : ApiClient() {
     var nextStartResult: StartResult = StartResult.Error("not configured")
     var nextCompleteResult: CompleteResult = CompleteResult(false, null, "not configured")
     var completeCallDelayMs: Long = 0L
+
+    /**
+     * TTL provisioned by a successful [login] (client-side/watchdog D2): when
+     * non-null the fake mirrors the real ApiClient — persist the TTL and reset
+     * the activity clock to now. Null leaves storage untouched (the pre-change
+     * fake semantics, so unrelated login tests are unaffected).
+     */
+    var nextLoginTtlMinutes: Long? = null
+
+    /** Tri-state verdict returned by [probeSession]; default is "not a verdict". */
+    var nextProbeResult: SessionProbeResult = SessionProbeResult.Unknown
+
+    /** Number of [probeSession] invocations (task 4.1 assertions). */
+    var probeCalls: Int = 0
+        private set
 
     var nextOnboardingState: OnboardingState? = null
     var nextRegistrationInfo: RegistrationInfo? = null
@@ -4349,12 +4799,26 @@ private class FakeApiClient : ApiClient() {
     override suspend fun login(username: String, password: String): LoginResult {
         if (loginCalls == null) loginCalls = mutableListOf()
         loginCalls!!.add(username to password)
-        return nextLoginResult
+        val result = nextLoginResult
+        if (result is LoginResult.Success) {
+            // Mirror the real ApiClient: a 200 resets the activity clock, and
+            // (when configured) persists the provisioned TTL.
+            nextLoginTtlMinutes?.let {
+                localStorageSet(AppViewModel.TTL_KEY, it.toString())
+            }
+            localStorageSet(AppViewModel.LAST_ACTIVITY_KEY, now().toString())
+        }
+        return result
     }
 
     override suspend fun logout(): Boolean = true
 
     override suspend fun checkAuth(): AuthState = nextAuthState
+
+    override suspend fun probeSession(): SessionProbeResult {
+        probeCalls++
+        return nextProbeResult
+    }
 
     override suspend fun getOnboardingStatus(): OnboardingStatus? {
         if (onboardingStatusCallDelayMs > 0) delay(onboardingStatusCallDelayMs)

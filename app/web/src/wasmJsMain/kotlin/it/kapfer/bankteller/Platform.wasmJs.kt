@@ -168,6 +168,13 @@ actual fun setDocumentTitle(title: String) {
     setDocumentTitleJs(title)
 }
 
+@JsFun("(callback) => { try { window.addEventListener('focus', () => callback()); } catch (e) {} }")
+private external fun registerWindowFocusListenerJs(callback: () -> Unit)
+
+actual fun registerWindowFocusListener(callback: () -> Unit) {
+    registerWindowFocusListenerJs(callback)
+}
+
 @JsFun("(value) => { try { return decodeURIComponent(value); } catch (e) { return null; } }")
 private external fun decodeUriComponentJs(value: String): String?
 

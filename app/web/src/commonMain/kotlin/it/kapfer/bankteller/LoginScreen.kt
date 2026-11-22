@@ -91,11 +91,15 @@ fun LoginScreen(viewModel: AppViewModel) {
             // brass DecisionBox (Tier 3 — the remove-caveat panel's grammar:
             // leading 18dp outlined WarningAmber glyph, trailing dismiss
             // affordance). Rendered only here, between the brand lockup and
-            // the credentials form; latched by the login gate when ANY
-            // observed 401 carried `reason: session_expired`. Never rendered
-            // after a deliberate logout, on a fresh visit, after dismissal,
-            // or after a re-login.
+            // the credentials form; latched by the client-side session
+            // watchdog (probe/timer/focus/boot verdict) or the in-session
+            // plain-401 backstop. Never rendered after a deliberate logout,
+            // on a fresh visit, after dismissal, or after a re-login.
+            // A TTL of [AppViewModel.UNTIMED_SESSION_EXPIRY_TTL_MINUTES] (a
+            // boot verdict with no known TTL) degrades to an untimed copy —
+            // never a fabricated window.
             viewModel.sessionExpiredTtlMinutes?.let { ttl ->
+                val untimed = ttl == AppViewModel.UNTIMED_SESSION_EXPIRY_TTL_MINUTES
                 val brass = LocalBankTellerColors.current.brass
                 val brassText = LocalBankTellerColors.current.brassText
                 // Calm fade-in (task 2.5): the panel materializes gently rather
@@ -125,7 +129,11 @@ fun LoginScreen(viewModel: AppViewModel) {
                             modifier = Modifier.size(18.dp),
                         )
                         Text(
-                            text = "Your session expired after $ttl ${if (ttl == 1L) "minute" else "minutes"} of inactivity. Please sign in again.",
+                            text = if (untimed) {
+                                "Your session expired. Please sign in again."
+                            } else {
+                                "Your session expired after $ttl ${if (ttl == 1L) "minute" else "minutes"} of inactivity. Please sign in again."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurface,
                             modifier = Modifier.weight(1f),

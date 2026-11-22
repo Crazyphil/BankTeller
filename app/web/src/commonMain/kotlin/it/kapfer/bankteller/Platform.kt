@@ -127,6 +127,16 @@ fun closeSandboxCredentialsPopupIfOpen(): Boolean {
 expect fun setDocumentTitle(title: String)
 
 /**
+ * Registers a callback invoked when the browser window regains focus
+ * (client-side/watchdog D4). The focus check is the guaranteed watchdog
+ * trigger: browsers throttle background-tab timers, but a returning user
+ * always fires `focus` — the session liveness is re-evaluated before the user
+ * can resume interacting with a dead session. On non-web targets this is an
+ * inert no-op (the focus trigger does not exist there).
+ */
+expect fun registerWindowFocusListener(callback: () -> Unit)
+
+/**
  * URL-decodes a query-parameter value (decodeURIComponent). Returns null when
  * the value is malformed (e.g. a bare `%` sequence) — the caller treats the
  * params as unreadable.

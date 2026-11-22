@@ -131,18 +131,40 @@ data class ReAuthBank(
  */
 class AppViewModel(
     private val apiClient: ApiClient = ApiClient(onUnauthorized = null),
+    /**
+     * The watchdog's clock (review finding, client-side-session-timeout-
+     * watchdog 5.2): tests inject a SCHEDULER-VIRTUAL clock so `delay`-armed
+     * liveness chains advance with `advanceTimeBy` and terminate under
+     * `runTest` (a wall clock never advances in virtual time — the chains
+     * looped forever and hung the browser suite). Production leaves the
+     * default: the platform's real epoch-millis source.
+     */
+    private val now: () -> Long = ::getCurrentEpochMillis,
 ) : ViewModel() {
 
     init {
-        // Session-expiry catch-all (server-side-session-storage): ANY API call
-        // answering 401 routes to the login screen immediately — the
-        // server-side session record is gone (expired/revoked), the cookie is
-        // worthless, and leaving the user on a stale screen with inline
-        // errors is a dead end (manual-verification 8.2 finding). Wired via a
-        // late-binding setter (the view model owns the routing state; the
-        // client may be injected by tests without the hook).
+        // Session-expiry backstop (client-side/watchdog D5): ANY API call
+        // answering 401 is a plain 401 now. The view model routes to the login
+        // screen immediately and latches the expiry panel when it still
+        // believes it is in-session (a deliberate logout clears that belief
+        // first, so it never latches). Wired via a late-binding setter (the
+        // view model owns the routing state; the client may be injected by
+        // tests without the hook).
         apiClient.onUnauthorized = ::handleSessionExpired
+        // Watchdog trigger #2 (D4): re-evaluate session liveness whenever the
+        // browser window regains focus — the guaranteed "returning user" check
+        // (background-tab timers are throttled; focus is not). Inert on JVM.
+        registerWindowFocusListener(::onWindowFocusTrigger)
     }
+
+    /**
+     * Window-focus watchdog trigger (D4): runs the shared liveness evaluation.
+     * Also the test seam for the focus path (the actual listener is wasm-only).
+     */
+    internal fun onWindowFocusTrigger() {
+        viewModelScope.launch { evaluateSessionLiveness() }
+    }
+
     // ---------------------------------------------------------------
     // State
     // ---------------------------------------------------------------
@@ -621,23 +643,23 @@ class AppViewModel(
     // ---------------------------------------------------------------
 
     /**
-     * Session-expiry catch-all (server-side-session-storage): any API call
-     * answering 401 means the server-side session record is gone (expired,
-     * revoked, or restarted into a fresh database) — the cookie is worthless.
-     * Route to the login screen immediately instead of leaving the user on a
-     * stale screen with inline errors. Cancels every active poll first (a
-     * polling loop would otherwise keep firing 401s and, worse, keep the
-     * on-activity sliding renewal alive for a session that no longer exists).
+     * Session-expiry backstop (client-side/watchdog D5): any API call
+     * answering 401 means the session is gone (expired, revoked, or restarted
+     * into a fresh database) — the cookie is worthless. Route to the login
+     * screen immediately instead of leaving the user on a stale screen with
+     * inline errors. Cancels every active poll first (a polling loop would
+     * otherwise keep firing 401s and, worse, keep the on-activity sliding
+     * renewal alive for a session that no longer exists).
      *
-     * Session-timeout feedback (spec: session-management): when the 401
-     * carried `reason: session_expired`, the reason is LATCHED here —
-     * concurrent polling 401s may be processed before/after the
-     * reason-carrying one, and the login gate must render the panel based on
-     * ANY observed reason, regardless of which response triggered the
-     * routing. The latch is one-shot (consumed by the login screen's panel;
-     * cleared on dismissal, on a successful re-login, and on logout).
+     * Latch rule (D5): only a 401 arriving while the client still believes it
+     * is in-session latches the timeout panel. A deliberate logout clears
+     * [isAuthenticated] before routing, and a fresh visit never had it — so
+     * neither shows the panel. The TTL is the in-memory value, restored from
+     * the persisted `bankteller_session_ttl_minutes` store when null (the
+     * cross-tab/cold-boot case). If the TTL is totally unknown the latch stays
+     * unset (the plain server 401 still routes, just without a timed copy).
      */
-    fun handleSessionExpired(reason: String? = null, ttlMinutes: Long? = null) {
+    fun handleSessionExpired() {
         waitPollJob?.cancel()
         waitPollJob = null
         registrationProgressPollJob?.cancel()
@@ -645,18 +667,14 @@ class AppViewModel(
         stopLinkingSessionPoll()
         stopAccountsPoll()
         stopCooldownTimer()
+        cancelSessionLivenessTimer()
         importInProgress = false
         importFailed = false
-        if (reason == "session_expired") {
-            sessionExpiredTtlMinutes = ttlMinutes
-            // Persist the latch (spec: session-management — session-timeout
-            // feedback, cross-reload semantics): the login screen may render
-            // in a DIFFERENT page instance than the one that observed the
-            // 401 (the auth callback's full-page redirect; a background tab
-            // that consumed the server-side one-shot reason). localStorage
-            // carries the reason across reloads and tabs.
-            if (ttlMinutes != null) {
-                localStorageSet(SESSION_EXPIRED_MARKER_KEY, ttlMinutes.toString())
+        if (isAuthenticated) {
+            val ttl = sessionTtlMinutes ?: localStorageGet(TTL_KEY)?.toLongOrNull()
+            if (ttl != null) {
+                sessionTtlMinutes = ttl
+                latchSessionExpiry(ttl)
             }
         }
         isAuthenticated = false
@@ -668,21 +686,179 @@ class AppViewModel(
     }
 
     /**
-     * The latched session-expiry reason's TTL (spec: session-management —
+     * The latched session-expiry TTL (spec: session-management —
      * session-timeout feedback): non-null while the login screen should render
      * the one-shot informational panel naming the effective inactivity
-     * window. Persisted to localStorage (cross-reload/cross-tab — the latch
-     * may be set by a page instance that dies before the login screen
-     * renders). Cleared by [dismissSessionExpiredPanel], on a successful
-     * re-login, and on logout.
+     * window. Persisted to localStorage under the existing latch key
+     * (cross-reload/cross-tab — the latch may be set by a page instance that
+     * dies before the login screen renders). Cleared by
+     * [dismissSessionExpiredPanel], on a successful re-login, and on logout.
      */
     var sessionExpiredTtlMinutes by mutableStateOf<Long?>(null)
         private set
+
+    /**
+     * The latest effective `SESSION_TTL_MINUTES` (D2), provisioned by a login
+     * success or `/api/me` payload and persisted under [TTL_KEY]. Initialized
+     * from the store so a fresh page instance knows the effective window
+     * before the next login/checkAuth. Null means unknown (pre-change server /
+     * cleared storage) — the watchdog never judges without it.
+     */
+    var sessionTtlMinutes by mutableStateOf<Long?>(localStorageGet(TTL_KEY)?.toLongOrNull())
+        private set
+
+    /** In-flight guard so concurrent watchdog triggers issue at most one probe (D4). */
+    private var sessionLivenessCheckInFlight = false
+
+    /**
+     * TEST CIRCUIT BREAKER (review finding, 5.2): remaining timer-arming
+     * budget, or null for the production default (UNLIMITED — the watchdog
+     * reschedules itself as long as the session lives, correct in
+     * production, infinite under a virtual test scheduler). Tests assign a
+     * small number so self-rescheduling chains terminate and
+     * `advanceUntilIdle` returns. Each [armSessionLivenessTimer] call
+     * consumes one unit — consumed even when a prior job is cancelled
+     * (non-refunding): a test that fires many focus/boot/retry triggers
+     * before its intended window must budget accordingly.
+     */
+    internal var sessionLivenessEvaluationBudget: Int? = null
+
+    /** The delay-loop timer job (D4 trigger #1); null when disarmed. */
+    private var sessionLivenessTimerJob: Job? = null
 
     /** One-shot dismissal of the session-expiry panel (spec: session-management). */
     fun dismissSessionExpiredPanel() {
         sessionExpiredTtlMinutes = null
         localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
+        // Dismissal also clears the persisted activity clock (task 4.3) so a
+        // reload cannot re-latch the panel through the boot branch.
+        localStorageRemove(LAST_ACTIVITY_KEY)
+    }
+
+    /** Persists the one-shot expiry latch (memory + localStorage) for [ttl]. */
+    private fun latchSessionExpiry(ttlMinutes: Long) {
+        sessionExpiredTtlMinutes = ttlMinutes
+        localStorageSet(SESSION_EXPIRED_MARKER_KEY, ttlMinutes.toString())
+    }
+
+    private fun cancelSessionLivenessTimer() {
+        sessionLivenessTimerJob?.cancel()
+        sessionLivenessTimerJob = null
+    }
+
+    /**
+     * Arms the watchdog's delay-loop timer (D4 trigger #1) for the remaining
+     * TTL window. Does nothing when the TTL or the activity clock is unknown
+     * (a fresh visit never evaluates). Arming is idempotent: the remaining
+     * window is recomputed from the current clock, so a re-arm with an
+     * unchanged clock just reschedules the same (positive) delay.
+     */
+    private fun armSessionLivenessTimer(overrideDelayMs: Long? = null) {
+        val ttl = sessionTtlMinutes ?: return
+        val lastActivity = localStorageGet(LAST_ACTIVITY_KEY)?.toLongOrNull() ?: return
+        cancelSessionLivenessTimer()
+        // TEST CIRCUIT BREAKER (review finding, 5.2): the production watchdog
+        // reschedules itself indefinitely (correct — it must watch as long
+        // as the tab is open), which makes `advanceUntilIdle`-style virtual
+        // schedulers chase the chain forever and hang the suite. Tests set a
+        // low `sessionLivenessEvaluationBudget`; each evaluation decrements
+        // it and arming stops at zero. Production leaves the default
+        // (unlimited) — no behavior change.
+        val budget = sessionLivenessEvaluationBudget
+        if (budget != null) {
+            if (budget <= 0) return
+            sessionLivenessEvaluationBudget = budget - 1
+        }
+        val remaining = (lastActivity + ttl * 60_000L) - now()
+        sessionLivenessTimerJob = viewModelScope.launch {
+            if (overrideDelayMs != null) {
+                delay(overrideDelayMs)
+            } else if (remaining > 0) {
+                delay(remaining)
+            }
+            sessionLivenessTimerJob = null
+            evaluateSessionLiveness()
+        }
+    }
+
+    /**
+     * True when [lastActivityMillis] + [ttlMinutes] is due. Boundary-INCLUSIVE
+     * (`>=`): a timer that wakes exactly at the expiry boundary must PROBE,
+     * not treat the session as live — with a strict `>` plus the old
+     * clock-unchanged re-arm guard, a boundary-exact wake (or a client clock
+     * a few ms behind) evaluated "not expired" and the guard then KILLED the
+     * timer permanently, leaving the tab silently timer-less until a manual
+     * focus — the manual-verification 6.3 finding.
+     */
+    private fun isSessionExpired(lastActivityMillis: Long, ttlMinutes: Long): Boolean {
+        if (ttlMinutes <= 0) return false
+        return now() - lastActivityMillis >= ttlMinutes * 60_000L
+    }
+
+    /**
+     * The ONE watchdog evaluation path (D4), shared by all three triggers (the
+     * delay-loop timer, the window-focus listener, and — structurally — the
+     * boot branch in [checkAuth]). If the persisted activity clock is stale
+     * vs. the known TTL, probe `/api/me` once (in-flight guarded):
+     *  - 200 → refresh the clock + TTL and stay (clock-skew self-heal);
+     *  - 401 → latch + route to Login (via [handleSessionExpired]);
+     *  - transient failure → NOT a verdict: stay put, retry on the next trigger.
+     * A live clock is never probed.
+     */
+    internal suspend fun evaluateSessionLiveness() {
+        if (sessionLivenessCheckInFlight) return
+        if (!isAuthenticated) return
+        val ttl = sessionTtlMinutes ?: localStorageGet(TTL_KEY)?.toLongOrNull() ?: return
+        sessionTtlMinutes = ttl
+        val lastActivity = localStorageGet(LAST_ACTIVITY_KEY)?.toLongOrNull() ?: return
+        if (!isSessionExpired(lastActivity, ttl)) {
+            // Not expired — no probe at all. Re-arm unconditionally: the fired
+            // timer's own job died with the fire, so NOT re-arming here leaves
+            // the tab silently timer-less (the manual-verification 6.3
+            // finding — a boundary-exact wake plus the old clock-unchanged
+            // guard killed the timer permanently). Loop safety comes from the
+            // [delay] in the re-armed job itself, not from skipping the call.
+            armSessionLivenessTimer()
+            return
+        }
+        sessionLivenessCheckInFlight = true
+        try {
+            when (val verdict = apiClient.probeSession()) {
+                is SessionProbeResult.Alive -> {
+                    val at = now()
+                    localStorageSet(LAST_ACTIVITY_KEY, at.toString())
+                    verdict.ttlMinutes?.let {
+                        sessionTtlMinutes = it
+                        localStorageSet(TTL_KEY, it.toString())
+                    }
+                    // Re-arm for the full remaining window of the REFRESHED
+                    // clock (review note 3: a fixed 90s wake on the healthy
+                    // path obscured intent — arming recomputes the window).
+                    armSessionLivenessTimer()
+                }
+                SessionProbeResult.Expired -> {
+                    // Idempotent: the probe's own 401 also fires the backstop
+                    // hook on the real client; both latch the same known TTL
+                    // and route, and only the first one sees isAuthenticated.
+                    handleSessionExpired()
+                }
+                SessionProbeResult.Unknown -> {
+                    // NOT a verdict — stay put. But the tab still believes it
+                    // is in-session with a stale clock, so the next trigger
+                    // must ACTUALLY COME: schedule a short bounded retry delay
+                    // (the fired timer's job already died). Routed through the
+                    // budgeted arm (NOT a raw launch — a raw delay chain would
+                    // bypass the test circuit breaker and loop forever under
+                    // a virtual scheduler). A visible tab gets no focus event
+                    // and no API activity to refresh the clock — without this
+                    // retry the "retry on the next trigger" contract has no
+                    // trigger (the silent-disarm class).
+                    armSessionLivenessTimer(overrideDelayMs = SESSION_LIVENESS_RETRY_DELAY_MS)
+                }
+            }
+        } finally {
+            sessionLivenessCheckInFlight = false
+        }
     }
 
     /**
@@ -708,9 +884,48 @@ class AppViewModel(
                 is AuthState.Authenticated -> {
                     isAuthenticated = true
                     username = state.username
+                    // TTL provisioning (D2): capture the payload value and
+                    // persist it; an old server payload (null) keeps any
+                    // previously persisted value.
+                    state.ttlMinutes?.let {
+                        sessionTtlMinutes = it
+                        localStorageSet(TTL_KEY, it.toString())
+                    }
+                    // An authenticated boot with no activity clock yet (e.g.
+                    // the first load after upgrading the client) starts a
+                    // fresh window; a fresh UNauthenticated visit is untouched
+                    // (it must never latch — see the boot branch below).
+                    if (localStorageGet(LAST_ACTIVITY_KEY) == null) {
+                        localStorageSet(LAST_ACTIVITY_KEY, now().toString())
+                    }
                     checkOnboardingStatus()
+                    armSessionLivenessTimer()
                 }
                 is AuthState.Unauthenticated -> {
+                    // Boot-time liveness evaluation (D4 trigger #3, amended
+                    // per manual-verification 6.6(b)): the cold-boot/
+                    // overnight case where no live page instance existed to
+                    // sense the expiry. The SERVER's unauthenticated verdict
+                    // is authoritative — but it cannot distinguish a
+                    // returning expired user from a fresh visitor, so the
+                    // client contributes the ONLY discriminator it honestly
+                    // has: a PERSISTED ACTIVITY CLOCK's PRESENCE. The clock
+                    // is written exclusively by authenticated responses and
+                    // cleared on logout/panel dismissal — present means "a
+                    // session existed here and did not end deliberately",
+                    // so the boot's 401 IS the timeout verdict (regardless
+                    // of how fresh the client clock looks: client clock skew
+                    // — e.g. a time sync to the past, or a TTL shortened
+                    // server-side mid-session — must never mask the server's
+                    // verdict, and must never cause a fixed "just expired" /
+                    // just-past-TTL reading either: TTL known → the provisioned
+                    // value; TTL unknown → untimed copy, still correct on
+                    // presence). Absent clock = fresh visit → plain login.
+                    val bootTtl = sessionTtlMinutes ?: localStorageGet(TTL_KEY)?.toLongOrNull()
+                    val bootLastActivity = localStorageGet(LAST_ACTIVITY_KEY)
+                    if (bootLastActivity != null) {
+                        latchSessionExpiry(bootTtl ?: UNTIMED_SESSION_EXPIRY_TTL_MINUTES)
+                    }
                     isAuthenticated = false
                     username = ""
                     currentScreen = Screen.Login
@@ -746,11 +961,17 @@ class AppViewModel(
                     // consumes the latched expiry reason (memory + persisted).
                     sessionExpiredTtlMinutes = null
                     localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
+                    // TTL provisioning (D2): the login success already wrote
+                    // the effective TTL + reset the activity clock to storage
+                    // (ApiClient.login is self-contained on storage). Capture
+                    // the store value so the watchdog knows the window.
+                    localStorageGet(TTL_KEY)?.toLongOrNull()?.let { sessionTtlMinutes = it }
                     // Suspend call: runs the onboarding gate (further network
                     // requests) and routes to the destination screen. isLoading
                     // stays true through this so the login button remains
                     // disabled until the redirect actually happens (D6).
                     checkOnboardingStatus()
+                    armSessionLivenessTimer()
                 }
                 LoginResult.RateLimited -> {
                     isRateLimited = true
@@ -777,15 +998,23 @@ class AppViewModel(
         stopLinkingSessionPoll()
         stopAccountsPoll()
         stopCooldownTimer()
+        cancelSessionLivenessTimer()
         importInProgress = false
         importFailed = false
         // Deliberate logout shows no panel (spec: session-management —
         // session-timeout feedback: logout is expected, timeout is not).
         sessionExpiredTtlMinutes = null
         localStorageRemove(SESSION_EXPIRED_MARKER_KEY)
+        // Clear the persisted activity clock too (D5 / task 4.3): a reload
+        // after a deliberate logout must not re-latch the panel through the
+        // boot branch.
+        localStorageRemove(LAST_ACTIVITY_KEY)
+        // Clear the in-session belief FIRST (D5): if the logout request itself
+        // answers a plain 401, the backstop must not mistake the deliberate
+        // logout for a surprising session loss and latch the panel.
+        isAuthenticated = false
         viewModelScope.launch {
             apiClient.logout()
-            isAuthenticated = false
             username = ""
             currentScreen = Screen.Login
             loginError = null
@@ -2742,6 +2971,7 @@ class AppViewModel(
         stopLinkingSessionPoll()
         stopAccountsPoll()
         stopCooldownTimer()
+        cancelSessionLivenessTimer()
         viewModelScope.cancel()
     }
 
@@ -2758,12 +2988,46 @@ class AppViewModel(
          * localStorage key persisting the latched session-expiry TTL
          * across reloads/tabs (spec: session-management — session-timeout
          * feedback): the latch may be set by a page instance that dies
-         * before the login screen renders (the auth callback's full-page
-         * redirect; a background tab consuming the server-side one-shot
-         * reason). Cleared with the one-shot semantics (dismissal /
-         * re-login / logout).
+         * before the login screen renders. Cleared with the one-shot semantics
+         * (dismissal / re-login / logout). Kept unchanged (old cached pages
+         * may still write the same key; the boot restore still honors it).
          */
         const val SESSION_EXPIRED_MARKER_KEY = "bankteller_session_expired_ttl"
+
+        /**
+         * localStorage key for the shared client-side activity clock
+         * (client-side/watchdog D3): `lastActivity` as a Unix-millis string,
+         * written on every successful authenticated response and reset by a
+         * successful login. Cleared by dismissal and logout so a reload cannot
+         * re-latch the panel.
+         */
+        const val LAST_ACTIVITY_KEY = SESSION_LAST_ACTIVITY_KEY
+
+        /**
+         * localStorage key persisting the latest provisioned effective
+         * `SESSION_TTL_MINUTES` (client-side/watchdog D2), re-read on every
+         * latch evaluation.
+         */
+        const val TTL_KEY = SESSION_TTL_MINUTES_KEY
+
+        /**
+         * Latch TTL for a boot-branch expiry when the client's TTL store is
+         * empty (pre-change server, cleared storage): the panel still
+         * renders (the verdict is presence-based, not TTL-based), with a
+         * plain one-shot-timeout copy that names no window. Never shown when
+         * any TTL value is known — the known value always wins.
+         */
+        const val UNTIMED_SESSION_EXPIRY_TTL_MINUTES = -1L
+
+        /**
+         * Retry delay after an INCONCLUSIVE probe verdict (network error /
+         * timeout): the watchdog stays put but the tab still believes its
+         * clock is stale, so a fresh evaluation must be scheduled (the fired
+         * timer's job is gone; a visible tab sees no focus event). Scaled to
+         * 10% of a 15-minute window — frequent enough to recover promptly,
+         * bounded so a dead network cannot self-DOS.
+         */
+        const val SESSION_LIVENESS_RETRY_DELAY_MS = 90_000L
     }
 }
 

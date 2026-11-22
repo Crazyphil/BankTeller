@@ -33,7 +33,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
@@ -50,17 +49,38 @@ import javax.imageio.ImageIO
 private val logoCache = ConcurrentHashMap<String, ByteArray>()
 
 /**
- * 401 response body of the SessionAuth middleware (spec: session-management —
- * session-timeout feedback). [reason]/[ttlMinutes] are present only when the
- * failed resolution classified as an expired session record (one-shot — the
- * classification prunes the record). Explicit DTO: a Map<String, Any> mixing
- * String and Long values crashes kotlinx's element-type guesser.
+ * 401 response body of the SessionAuth middleware. A failed session resolution
+ * is a plain unauthenticated response — timeout feedback is the SPA's
+ * client-side concern (spec: session-management), so there is no reason/TTL
+ * channel on the wire. Explicit DTO: a Map<String, Any> mixing String and Long
+ * values crashes kotlinx's element-type guesser.
  */
 @Serializable
 private data class UnauthorizedBody(
     val error: String,
-    val reason: String? = null,
-    @SerialName("ttl_minutes") val ttlMinutes: Long? = null,
+)
+
+/**
+ * `/api/login` success body. Carries the effective SESSION_TTL_MINUTES
+ * (`ttlMinutes`, design D2) so the SPA can run its timeout watchdog. An
+ * explicit DTO keeps the payload homogeneous (see [UnauthorizedBody] — same
+ * reason: never mix value types in one map).
+ */
+@Serializable
+private data class LoginSuccessBody(
+    val message: String,
+    val ttlMinutes: Long,
+)
+
+/**
+ * `/api/me` authenticated body. Carries the effective SESSION_TTL_MINUTES
+ * (`ttlMinutes`, design D2) — the boot/probe session check is the second
+ * moment the client learns the TTL.
+ */
+@Serializable
+private data class MeBody(
+    val username: String,
+    val ttlMinutes: Long,
 )
 
 /** HttpClient used to fetch remote bank logos (CIO engine, same as EB clients). */
@@ -202,55 +222,27 @@ fun Application.module(
             // Lax, not Strict (manual-verification 8.4 finding, the task's
             // documented fallback): Firefox drops the Strict cookie on the
             // bank → callback cross-site navigation AND on the same-origin
-            // follow-up navigation after a cross-site redirect chain, so the
-            // session-timeout classification can never see the expired ID on
-            // the document routes — the panel never latches in the bank-return
-            // flow. Lax attaches the cookie on top-level GET navigations (the
-            // callback) while still blocking cross-site POSTs (the CSRF
-            // property that matters); the session-independent callback design
-            // means the cookie policy no longer gates the callback itself.
+            // follow-up navigation after a cross-site redirect chain. Lax
+            // attaches the cookie on top-level GET navigations (the callback)
+            // while still blocking cross-site POSTs (the CSRF property that
+            // matters); the session-independent callback design means the
+            // cookie policy no longer gates the callback itself.
             cookie.sameSite = SameSite.Lax
             cookie.secure = cookieSecure
             cookie.path = "/"
         }
     }
 
-    // Session validation middleware — protects /api/* routes (except login/logout)
+    // Session validation middleware — protects /api/* routes (except login/logout).
+    // A failed resolution is a plain 401: timeout feedback is the SPA's
+    // client-side concern (spec: session-management — the client owns timeout
+    // detection), so there is no reason/TTL channel here.
     install(createApplicationPlugin("SessionAuth") {
         onCall { call ->
             val path = call.request.uri
             if (path.startsWith("/api/") && path != "/api/login" && path != "/api/logout") {
                 val session = call.sessions.get<UserSession>()
                 if (session == null) {
-                    // Session-timeout feedback (spec: session-management): a
-                    // failed resolution is classified — an EXPIRED record (row
-                    // present, expires_at past) is pruned by the classification
-                    // and the 401 carries the machine-readable reason plus the
-                    // effective TTL so the SPA can explain the redirect; an
-                    // unknown/absent ID stays a plain unauthenticated. The
-                    // classification prune makes the reason one-shot.
-                    val cookieId = call.request.cookies["bankteller-session"]
-                    val sessionExpired = cookieId != null && sessionStorage.classifyExpired(cookieId)
-                    if (sessionExpired) {
-                        // The reason rides BOTH the JSON body and response
-                        // headers: the SPA's client interceptor reads the
-                        // header (no body consumption inside its pipeline
-                        // phase), any other API consumer reads the body.
-                        // Explicit @Serializable DTO — a Map<String, Any> mixing
-                        // String and Long values cannot be serialized by
-                        // kotlinx's element-type guesser (500s in production).
-                        call.response.headers.append("X-Session-Reason", "session_expired")
-                        call.response.headers.append("X-Session-Ttl-Minutes", sessionStorage.sessionTtlMinutes.toString())
-                        call.respond(
-                            HttpStatusCode.Unauthorized,
-                            UnauthorizedBody(
-                                error = "Not authenticated",
-                                reason = "session_expired",
-                                ttlMinutes = sessionStorage.sessionTtlMinutes,
-                            ),
-                        )
-                        return@onCall
-                    }
                     call.respond(HttpStatusCode.Unauthorized, UnauthorizedBody(error = "Not authenticated"))
                     return@onCall
                 }
@@ -261,7 +253,7 @@ fun Application.module(
     // Configure routes
     routing {
         // Onboarding routes (registered first so they are matched before the catch-all)
-        onboardingRoutes(database, onboardingService, cpClient, ebClientFactory, flowRecordStore, sessionStorage)
+        onboardingRoutes(database, onboardingService, cpClient, ebClientFactory, flowRecordStore)
         accountLinkingRoutes(database, cpClient, ebClientFactory, flowRecordStore, onboardingService)
         syncRoutes(syncEngine)
         connectionsRoutes(database, ebClientFactory)
@@ -324,7 +316,10 @@ fun Application.module(
                     ),
                     "login",
                 )
-                call.respond(HttpStatusCode.OK, mapOf("message" to "Login successful"))
+                call.respond(
+                    HttpStatusCode.OK,
+                    LoginSuccessBody(message = "Login successful", ttlMinutes = sessionStorage.sessionTtlMinutes),
+                )
             } else {
                 LoginRateLimiter.recordFailedAttempt(ip)
                 call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Invalid credentials"))
@@ -339,7 +334,7 @@ fun Application.module(
         get("/api/me") {
             val session = call.sessions.get<UserSession>()
             if (session != null) {
-                call.respond(mapOf("username" to session.username))
+                call.respond(MeBody(username = session.username, ttlMinutes = sessionStorage.sessionTtlMinutes))
             } else {
                 call.respond(HttpStatusCode.Unauthorized, mapOf("error" to "Not authenticated"))
             }
@@ -391,57 +386,19 @@ fun Application.module(
             }
         }
 
-        // Root — serve SPA entry point
         // Root — serve SPA entry point.
-        //
-        // Session-timeout feedback (spec: session-management): a page route
-        // with an EXPIRED session record must route to login and carry the
-        // reason. The Sessions plugin clears the cookie on this very response
-        // when its load fails on the expired record (BeforeSend), so the SPA's
-        // subsequent /api/me arrives WITHOUT a cookie — the API-side
-        // classification can never see the expired ID. The classification
-        // therefore runs HERE, on the page route, BEFORE the plugin's
-        // cookie-clearing response is built: an expired record is pruned by
-        // the classification and the SPA is served with the expiry flag in
-        // the fragment so the boot's login gate latches the panel (the
-        // fragment never reaches the server, keeping the handoff
-        // client-side).
         get("/") {
-            val cookieId = call.request.cookies["bankteller-session"]
-            val sessionExpired = cookieId != null && sessionStorage.classifyExpired(cookieId)
             val indexHtml = call.application.environment.classLoader
                 .getResourceAsStream("static/index.html")?.bufferedReader()?.readText()
             if (indexHtml != null) {
-                if (sessionExpired) {
-                    // no-store ONLY on the latch-carrying variant: the document
-                    // is per-response state (the expiry latch script) and must
-                    // never be served from cache. The plain variant stays
-                    // cacheable (production users keep normal SPA caching —
-                    // the manual-verification cache restriction was scoped to
-                    // the panel-latch variant only, per the wrap-up ruling).
-                    call.response.cacheControl(CacheControl.NoStore(visibility = CacheControl.Visibility.Public))
-                    call.respondText(
-                        indexHtml.replace(
-                            "</head>",
-                            "<script>try{window.localStorage.setItem('bankteller_session_expired_ttl','" +
-                                sessionStorage.sessionTtlMinutes + "')}catch(e){}</script></head>",
-                        ),
-                        ContentType.Text.Html,
-                    )
-                } else {
-                    call.respondText(indexHtml, ContentType.Text.Html)
-                }
+                call.respondText(indexHtml, ContentType.Text.Html)
             } else {
                 call.respondText("Not found", ContentType.Text.Plain, HttpStatusCode.NotFound)
             }
         }
 
         // Catch-all: try static resource first (web.js, skiko.wasm, etc.),
-        // then fall back to index.html for SPA client-side routing. The
-        // session-expiry classification runs only on the SPA-fallback branch
-        // (an expired record + a static asset request is not a user-facing
-        // page load; the classification is one-shot and must be saved for
-        // the document the user actually sees).
+        // then fall back to index.html for SPA client-side routing.
         get("/{path...}") {
             val path = call.parameters.getAll("path")?.joinToString("/") ?: ""
             val resource = call.application.environment.classLoader.getResourceAsStream("static/$path")
@@ -451,26 +408,10 @@ fun Application.module(
                     resource.copyTo(this)
                 }
             } else {
-                val cookieId = call.request.cookies["bankteller-session"]
-                val sessionExpired = cookieId != null && sessionStorage.classifyExpired(cookieId)
                 val indexHtml = call.application.environment.classLoader
                     .getResourceAsStream("static/index.html")?.bufferedReader()?.readText()
                 if (indexHtml != null) {
-                    if (sessionExpired) {
-                        // no-store ONLY on the latch-carrying variant (see the
-                        // root route's note); the plain variant stays cacheable.
-                        call.response.cacheControl(CacheControl.NoStore(visibility = CacheControl.Visibility.Public))
-                        call.respondText(
-                            indexHtml.replace(
-                                "</head>",
-                                "<script>try{window.localStorage.setItem('bankteller_session_expired_ttl','" +
-                                    sessionStorage.sessionTtlMinutes + "')}catch(e){}</script></head>",
-                            ),
-                            ContentType.Text.Html,
-                        )
-                    } else {
-                        call.respondText(indexHtml, ContentType.Text.Html)
-                    }
+                    call.respondText(indexHtml, ContentType.Text.Html)
                 } else {
                     call.respondText("Not found", ContentType.Text.Plain, HttpStatusCode.NotFound)
                 }

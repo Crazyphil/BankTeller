@@ -15,7 +15,6 @@ import it.kapfer.bankteller.server.FlowRecordStore
 import it.kapfer.bankteller.server.FlowKind
 import it.kapfer.bankteller.server.FlowStatus
 import it.kapfer.bankteller.server.MissingAccountSignalStore
-import it.kapfer.bankteller.server.SqlDelightSessionStorage
 import it.kapfer.bankteller.server.UserSession
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.buildJsonObject
@@ -64,7 +63,6 @@ fun Route.onboardingRoutes(
     controlPlaneClient: EnableBankingControlPlaneClient, // retained for future use
     enableBankingClientFactory: (() -> EnableBankingClient)? = null,
     flowRecordStore: FlowRecordStore? = null,
-    sessionStorage: SqlDelightSessionStorage? = null,
 ) {
     val ebSessionStore = EbSessionStore(database)
     // -----------------------------------------------------------------------
@@ -97,7 +95,7 @@ fun Route.onboardingRoutes(
             oobCode != null -> {
                 logger.info("EB callback: email-link branch (oobCode present, state={})", state)
                 service.handleCallback(state, oobCode) // captures oobCode as side-effect
-                serveSpaBundle(call, sessionStorage)
+                serveSpaBundle(call)
             }
 
             // Auth flow — session-independent (design D4): the flow record
@@ -109,7 +107,7 @@ fun Route.onboardingRoutes(
                 val record = state?.let { flowRecordStore?.lookup(it) }
                 if (flowRecordStore == null || record == null || record.kind != FlowKind.BANK_AUTH) {
                     logger.warn("EB callback: auth branch with unknown/expired state token — code discarded")
-                    serveSpaBundle(call, sessionStorage)
+                    serveSpaBundle(call)
                     return@get
                 }
                 val staged = runCatching {
@@ -133,7 +131,7 @@ fun Route.onboardingRoutes(
                 if (client == null) {
                     logger.warn("EB callback: no Enable Banking client factory configured")
                     fail("Technical error", "unexpected")
-                    serveSpaBundle(call, sessionStorage)
+                    serveSpaBundle(call)
                     return@get
                 }
                 try {
@@ -227,7 +225,7 @@ fun Route.onboardingRoutes(
                 } finally {
                     client.close()
                 }
-                serveSpaBundle(call, sessionStorage)
+                serveSpaBundle(call)
             }
 
             // Error branch — OAuth error redirect (RFC 6749): `error` (+ optional
@@ -241,7 +239,7 @@ fun Route.onboardingRoutes(
                 if (flowRecordStore == null || record == null || record.kind != FlowKind.BANK_AUTH) {
                     // Unknown/expired token — nothing to record against; serve
                     // the SPA (its login gate routes the user).
-                    serveSpaBundle(call, sessionStorage)
+                    serveSpaBundle(call)
                     return@get
                 }
                 val staged = runCatching {
@@ -265,7 +263,7 @@ fun Route.onboardingRoutes(
                         ),
                     ),
                 )
-                serveSpaBundle(call, sessionStorage)
+                serveSpaBundle(call)
             }
 
             // Neither param — preserve the previous missing-oobCode behavior
@@ -275,7 +273,7 @@ fun Route.onboardingRoutes(
                     state, call.request.queryParameters.names(),
                 )
                 service.handleCallback(state, null)
-                serveSpaBundle(call, sessionStorage)
+                serveSpaBundle(call)
             }
         }
     }
@@ -536,42 +534,14 @@ private fun classifyAuthError(error: String): String = when (error) {
 /**
  * Serves the SPA bundle (`static/index.html` from the classpath) with 200 OK.
  * Mirrors the foundation's catch-all SPA-bundle handler in `Application.kt`.
- *
- * Session-timeout feedback (spec: session-management): this response is served
- * on a full-page navigation (the bank's redirect back to the callback), so the
- * Sessions plugin's cookie-clear on a failed load lands HERE — the browser
- * deletes the cookie before the SPA boots, and the API-side classification
- * can never see the expired ID. The classification therefore runs inside this
- * handler: an expired record is pruned and the served `index.html` carries an
- * inline script setting the SPA's expiry latch (localStorage — restored by
- * the boot's login gate; one-shot semantics owned by the SPA).
+ * The document is plain and cacheable for every session state — timeout
+ * feedback is client-owned (spec: session-management).
  */
-private suspend fun serveSpaBundle(
-    call: ApplicationCall,
-    sessionStorage: SqlDelightSessionStorage? = null,
-) {
-    val sessionExpired = sessionStorage != null &&
-        call.request.cookies["bankteller-session"]?.let { sessionStorage.classifyExpired(it) } == true
+private suspend fun serveSpaBundle(call: ApplicationCall) {
     val indexHtml = call.application.environment.classLoader
         .getResourceAsStream("static/index.html")?.bufferedReader()?.readText()
     if (indexHtml != null) {
-        if (sessionExpired) {
-            // no-store ONLY on the latch-carrying variant (see Application.kt's
-            // root route note): per-response latch state must never come from
-            // cache; the plain variant stays cacheable for production.
-            call.response.cacheControl(CacheControl.NoStore(visibility = CacheControl.Visibility.Public))
-            call.respondText(
-                indexHtml.replace(
-                    "</head>",
-                    "<script>try{window.localStorage.setItem('bankteller_session_expired_ttl','" +
-                        sessionStorage!!.sessionTtlMinutes + "')}catch(e){}</script></head>",
-                ),
-                ContentType.Text.Html,
-                HttpStatusCode.OK,
-            )
-        } else {
-            call.respondText(indexHtml, ContentType.Text.Html, HttpStatusCode.OK)
-        }
+        call.respondText(indexHtml, ContentType.Text.Html, HttpStatusCode.OK)
     } else {
         call.respondText("Not found", ContentType.Text.Plain, HttpStatusCode.NotFound)
     }
