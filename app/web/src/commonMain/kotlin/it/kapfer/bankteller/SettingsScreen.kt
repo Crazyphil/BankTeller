@@ -57,7 +57,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,6 +80,12 @@ import it.kapfer.bankteller.ui.components.QuietActionButton
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggle
 import it.kapfer.bankteller.ui.components.WaitingIndicator
+import it.kapfer.bankteller.ui.components.semantics.StatusText
+import it.kapfer.bankteller.ui.components.semantics.backAffordanceSemantics
+import it.kapfer.bankteller.ui.components.semantics.collectionInfo
+import it.kapfer.bankteller.ui.components.semantics.navRowSemantics
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
+import it.kapfer.bankteller.ui.components.semantics.semanticIconAction
 import it.kapfer.bankteller.ui.components.appTabBarEntries
 import it.kapfer.bankteller.ui.components.dashboardTab
 import it.kapfer.bankteller.ui.components.settingsTab
@@ -225,9 +230,11 @@ fun SettingsScreen(viewModel: AppViewModel) {
         viewportWidthDpFrom(viewportWidthPx(), devicePixelRatio()),
     )
 
-    // Section selection survives breakpoint flips (D4) and tab switches.
-    var selectedSectionId by rememberSaveable { mutableStateOf<String?>(null) }
-    val selectedSection = settingsSections.firstOrNull { it.id == selectedSectionId }
+    // Section selection survives breakpoint flips (D4) and tab switches —
+    // held in the view model: a navigation-local `rememberSaveable` died with
+    // the disposed Settings branch on tab switches (the 5.3 close-out finding);
+    // view-model state survives the branch round-trip by construction.
+    val selectedSection = settingsSections.firstOrNull { it.id == viewModel.settingsSelectedSectionId }
 
     // The ACTIVE panel's scroll state (D4): the section's detail panel
     // attaches its primary scrollable to this state, and the shell's
@@ -297,7 +304,7 @@ fun SettingsScreen(viewModel: AppViewModel) {
                     viewModel,
                     activeSection = active,
                     panelScrollState = activePanelScrollState,
-                    onSectionSelected = { selectedSectionId = it.id },
+                    onSectionSelected = { viewModel.settingsSelectedSectionId = it.id },
                 )
             }
             SettingsLayoutMode.Compact -> {
@@ -305,14 +312,14 @@ fun SettingsScreen(viewModel: AppViewModel) {
                 if (active == null) {
                     SettingsSectionList(
                         panelScrollState = activePanelScrollState,
-                        onSectionSelected = { selectedSectionId = it.id },
+                        onSectionSelected = { viewModel.settingsSelectedSectionId = it.id },
                     )
                 } else {
                     SettingsPanel(
                         viewModel,
                         section = active,
                         panelScrollState = activePanelScrollState,
-                        onBack = { selectedSectionId = null },
+                        onBack = { viewModel.settingsSelectedSectionId = null },
                     )
                 }
             }
@@ -431,6 +438,7 @@ private fun SettingsSectionList(
                 Text(
                     text = "Settings",
                     style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.screenHeading,
                 )
                 Spacer(modifier = Modifier.height(Dimens.md))
                 settingsSections.forEach { section ->
@@ -456,6 +464,9 @@ private fun SettingsSectionList(
                             onSectionSelected(section)
                         }
                         .denseWash(interactionSource, scale = WashScale.Row)
+                        // Compact drill row: navigation destination whose own
+                        // text supplies the name (WCAG 4.1.2).
+                        .navRowSemantics()
                         .padding(vertical = Dimens.md),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -529,6 +540,9 @@ private fun SettingsPanel(
                         indication = null,
                     ) { onBack() }
                     .denseWash(interactionSource)
+                    // Compact back affordance: name says where it goes, beyond
+                    // the visible "Settings" label (WCAG 4.1.2).
+                    .backAffordanceSemantics("Back to Settings sections")
                     .padding(horizontal = 8.dp, vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -625,6 +639,9 @@ private fun SectionNavColumn(
                         onSectionSelected(section)
                     }
                     .denseWash(interactionSource, scale = WashScale.Row)
+                    // Expanded nav row: button role + current selection
+                    // (WCAG 4.1.2).
+                    .navRowSemantics(selected)
                     .padding(vertical = Dimens.sm, horizontal = Dimens.xs),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -714,6 +731,7 @@ private fun BankConnectionsSection(
             Text(
                 text = "Bank connections",
                 style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.screenHeading,
             )
             // "+ Connect bank" (D5/5.4): the canonical label per the
             // spec/design naming — the "+" prefix distinguishes the
@@ -755,7 +773,7 @@ private fun BankConnectionsSection(
                         tint = brassText,
                         modifier = Modifier.size(18.dp),
                     )
-                    Text(
+                    StatusText(
                         text = caveat,
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface,
@@ -772,7 +790,7 @@ private fun BankConnectionsSection(
                     ) {
                         Icon(
                             imageVector = Icons.Outlined.Close,
-                            contentDescription = "Dismiss",
+                            contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
                                 .size(28.dp)
@@ -780,6 +798,8 @@ private fun BankConnectionsSection(
                                     interactionSource = dismissInteraction,
                                     indication = null,
                                 ) { viewModel.clearRemoveCaveat() }
+                                // Icon-only action (WCAG 1.1.1 / 4.1.2).
+                                .semanticIconAction("Dismiss")
                                 .padding(6.dp),
                         )
                     }
@@ -789,7 +809,7 @@ private fun BankConnectionsSection(
         }
         // Honest settings-surface error line (delete failures, etc.).
         viewModel.settingsError?.let { error ->
-            Text(
+            StatusText(
                 text = error,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
@@ -813,7 +833,10 @@ private fun BankConnectionsSection(
                 )
             }
             else -> {
-                Column(verticalArrangement = Arrangement.spacedBy(Dimens.md)) {
+                Column(
+                    modifier = Modifier.collectionInfo(data.banks.size),
+                    verticalArrangement = Arrangement.spacedBy(Dimens.md),
+                ) {
                     data.banks.forEach { bank ->
                         ConnectionCard(viewModel, bank)
                     }
@@ -1191,7 +1214,10 @@ private fun ConnectionAccountList(viewModel: AppViewModel, bank: BankData) {
     val visibleCount = if (expanded) bank.accounts.size else minOf(bank.accounts.size, CONNECTION_CARD_VISIBLE_ROWS)
     val hiddenCount = bank.accounts.size - visibleCount
 
-    Column(verticalArrangement = Arrangement.spacedBy(Dimens.xs)) {
+    Column(
+        modifier = Modifier.collectionInfo(bank.accounts.size),
+        verticalArrangement = Arrangement.spacedBy(Dimens.xs),
+    ) {
         Text(
             text = "ACCOUNTS (${bank.accounts.size})",
             style = MaterialTheme.typography.labelSmall,
@@ -1818,7 +1844,10 @@ private fun InlineDangerDelete(
                 indication = null,
                 enabled = enabled && !busy,
             ) { onClick() }
-            .denseWash(interactionSource),
+            .denseWash(interactionSource)
+            // Icon-only delete action: name + button role on the clickable
+            // node (WCAG 1.1.1 / 4.1.2).
+            .semanticIconAction("Delete local copy"),
         contentAlignment = Alignment.Center,
     ) {
         if (busy) {
@@ -1826,7 +1855,7 @@ private fun InlineDangerDelete(
         } else {
             Icon(
                 imageVector = Icons.Outlined.Delete,
-                contentDescription = "Delete local copy",
+                contentDescription = null,
                 tint = if (enabled) {
                     MaterialTheme.colorScheme.error
                 } else {

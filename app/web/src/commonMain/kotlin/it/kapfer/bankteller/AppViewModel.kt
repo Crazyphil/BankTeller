@@ -1051,6 +1051,20 @@ class AppViewModel(
     }
 
     /**
+     * The Settings surface's selected section id (compact drill state).
+     * View-model state rather than `rememberSaveable`: App.kt's
+     * `when (currentScreen)` DISPOSES the Settings composition branch on
+     * a tab switch, and a navigation-local `rememberSaveable` cannot
+     * survive branch disposal — the compact drill selection silently
+     * reset on a Settings→Dashboard→Settings round-trip (the 5.3
+     * close-out's finding) despite the screen comment claiming tab-switch
+     * survival. View-model state survives the round-trip by construction
+     * (the view model outlives the branches) — matching how
+     * [currentScreen] itself travels.
+     */
+    var settingsSelectedSectionId: String? by mutableStateOf(null)
+
+    /**
      * Fetches GET /api/accounts into [accountsData]. Stale-while-revalidate
      * (design D6): a failed fetch keeps the last-known data — the dashboard
      * never blocks on a transient error. Does NOT set [isLoading] (a data
