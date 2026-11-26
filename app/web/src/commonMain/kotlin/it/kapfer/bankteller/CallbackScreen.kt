@@ -35,6 +35,7 @@ import it.kapfer.bankteller.ui.components.BrassDoubleRule
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggleOverlay
 import it.kapfer.bankteller.ui.components.WaitingIndicator
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import kotlinx.coroutines.delay
@@ -98,6 +99,7 @@ fun CallbackScreen() {
                 Text(
                     text = "BankTeller",
                     style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.screenHeading,
                 )
             }
 

@@ -55,6 +55,7 @@ import it.kapfer.bankteller.jetBrainsMonoFamily
 import it.kapfer.bankteller.openSandboxCredentialsPopup
 import it.kapfer.bankteller.openUrlInNewTab
 import it.kapfer.bankteller.ui.components.denseWash
+import it.kapfer.bankteller.ui.components.semantics.semanticIconAction
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import kotlinx.coroutines.delay
@@ -300,7 +301,7 @@ private fun CredentialRow(label: String, value: String, helper: String? = null) 
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.weight(1f),
                     )
-                    CopyFieldButton(value = value)
+                    CopyFieldButton(name = "Copy ${label.lowercase()}", value = value)
                 }
                 helper?.let {
                     Text(
@@ -337,7 +338,7 @@ private fun CredentialRow(label: String, value: String, helper: String? = null) 
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                 }
-                CopyFieldButton(value = value)
+                CopyFieldButton(name = "Copy ${label.lowercase()}", value = value)
             }
         }
     }
@@ -354,7 +355,7 @@ private fun CredentialRow(label: String, value: String, helper: String? = null) 
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CopyFieldButton(value: String) {
+private fun CopyFieldButton(name: String, value: String) {
     val emerald = LocalBankTellerColors.current.emerald
     var copied by remember(value) { mutableStateOf(false) }
 
@@ -389,7 +390,10 @@ private fun CopyFieldButton(value: String) {
                         copyToClipboard(value)
                         copied = true
                     }
-                    .denseWash(interactionSource),
+                    .denseWash(interactionSource)
+                    // Icon-only copy action: mandatory name + button role on
+                    // the clickable node (WCAG 1.1.1 / 4.1.2).
+                    .semanticIconAction(name),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(

@@ -42,6 +42,10 @@ import it.kapfer.bankteller.ui.components.BrandLogo
 import it.kapfer.bankteller.ui.components.DecisionBox
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggleOverlay
+import it.kapfer.bankteller.ui.components.semantics.StatusText
+import it.kapfer.bankteller.ui.components.semantics.fieldName
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
+import it.kapfer.bankteller.ui.components.semantics.semanticIconAction
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 
@@ -82,6 +86,7 @@ fun LoginScreen(viewModel: AppViewModel) {
             Text(
                 text = "BankTeller",
                 style = MaterialTheme.typography.headlineMedium,
+                modifier = Modifier.screenHeading,
             )
 
             Spacer(modifier = Modifier.height(Dimens.xl))
@@ -149,7 +154,7 @@ fun LoginScreen(viewModel: AppViewModel) {
                         ) {
                             Icon(
                                 imageVector = Icons.Outlined.Close,
-                                contentDescription = "Dismiss",
+                                contentDescription = null,
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier
                                     .size(28.dp)
@@ -157,6 +162,9 @@ fun LoginScreen(viewModel: AppViewModel) {
                                         interactionSource = dismissInteraction,
                                         indication = null,
                                     ) { viewModel.dismissSessionExpiredPanel() }
+                                    // Icon-only action: name + button role on
+                                    // the clickable node (WCAG 1.1.1 / 4.1.2).
+                                    .semanticIconAction("Dismiss")
                                     .padding(6.dp),
                             )
                         }
@@ -175,6 +183,7 @@ fun LoginScreen(viewModel: AppViewModel) {
                 keyboardActions = KeyboardActions(onNext = { passwordFocusRequester.requestFocus() }),
                 modifier = Modifier
                     .fillMaxWidth()
+                    .fieldName("Username")
                     .focusRequester(usernameFocusRequester),
             )
 
@@ -190,6 +199,7 @@ fun LoginScreen(viewModel: AppViewModel) {
                 keyboardActions = KeyboardActions(onDone = { viewModel.login(username, password) }),
                 modifier = Modifier
                     .fillMaxWidth()
+                    .fieldName("Password")
                     .focusRequester(passwordFocusRequester),
             )
 
@@ -208,7 +218,7 @@ fun LoginScreen(viewModel: AppViewModel) {
             // Non-rate-limited error
             viewModel.loginError?.let { error ->
                 Spacer(modifier = Modifier.height(Dimens.sm))
-                Text(
+                StatusText(
                     text = error,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
@@ -218,7 +228,7 @@ fun LoginScreen(viewModel: AppViewModel) {
             // Rate-limit message
             if (viewModel.isRateLimited) {
                 Spacer(modifier = Modifier.height(Dimens.sm))
-                Text(
+                StatusText(
                     text = "Too many login attempts. Please wait before retrying.",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,

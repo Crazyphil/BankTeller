@@ -22,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 
@@ -128,6 +129,7 @@ fun WizardScaffold(
             Text(
                 text = title,
                 style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.screenHeading,
             )
             oneLiner?.let { oneLinerText ->
                 Text(

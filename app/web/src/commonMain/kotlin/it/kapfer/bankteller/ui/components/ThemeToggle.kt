@@ -25,6 +25,8 @@ import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import it.kapfer.bankteller.ui.components.semantics.semanticIconAction
+import it.kapfer.bankteller.ui.components.semantics.themeToggleDescription
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.ThemeMode
 import it.kapfer.bankteller.ui.theme.nextThemeMode
@@ -64,10 +66,13 @@ fun ThemeToggle(modifier: Modifier = Modifier) {
     ) {
         IconButton(
             onClick = { setThemeMode(nextThemeMode(mode, isSystemDark)) },
+            // Icon-only control: the name lives on the interactive node, the
+            // glyph stays decorative (WCAG 1.1.1 / 4.1.2).
+            modifier = Modifier.semanticIconAction(themeToggleDescription(label)),
         ) {
             Icon(
                 imageVector = icon,
-                contentDescription = "Theme mode: $label",
+                contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }

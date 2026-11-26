@@ -97,6 +97,10 @@ import it.kapfer.bankteller.ui.components.diagnosticTooltipOpenState
 import it.kapfer.bankteller.ui.components.QuietButton
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.WaitingIndicator
+import it.kapfer.bankteller.ui.components.semantics.StatusText
+import it.kapfer.bankteller.ui.components.semantics.collectionInfo
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
+import it.kapfer.bankteller.ui.components.semantics.semanticIconAction
 import it.kapfer.bankteller.ui.components.BrandedTopBar
 import it.kapfer.bankteller.ui.components.ThemeToggle
 import it.kapfer.bankteller.ui.components.ActionButton
@@ -367,7 +371,11 @@ private fun MissingAccountsDialog(viewModel: AppViewModel) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .verticalScroll(listScrollState),
+                            .verticalScroll(listScrollState)
+                            // Bounded record list the user decides over —
+                            // collection semantics so AT announces list
+                            // structure (review finding 5).
+                            .collectionInfo(rows.size),
                         verticalArrangement = Arrangement.spacedBy(Dimens.sm),
                     ) {
                         rows.forEach { row ->
@@ -380,7 +388,7 @@ private fun MissingAccountsDialog(viewModel: AppViewModel) {
                 // settings-surface error would be invisible. Mirrors the
                 // remove-connection dialog's removeError treatment.
                 viewModel.missingAccountsError?.let { error ->
-                    Text(
+                    StatusText(
                         text = error,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
@@ -553,12 +561,12 @@ private fun ImportStep(viewModel: AppViewModel) {
         } else {
             Spacer(modifier = Modifier.height(Dimens.xxl))
             WaitingIndicator.Zone(verticalPadding = Dimens.md)
-            Text(
+            StatusText(
                 text = "Connecting to your bank",
                 style = MaterialTheme.typography.titleMedium,
             )
             Spacer(modifier = Modifier.height(Dimens.xs))
-            Text(
+            StatusText(
                 text = "Retrieving your balances…",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -640,6 +648,7 @@ private fun Greeting(username: String) {
     Text(
         text = "Welcome, $username!",
         style = MaterialTheme.typography.headlineMedium,
+        modifier = Modifier.screenHeading,
     )
     Spacer(modifier = Modifier.height(Dimens.md))
 }
@@ -997,7 +1006,7 @@ private fun GlobalSyncLine(viewModel: AppViewModel, banks: List<BankData>) {
             horizontalArrangement = Arrangement.spacedBy(Dimens.sm),
         ) {
             WaitingIndicator.Inline()
-            Text(
+            StatusText(
                 text = "Updating balances…",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1009,13 +1018,13 @@ private fun GlobalSyncLine(viewModel: AppViewModel, banks: List<BankData>) {
         // is a single row, so the line must break internally.
         val summary = globalSyncSummary(banks)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(Dimens.xs)) {
-            Text(
+            StatusText(
                 text = globalSyncLineText(latestSuccessAt(banks), getCurrentEpochMillis()),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             summary.forEach { segment ->
-                Text(
+                StatusText(
                     text = "· ${segment.text}",
                     style = MaterialTheme.typography.labelMedium,
                     color = if (segment.tier == GlobalSyncSummaryTier.Danger) {
@@ -1074,7 +1083,7 @@ private fun RefreshControl(viewModel: AppViewModel, compact: Boolean) {
                 IconButton(
                     onClick = { viewModel.triggerRefresh() },
                     enabled = refreshControlEnabled(state),
-                    modifier = Modifier.size(28.dp),
+                    modifier = Modifier.size(28.dp).semanticIconAction("Refresh balances"),
                 ) { icon() }
             }
         } else {
@@ -1083,6 +1092,7 @@ private fun RefreshControl(viewModel: AppViewModel, compact: Boolean) {
             IconButton(
                 onClick = { viewModel.triggerRefresh() },
                 enabled = refreshControlEnabled(state),
+                modifier = Modifier.semanticIconAction("Refresh balances"),
             ) { icon() }
         }
     }
@@ -1674,19 +1684,19 @@ private fun AuthFailureNotice(viewModel: AppViewModel) {
                 tint = error,
                 modifier = Modifier.size(18.dp),
             )
-            Text(
+            StatusText(
                 text = copy.title,
                 style = MaterialTheme.typography.titleMedium,
                 color = error,
             )
         }
         Spacer(modifier = Modifier.height(Dimens.xs))
-        Text(
+        StatusText(
             text = copy.body,
             style = MaterialTheme.typography.bodyMedium,
         )
         Spacer(modifier = Modifier.height(Dimens.xs))
-        Text(
+        StatusText(
             text = copy.guidance,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1712,7 +1722,10 @@ private fun AuthFailureNotice(viewModel: AppViewModel) {
 @Composable
 private fun AccountCards(viewModel: AppViewModel, banks: List<BankData>) {
     val syncInProgress = viewModel.refreshRequested || viewModel.accountsData?.syncInProgress == true
-    Column(verticalArrangement = Arrangement.spacedBy(Dimens.md)) {
+    Column(
+        modifier = Modifier.collectionInfo(banks.sumOf { it.accounts.size }),
+        verticalArrangement = Arrangement.spacedBy(Dimens.md),
+    ) {
         banks.forEach { bank ->
             bank.accounts.forEach { account ->
                 AccountCard(bank, account, syncInProgress)

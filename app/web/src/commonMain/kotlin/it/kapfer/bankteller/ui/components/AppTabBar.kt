@@ -26,6 +26,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import it.kapfer.bankteller.ui.components.semantics.tabItemSemantics
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 
 /**
@@ -138,6 +139,9 @@ private fun TabItem(
                 // aesthetic, §8).
                 indication = null,
             ) { onSelected() }
+            // Tab role, name, and selected state on the clickable node; the
+            // glyph inside stays decorative (WCAG 4.1.2).
+            .tabItemSemantics(label = tab.label, selected = selected)
             .padding(top = 8.dp, bottom = 2.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {

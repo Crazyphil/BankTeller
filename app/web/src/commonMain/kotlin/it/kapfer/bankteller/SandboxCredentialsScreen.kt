@@ -33,6 +33,8 @@ import it.kapfer.bankteller.ui.components.BrandLogo
 import it.kapfer.bankteller.ui.components.DecisionBox
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.WaitingIndicator
+import it.kapfer.bankteller.ui.components.semantics.StatusText
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 
@@ -257,6 +259,7 @@ private fun BankIdentityHeader(bank: Aspssp) {
         Text(
             text = bank.name,
             style = MaterialTheme.typography.headlineSmall,
+            modifier = Modifier.screenHeading,
         )
         val subline = listOfNotNull(
             bank.country.uppercase().ifEmpty { null },
@@ -295,14 +298,14 @@ private fun PopupErrorContent(onRetry: (() -> Unit)?) {
                 tint = error,
                 modifier = Modifier.size(18.dp),
             )
-            Text(
+            StatusText(
                 text = "Unable to load credentials",
                 style = MaterialTheme.typography.titleMedium,
                 color = error,
             )
         }
         Spacer(modifier = Modifier.height(Dimens.xs))
-        Text(
+        StatusText(
             text = "Unable to load credentials for this bank. Please return to the main tab.",
             style = MaterialTheme.typography.bodyMedium,
         )

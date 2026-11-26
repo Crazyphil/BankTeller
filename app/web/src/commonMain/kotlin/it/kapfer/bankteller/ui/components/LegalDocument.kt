@@ -18,6 +18,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import it.kapfer.bankteller.jetBrainsMonoFamily
 import it.kapfer.bankteller.ui.theme.Dimens
+import it.kapfer.bankteller.ui.components.semantics.screenHeading
 
 /**
  * Sovereign Letterhead scaffold for public legal pages (tasks 10.5/10.6, design D13):
@@ -59,6 +60,7 @@ fun LegalDocument(
         Text(
             text = title,
             style = MaterialTheme.typography.headlineLarge,
+            modifier = Modifier.screenHeading, // screen-title heading semantics (wcag-semantics-conformance 2.3) — Terms + Privacy via this shared component
         )
 
         Text(

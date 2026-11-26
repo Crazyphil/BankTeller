@@ -73,6 +73,31 @@ kotlin {
         commonTest.dependencies {
             implementation(libs.kotlin.test)
             implementation(libs.kotlinx.coroutines.test)
+            // SemanticsContractTest's assertion framework (3.0's dependency
+            // strategy): resolves for BOTH targets from the CMP line — the
+            // JVM variant serves the hermetic jvmTest trio, the wasmJs
+            // variant the containerized Karma compile. Zero browser or
+            // ViewModel dependencies beyond it.
+            implementation(libs.compose.uiTest)
+        }
+        // Skiko's native runtime for the TEST-ONLY JVM target
+        // (SemanticsContractTest's Compose harness needs a rendering host
+        // on JVM — the Compose Desktop Gradle plugin normally injects
+        // skiko-awt-runtime-<os> per platform; this wasmJs-only module has
+        // no desktop target, so the runtime rides the test compilation
+        // alone. Production targets are unaffected.
+        jvmTest.dependencies {
+            val os = org.gradle.internal.os.OperatingSystem.current()
+            val arch = System.getProperty("os.arch")
+            val classifier = when {
+                os.isMacOsX && arch == "aarch64" -> "macos-arm64"
+                os.isMacOsX -> "macos-x64"
+                os.isLinux && arch == "aarch64" -> "linux-arm64"
+                os.isLinux -> "linux-x64"
+                os.isWindows -> "windows-x64"
+                else -> throw GradleException("Unsupported test platform: $os $arch")
+            }
+            implementation("org.jetbrains.skiko:skiko-awt-runtime-$classifier:${libs.versions.skikoAwt.get()}")
         }
         wasmJsMain.dependencies {
             implementation(libs.wrappers.browser)
@@ -82,15 +107,17 @@ kotlin {
 }
 
 // ---------------------------------------------------------------------------
-// jvmTest runs ONLY the hermetic contrast test (accessibility D5)
+// jvmTest runs ONLY the hermetic trio (accessibility D5, semantics contracts
+// per wcag-semantics-conformance D5)
 // ---------------------------------------------------------------------------
 // The commonTest suite is wasmJs-shaped: AppViewModel/localStorage/browser-
 // actual tests dominate it, and the JVM actuals under src/jvmMain are inert
 // throwaways that merely satisfy the expect/actual contract (createHttpClient
 // throws, localStorage is an in-memory map, browser navigation throws). Running
-// that suite on the JVM would produce misleading failures, not signal. The one
-// JVM-worthy test is ThemeContrastTest — pure token arithmetic over the color
-// constants with zero browser/ViewModel dependencies. Filter jvmTest to it so
+// that suite on the JVM would produce misleading failures, not signal. The
+// JVM-worthy tests are the hermetic trio (see the filter below) — pure
+// arithmetic and JVM semantics-tree assertions with zero browser/ViewModel
+// dependencies. Filter jvmTest to them so
 // `./gradlew :app:web:jvmTest` stays hermetic and fast, while the containerized
 // wasmJs Karma run keeps exercising the full suite.
 tasks.named("jvmTest", Test::class) {
@@ -101,6 +128,16 @@ tasks.named("jvmTest", Test::class) {
         // structural two-state rule, reviewer finding 4).
         includeTestsMatching("it.kapfer.bankteller.ThemeContrastTest")
         includeTestsMatching("it.kapfer.bankteller.DecisionBoxBorderColorTest")
+        // The hermetic trio's third member: SemanticsContractTest
+        // (wcag-semantics-conformance D5). Dependency strategy: the
+        // semantics-assertion API (compose ui-test / semantics tree) and
+        // any compose ui test dependency resolve from the EXISTING
+        // test-target classpath — zero browser/ViewModel dependencies,
+        // the same hermeticity bar as the pair: JVM semantics trees over
+        // the primitive layer's composables only (assertions declare the
+        // CONTRACT, not bridge behavior; bridge internals are upstream
+        // code verified by the live spike, task 1.2's probe).
+        includeTestsMatching("it.kapfer.bankteller.SemanticsContractTest")
     }
 }
 

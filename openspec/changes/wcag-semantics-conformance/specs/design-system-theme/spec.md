@@ -63,4 +63,4 @@ The SPA SHALL gain a hand-rolled top-level navigation bar rendered in `ScreenShe
 
 #### Scenario: Tab semantics declared alongside visuals
 - **WHEN** the tab bar renders
-- **THEN** each tab item's semantics node carries `Role.Tab`, its label as name, and the `Selected` state matching the active tab — machine-readable without visual inspection (per the `semantic-ui-primitives` capability)
+- **THEN** each tab item's semantics node carries `Role.Tab`, its label as name, and the `Selected` state matching the active tab — machine-readable without visual inspection (per the `semantic-ui-primitives` capability; contract-tested in the Compose tree). *Layer note (implementation-verified): node role/state projection to the DOM is 1.13-gated — at 1.12.x the bridge projects the tab as `role="button"` with its name (OnClick forces the button role) and no `aria-selected`; the declaration is the app-side truth, the DOM projection re-examines at the 1.13 upgrade per the verdict policy*

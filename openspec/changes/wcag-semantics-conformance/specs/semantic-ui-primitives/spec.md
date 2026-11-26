@@ -18,15 +18,15 @@ The system SHALL provide a semantic icon-action wrapper in `ui/components/semant
 - **THEN** the API surface requires it (no default-empty overload); the enforcement is API design (no unnamed overload to call) plus review — the JVM contract test asserts that the wrapper's existing variants always expose a non-empty name, catching regressions that strip the declaration
 
 ### Requirement: Status announcements
-The system SHALL provide a status-announcement component (`StatusText`) whose content changes are announced by assistive technology: it declares `liveRegion` semantics, mirrored to `aria-live` by the Compose ≥1.12 web bridge (#3428). Announcement politeness SHALL be `Polite` (no interruptions of an in-progress user action).
+The system SHALL provide a status-announcement component (`StatusText`) whose content changes are announced by assistive technology: it declares `liveRegion` semantics. Announcement politeness SHALL be `Polite` (no interruptions of an in-progress user action).
 
 #### Scenario: Async application-state changes adopt StatusText
-- **WHEN** an async application-state text changes (the global sync line's updates and degraded summaries, in-flight "Updating balances…"/"Importing accounts…" labels, error/caveat panels appearing after actions)
+- **WHEN** an async application-state text changes (the global sync line's updates and degraded summaries, in-flight "Updating balances…" / "Connecting to your bank" / "Retrieving your balances…" labels, error/caveat panels appearing after actions)
 - **THEN** it renders through `StatusText` (or declares equivalent liveRegion semantics), so the change is announced politely
 
 #### Scenario: Sync status change is announced
 - **WHEN** a sync run completes and the global sync line's text changes
-- **THEN** the line's liveRegion semantics cause the new text to be announced politely by assistive technology
+- **THEN** the line's liveRegion semantics cause the new text to be announced politely by assistive technology (bridge note, implementation-verified: node-level `aria-live` mapping is a 1.13 feature; at 1.12.x announcements ride the overlay container's hardcoded `aria-live="polite"` — container-mediated, live-verified mid-sync; the declaration is forward-compatible with the node-level mapping)
 
 #### Scenario: In-flight status is announced
 - **WHEN** an import run begins and the waiting indicator's label appears
@@ -40,11 +40,11 @@ Screen titles SHALL declare heading semantics (`SemanticsProperties.Heading`), s
 - **THEN** the title's semantics node carries heading semantics, letting screen-reader users jump between steps' titles
 
 ### Requirement: Tab and navigation-row semantics
-The hand-rolled tab bar and Settings navigation rows SHALL declare their interactive semantics: `Role.Tab` with `Selected` state on tab items (mirrored to `role` by the bridge), `Selected`/`Role` on the master-detail nav rows, and `Role.Button` on the drill-in back affordance. The active/inactive visual treatment (brass indicator, label colors) SHALL be redundant with — not a substitute for — the declared state.
+The hand-rolled tab bar and Settings navigation rows SHALL declare their interactive semantics: `Role.Tab` with `Selected` state on tab items, `Selected`/`Role` on the master-detail nav rows, and `Role.Button` on the drill-in back affordance. The active/inactive visual treatment (brass indicator, label colors) SHALL be redundant with — not a substitute for — the declared state.
 
 #### Scenario: Tab state is machine-readable
 - **WHEN** the dashboard tab is active
-- **THEN** its semantics node carries the selected state, distinguishable from the inactive tab's node without visual inspection
+- **THEN** its semantics node carries the selected state, distinguishable from the inactive tab's node without visual inspection (in the Compose tree — contract-tested; bridge note, implementation-verified per the 5.3 record: at 1.12.x OnClick controls project `role="button"` with no `aria-selected` — the tab role/state DOM projection is 1.13-gated per #3381, re-examined per the verdict policy)
 
 ### Requirement: Text-field accessible names
 Text fields SHALL expose their label as the field's accessible name: the field wrapper merges the editable node's semantics with its label (the 2026-11 spike found the Compose bridge exposes `role="textbox"` with NO name, the M3 label rendering as a separate unassociated node). Every `OutlinedTextField` SHALL carry its label as `contentDescription` on the editable node — making the field's name readable by assistive technology.

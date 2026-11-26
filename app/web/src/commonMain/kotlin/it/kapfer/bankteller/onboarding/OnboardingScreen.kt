@@ -100,6 +100,9 @@ import it.kapfer.bankteller.ui.components.QuietButton
 import it.kapfer.bankteller.ui.components.ScreenShell
 import it.kapfer.bankteller.ui.components.ThemeToggle
 import it.kapfer.bankteller.ui.components.WizardScaffold
+import it.kapfer.bankteller.ui.components.semantics.StatusText
+import it.kapfer.bankteller.ui.components.semantics.collectionInfo
+import it.kapfer.bankteller.ui.components.semantics.fieldName
 import it.kapfer.bankteller.ui.theme.Dimens
 import it.kapfer.bankteller.ui.theme.LocalBankTellerColors
 import io.ktor.client.request.get
@@ -291,6 +294,7 @@ private fun EmailEntryStep(viewModel: AppViewModel) {
             keyboardActions = KeyboardActions(onDone = { submit() }),
             modifier = Modifier
                 .fillMaxWidth()
+                .fieldName("Email")
                 .focusRequester(emailFocusRequester),
         )
 
@@ -511,7 +515,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
             supportingText = urlError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) } },
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
             keyboardActions = KeyboardActions(onDone = { submit() }),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().fieldName("Redirect URL"),
         )
 
         // --- Production field overrides (only shown for PRODUCTION) ---
@@ -532,7 +536,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submit() }),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().fieldName("Description"),
                 )
 
                 OutlinedTextField(
@@ -546,7 +550,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submit() }),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().fieldName("GDPR email"),
                 )
 
                 OutlinedTextField(
@@ -559,7 +563,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submit() }),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().fieldName("Privacy URL"),
                 )
 
                 OutlinedTextField(
@@ -572,7 +576,7 @@ private fun RegistrationReviewStep(viewModel: AppViewModel) {
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                     keyboardActions = KeyboardActions(onDone = { submit() }),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().fieldName("Terms URL"),
                 )
             }
         }
@@ -956,7 +960,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
             )
 
             viewModel.linkError?.takeIf { viewModel.selectedPsuType.isNotEmpty() }?.let { err ->
-                Text(
+                StatusText(
                     text = err,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodyMedium,
@@ -1003,7 +1007,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                 onValueChange = { searchQuery = it },
                 label = { Text("Search by name, BIC, or country") },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().fieldName("Search by name, BIC, or country"),
             )
 
             when (val state = viewModel.aspspsState) {
@@ -1088,6 +1092,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
                                     state = bankListState,
                                     modifier = Modifier
                                         .fillMaxSize()
+                                        .collectionInfo(filtered.size)
                                         .padding(end = 12.dp),
                                     verticalArrangement = Arrangement.spacedBy(Dimens.sm),
                                 ) {
@@ -1296,7 +1301,7 @@ private fun BankSelectionStep(viewModel: AppViewModel) {
              }
 
             viewModel.linkError?.let { err ->
-                Text(
+                StatusText(
                     text = err,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodyMedium,
@@ -1488,7 +1493,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                 tint = MaterialTheme.colorScheme.error,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(
+                StatusText(
                     text = err,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -1518,7 +1523,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                     // re-open affordance in a Tier-4 info box. Empty forward
                     // slot (set above). No close-tab claims (D10).
                     WaitingIndicator.Zone(verticalPadding = Dimens.lg)
-                    Text(
+                    StatusText(
                         text = "Waiting for you to complete the linking steps…",
                         style = MaterialTheme.typography.titleMedium,
                     )
@@ -1546,7 +1551,7 @@ private fun LinkingProgressStep(viewModel: AppViewModel) {
                 // normal poll cadence (the state is not terminal — the server
                 // owns the retry schedule).
                 WaitingIndicator.Zone(verticalPadding = Dimens.lg)
-                Text(
+                StatusText(
                     text = "Linking completed — confirming the connection…",
                     style = MaterialTheme.typography.titleMedium,
                 )
@@ -2020,7 +2025,7 @@ private fun AuthProgressStep(viewModel: AppViewModel) {
         // Flow-level error pattern: a failed retry (POST /api/auth error) is
         // shown here so the user can see why the redirect did not fire.
         viewModel.linkError?.let { err ->
-            Text(
+            StatusText(
                 text = err,
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,

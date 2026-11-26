@@ -1,7 +1,12 @@
 [versions]
-androidx-lifecycle = "2.11.0-beta01"
-composeMultiplatform = "1.11.1"
-material3WindowSizeClass = "1.9.0"
+androidx-lifecycle = "2.11.0"
+composeMultiplatform = "1.12.2"
+# skiko-awt runtime version (the version the CMP 1.12.2 compose stack
+# resolves — ui-test-desktop depends on org.jetbrains.skiko:skiko:0.150.2);
+# the SemanticsContractTest JVM harness needs the native rendering runtime
+# that the Compose Desktop plugin would otherwise inject.
+skikoAwt = "0.150.2"
+material3WindowSizeClass = "1.12.0-alpha03"
 junit = "4.13.2"
 kotlin = "2.4.0"
 kotlin-wrappers = "2026.6.1"
@@ -25,9 +30,16 @@ compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", v
 compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "composeMultiplatform" }
 compose-components-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "composeMultiplatform" }
 compose-uiToolingPreview = { module = "org.jetbrains.compose.ui:ui-tooling-preview", version.ref = "composeMultiplatform" }
-# material3-window-size-class (bank-connection-management 4.1): stable on wasmJs
-# at the pinned CMP line. It rides the material3 1.9.x train (the same train the
-# compose plugin's compose.material3 accessor resolves at CMP 1.11.x) — the
+# compose ui-test (wcag-semantics-conformance 3.1): the multiplatform test
+# framework behind SemanticsContractTest — publishes JVM (desktop/Skiko) and
+# wasmJs variants at the pinned CMP line, so it rides commonTest for both the
+# hermetic jvmTest target and the wasmJs Karma compile (build.gradle.kts's
+# check gate). Same version as the rest of the compose-ui stack.
+compose-uiTest = { module = "org.jetbrains.compose.ui:ui-test", version.ref = "composeMultiplatform" }
+# material3-window-size-class (bank-connection-management 4.1): rides the
+# material3 train the compose plugin's compose.material3 accessor resolves at
+# the pinned CMP line (1.12.0-alpha03 at CMP 1.12.2 — no stable exists on this
+# train; alpha refers to the train, not this artifact's readiness) — the
 # artifacts are published as a set; a mismatched version would pull a second
 # material3 into the graph. Used ONLY for viewport measurement
 # (calculateWindowSizeClass); the 768dp settings breakpoint is applied by the
