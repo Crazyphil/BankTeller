@@ -39,6 +39,15 @@ CREATE TABLE eb_sessions (
 
 CREATE TABLE accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- FK edge policy (enable-db-foreign-keys): deliberately NO ACTION (no
+    -- cascade) — a tripwire, not an oversight. Accounts can legitimately
+    -- outlive their session: the re-authorization merge re-points
+    -- kept-as-local-copy accounts to the new session row BEFORE deleting the
+    -- old session. A cascade here would silently destroy the user's kept
+    -- local copies (plus their balances, via cascade) on any future
+    -- re-ordering of the merge's statements; NO ACTION turns that bug into a
+    -- loud transaction failure instead. All deletion paths comply today
+    -- (children deleted first, or accounts re-pointed first).
     session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
     iban TEXT,
     uid TEXT,

@@ -2,8 +2,18 @@ package it.kapfer.bankteller.server
 
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import it.kapfer.bankteller.database.BankTellerDatabase
+import org.slf4j.LoggerFactory
 
 object DatabaseFactory {
+    private val logger = LoggerFactory.getLogger(DatabaseFactory::class.java)
+
+    // Test-support visibility into the factory's own connection (the FK
+    // pragma contract is per connection — a test's own driver would read its
+    // own setting, not the factory's). Holds the driver of the most recent
+    // init() call; production code never reads it.
+    internal var lastInitializedDriver: JdbcSqliteDriver? = null
+        private set
+
     fun init(): BankTellerDatabase {
         // Resolution order: database.path system property → DATABASE_PATH env
         // → project-relative default. The container deployment sets
@@ -17,9 +27,36 @@ object DatabaseFactory {
         java.nio.file.Files.createDirectories(
             java.nio.file.Paths.get(dbPath).toAbsolutePath().parent,
         )
-        val driver = JdbcSqliteDriver("jdbc:sqlite:$dbPath")
+        // Per-connection pragma configuration. SQLite applies these settings
+        // per connection and cannot persist them in the file — and
+        // SQLDelight's JdbcSqliteDriver with a FILE-backed URL opens a NEW
+        // raw JDBC connection per statement outside transactions
+        // (ThreadedConnectionManager: getConnection lazily, closeConnection
+        // after each non-transactional statement). A one-shot
+        // `PRAGMA foreign_keys=ON` therefore governs only that single
+        // ephemeral connection. The JDBC connection properties ride
+        // DriverManager.getConnection on EVERY connection sqlite-jdbc opens
+        // (SQLiteConfig applies them at connection birth) — the only way to
+        // satisfy the per-connection contract (enable-db-foreign-keys,
+        // design D3) under this driver.
+        //
+        // FK enforcement is a HARD prerequisite of the ownership CASCADE
+        // clauses in the schema sources (design D5): on a cascade-less
+        // database enforcement makes every parent-first deletion path
+        // throw. foreign_keys=ON must precede any DML — as a connection
+        // property it is set before the first statement runs on each
+        // connection.
+        val connectionProperties = java.util.Properties().apply {
+            // SQLiteConfig-backed pragmas (org.sqlite.SQLiteConfig.Pragma):
+            // busy_timeout (ms) and foreign_keys enforcement.
+            setProperty("busy_timeout", "5000")
+            setProperty("foreign_keys", "true")
+        }
+        val driver = JdbcSqliteDriver("jdbc:sqlite:$dbPath", connectionProperties)
+        // journal_mode=WAL persists in the file (unlike the per-connection
+        // settings above), so the plain pragma form remains correct here.
         driver.execute(null, "PRAGMA journal_mode=WAL", 0)
-        driver.execute(null, "PRAGMA busy_timeout=5000", 0)
+        lastInitializedDriver = driver
 
         // Versioned migration. A fresh database (user_version = 0) gets the full
         // schema via create(); an existing database (user_version = 1, from
@@ -198,6 +235,41 @@ object DatabaseFactory {
                         "This is the pre-release intermediate draft state — the version-inference ladder only runs for " +
                         "user_version = 0, so no migration can repair it. Delete the pre-release dev database file " +
                         "($dbPath) and let the server recreate it from scratch; it is a disposable dev artifact."
+                )
+            }
+        }
+
+        // Log-only boot-time constraint check (enable-db-foreign-keys, design
+        // D4): deliberately a DIFFERENT severity from the sanity check above —
+        // orphans do not prevent the database from working (enforcement gates
+        // future writes, not reads of pre-existing rows), so this never
+        // blocks or fails startup. One console line per violating table,
+        // with the violation count and mitigation guidance. Runs after
+        // migration and after enforcement is on; placement before the
+        // user_version stamp does not affect behavior (it never mutates).
+        run {
+            // The pragma's table-valued function: one row per violating
+            // child row (table, rowid, parent, fkid). Group by table for the
+            // one-line-per-table log.
+            val violationCounts = mutableMapOf<String, Long>()
+            driver.executeQuery<Long>(
+                identifier = null,
+                sql = "SELECT \"table\", COUNT(*) FROM pragma_foreign_key_check GROUP BY \"table\"",
+                mapper = { cursor ->
+                    if (cursor.next().value) {
+                        // Column 0 is the violating table, column 1 the count.
+                        val table = cursor.getString(0) ?: "unknown"
+                        val count = cursor.getLong(1) ?: 0L
+                        violationCounts[table] = count
+                    }
+                    app.cash.sqldelight.db.QueryResult.Value(0L)
+                },
+                parameters = 0,
+            )
+            for ((table, count) in violationCounts) {
+                logger.warn(
+                    "Database at $dbPath: table '$table' contains $count row(s) violating foreign-key constraints " +
+                        "(stale, harmless — they gate nothing; delete them to clean up). Startup continues.",
                 )
             }
         }

@@ -7,8 +7,16 @@
 -- ladder only classifies a database as being at this version or later when
 -- the balances/sync_log tables are present (see DatabaseFactory.kt) — so the
 -- ALTERs never re-run on an already-migrated database.
+--
+-- FK edge policy (enable-db-foreign-keys): both FKs below are pure
+-- ownership edges and carry ON DELETE CASCADE. Both DDL sources are
+-- amended in place (pre-release ruling, matching the 4.sqm precedent —
+-- no database outside development exists): the .sq schema sources feed
+-- Schema.create() for fresh databases, these .sqm migrations are the DDL
+-- for databases migrating through this version. The two-source rule:
+-- keep the CASCADE clauses in Balances.sq and 3.sqm identical.
 CREATE TABLE IF NOT EXISTS balances (
-    account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id),
+    account_id INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     balance_amount TEXT NOT NULL,
     currency TEXT NOT NULL,
     balance_type TEXT NOT NULL,
@@ -18,7 +26,7 @@ CREATE TABLE IF NOT EXISTS balances (
 
 CREATE TABLE IF NOT EXISTS sync_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL REFERENCES eb_sessions(id),
+    session_id INTEGER NOT NULL REFERENCES eb_sessions(id) ON DELETE CASCADE,
     sync_type TEXT NOT NULL,
     started_at INTEGER NOT NULL,
     completed_at INTEGER,

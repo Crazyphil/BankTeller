@@ -1,13 +1,18 @@
 package it.kapfer.bankteller.server
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import it.kapfer.bankteller.database.BankTellerDatabase
 import java.nio.file.Files
+import org.slf4j.LoggerFactory
 
 class DatabaseFactoryTest {
 
@@ -617,5 +622,260 @@ class DatabaseFactoryTest {
         assertNull(db.ebApplicationQueries.selectEbApplication().executeAsOneOrNull())
         assertEquals("k", db.systemConfigQueries.selectValue("jwt_signing_key").executeAsOneOrNull())
         assertEquals("h", db.systemConfigQueries.selectValue("password_hash").executeAsOneOrNull())
+    }
+
+    // ------------------------------------------------------------------
+    // Foreign-key enforcement (enable-db-foreign-keys)
+    // ------------------------------------------------------------------
+
+    /** Reads a pragma as a Long on the given raw driver. */
+    private fun JdbcSqliteDriver.pragmaLong(sql: String): Long = executeQuery<Long>(
+        identifier = null,
+        sql = sql,
+        mapper = { cursor ->
+            app.cash.sqldelight.db.QueryResult.Value(if (cursor.next().value) (cursor.getLong(0) ?: 0L) else 0L)
+        },
+        parameters = 0,
+    ).value
+
+    @Test
+    fun `foreign_keys pragma reads 1 on the factory-initialized connection`() {
+        // Spec: foreign-key enforcement per connection. The pragma is
+        // per-connection and cannot be persisted in the file — the factory,
+        // not the schema, owns the contract. A test's own driver would read
+        // its own setting, so the assertion reads the factory's driver.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        DatabaseFactory.init()
+        val driver = assertNotNull(DatabaseFactory.lastInitializedDriver, "init must expose its driver for this assertion")
+        assertEquals(1L, driver.pragmaLong("PRAGMA foreign_keys"), "PRAGMA foreign_keys must read 1 on a factory-initialized connection")
+    }
+
+    @Test
+    fun `insert with dangling foreign key fails on factory-initialized connection`() {
+        // Spec: illegal reference insert fails — enforcement gates writes,
+        // not just boot-time reporting.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        // No eb_sessions row exists: session_id = 999 is a dangling parent.
+        val failed = runCatching {
+            db.ebSessionsQueries.insertAccount(
+                session_id = 999L,
+                iban = "DE1",
+                uid = "uid-1",
+                currency = "EUR",
+                name = "Orphan",
+                identification_hash = null,
+            )
+        }
+        assertTrue(failed.isFailure, "insert with a dangling FK must fail under PRAGMA foreign_keys=ON")
+    }
+
+    @Test
+    fun `deleting a sync_log row cascades its sync_outcomes`() {
+        // Spec: ownership edges delete by cascade — sync_outcomes.sync_log_id.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        db.ebSessionsQueries.insertSession("sess-casc-1", "Bank", "DE", "personal", 1_000L, null, null, null)
+        db.ebSessionsQueries.insertAccount(
+            session_id = 1L,
+            iban = "DE1",
+            uid = "uid-1",
+            currency = "EUR",
+            name = "Acc",
+            identification_hash = null,
+        )
+        db.balancesQueries.insertSyncLog(1L, "manual", 1_000L, 2_000L, "success", null, null)
+        db.syncOutcomesQueries.insertSyncOutcome(
+            sync_log_id = 1L,
+            account_id = 1L,
+            status = "success",
+            error_bin = null,
+            error_code = null,
+            error_message = null,
+            fetched_at = 1_500L,
+        )
+        assertEquals(1L, db.syncOutcomesQueries.countOutcomesBySessionId(1L).executeAsOne())
+        // Parent-first delete: the cascade removes the outcome rows with the
+        // run header (the explicit child-delete paths become redundant no-ops
+        // — spec: application cascades remain primary).
+        db.balancesQueries.deleteSyncLogsBySessionIds(listOf(1L))
+        assertEquals(0L, db.syncOutcomesQueries.countOutcomesBySessionId(1L).executeAsOne(), "cascade must remove the run's outcomes")
+    }
+
+    @Test
+    fun `deleting an account cascades its balances and sync_outcomes`() {
+        // Spec: ownership edges delete by cascade — balances.account_id and
+        // sync_outcomes.account_id.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        db.ebSessionsQueries.insertSession("sess-casc-2", "Bank", "DE", "personal", 1_000L, null, null, null)
+        db.ebSessionsQueries.insertAccount(
+            session_id = 1L,
+            iban = "DE2",
+            uid = "uid-2",
+            currency = "EUR",
+            name = "Acc",
+            identification_hash = null,
+        )
+        db.balancesQueries.upsertBalance(1L, "10.00", "EUR", "CLBD", null, 1_000L)
+        db.balancesQueries.insertSyncLog(1L, "manual", 1_000L, 2_000L, "success", null, null)
+        db.syncOutcomesQueries.insertSyncOutcome(
+            sync_log_id = 1L,
+            account_id = 1L,
+            status = "success",
+            error_bin = null,
+            error_code = null,
+            error_message = null,
+            fetched_at = 1_500L,
+        )
+        assertEquals("10.00", db.balancesQueries.selectBalanceByAccountId(1L).executeAsOne().balance_amount)
+        // Parent-first delete (deleteLocalCopyAccounts order): the cascade
+        // removes balances and outcome history with the account.
+        db.ebSessionsQueries.deleteAccountsByIds(listOf(1L))
+        assertNull(db.balancesQueries.selectBalanceByAccountId(1L).executeAsOneOrNull(), "cascade must remove the account's balance")
+        assertNull(db.syncOutcomesQueries.selectLatestOutcomeByAccountId(1L).executeAsOneOrNull(), "cascade must remove the account's outcome history")
+    }
+
+    @Test
+    fun `deleting a session with no remaining accounts cascades its sync_log and transitively outcomes`() {
+        // Spec: ownership edges delete by cascade — sync_log.session_id, and
+        // transitively sync_outcomes via sync_log. The realistic shape is the
+        // merge's keep-local-copy flow: the account is re-pointed to the NEW
+        // session before the old session is deleted, so no account references
+        // the old session and its delete cascades sync_log rows (and their
+        // outcomes) while the account survives on the new session.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        db.ebSessionsQueries.insertSession("sess-old", "Bank", "DE", "personal", 1_000L, null, null, null)
+        db.ebSessionsQueries.insertSession("sess-new", "Bank", "DE", "personal", 2_000L, null, null, null)
+        db.ebSessionsQueries.insertAccount(
+            session_id = 1L,
+            iban = "DE4",
+            uid = "uid-4",
+            currency = "EUR",
+            name = "Kept",
+            identification_hash = null,
+        )
+        db.balancesQueries.insertSyncLog(1L, "manual", 1_000L, 2_000L, "success", null, null)
+        db.syncOutcomesQueries.insertSyncOutcome(
+            sync_log_id = 1L,
+            account_id = 1L,
+            status = "success",
+            error_bin = null,
+            error_code = null,
+            error_message = null,
+            fetched_at = 1_500L,
+        )
+        assertEquals(1L, db.syncOutcomesQueries.countOutcomesBySessionId(1L).executeAsOne())
+        // Merge step 1: re-point the account at the new session (tripwire
+        // satisfied — no account references the old session anymore).
+        db.ebSessionsQueries.updateAccountSessionKeepLocal(session_id = 2L, id = 1L)
+        // Merge step 2: delete the old session — its sync_log rows cascade,
+        // and their outcomes follow transitively.
+        db.ebSessionsQueries.deleteSessionByIds(listOf(1L))
+        assertEquals(0L, db.balancesQueries.countSyncLogsBySessionId(1L).executeAsOne(), "cascade must remove the session's sync_log rows")
+        assertEquals(0L, db.syncOutcomesQueries.countOutcomesBySessionId(1L).executeAsOne(), "transitive cascade must remove the runs' outcomes")
+        // The re-pointed account survives on the new session.
+        val kept = assertNotNull(db.ebSessionsQueries.selectAccountById(1L).executeAsOneOrNull())
+        assertEquals(2L, kept.session_id)
+    }
+
+    @Test
+    fun `deleting a session while accounts still reference it fails`() {
+        // Spec: session-to-account tripwire — accounts.session_id is NO
+        // ACTION; the delete must fail loudly instead of silently cascading
+        // away kept accounts, their balances, and their outcome history.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        val db = DatabaseFactory.init()
+        db.ebSessionsQueries.insertSession("sess-tripwire", "Bank", "DE", "personal", 1_000L, null, null, null)
+        db.ebSessionsQueries.insertAccount(
+            session_id = 1L,
+            iban = "DE3",
+            uid = "uid-3",
+            currency = "EUR",
+            name = "Kept",
+            identification_hash = null,
+        )
+        val failed = runCatching {
+            db.ebSessionsQueries.deleteSessionByIds(listOf(1L))
+        }
+        assertTrue(failed.isFailure, "session delete with still-referencing accounts must fail (NO ACTION tripwire)")
+        // The kept account survives.
+        assertNotNull(db.ebSessionsQueries.selectAccountById(1L).executeAsOneOrNull())
+    }
+
+    @Test
+    fun `boot check logs guidance for orphaned rows and startup completes`() {
+        // Spec: log-only boot-time constraint check — a database containing
+        // orphans boots normally and logs one line per violating table with
+        // the table name, the count, and the mitigation guidance. Seeding
+        // uses a deliberate pragma-less raw driver (the orphan could not be
+        // written with enforcement on — consistent with the legacy-seeding
+        // test pattern).
+        val path = newTempDbPath()
+        val seedDriver = JdbcSqliteDriver("jdbc:sqlite:$path")
+        BankTellerDatabase.Schema.create(seedDriver)
+        seedDriver.execute(
+            null,
+            "INSERT INTO sync_log (session_id, sync_type, started_at, completed_at, status) VALUES (999, 'manual', 1, 2, 'success')",
+            0,
+        )
+        seedDriver.execute(
+            null,
+            "INSERT INTO sync_log (session_id, sync_type, started_at, completed_at, status) VALUES (999, 'manual', 3, 4, 'error')",
+            0,
+        )
+        seedDriver.close()
+
+        val rootLogger = LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as Logger
+        val appender = ListAppender<ILoggingEvent>()
+        appender.start()
+        rootLogger.addAppender(appender)
+
+        System.setProperty("database.path", path)
+        try {
+            val db = DatabaseFactory.init() // must NOT throw
+            db.ebSessionsQueries.countSessions().executeAsOne() // usable
+        } finally {
+            rootLogger.detachAppender(appender)
+            appender.stop()
+        }
+        val violationLines = appender.list.map { it.formattedMessage }.filter {
+            it.contains("violating foreign-key constraints")
+        }
+        assertEquals(1, violationLines.size, "one log line per violating table")
+        val line = violationLines.first()
+        assertTrue("sync_log" in line, "log names the violating table")
+        assertTrue("2 row" in line, "log names the violation count")
+        assertTrue("stale" in line && "harmless" in line && "delete" in line, "log carries the mitigation guidance")
+    }
+
+    @Test
+    fun `boot check logs nothing on a clean database`() {
+        // Spec: clean database logs nothing extra and startup completes.
+        val path = newTempDbPath()
+        System.setProperty("database.path", path)
+        DatabaseFactory.init() // create first, so the checked boot is on a clean, complete DB
+
+        val rootLogger = LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME) as Logger
+        val appender = ListAppender<ILoggingEvent>()
+        appender.start()
+        rootLogger.addAppender(appender)
+        try {
+            DatabaseFactory.init()
+        } finally {
+            rootLogger.detachAppender(appender)
+            appender.stop()
+        }
+        assertEquals(
+            emptyList(),
+            appender.list.map { it.formattedMessage }.filter { it.contains("violating foreign-key constraints") },
+        )
     }
 }

@@ -1,9 +1,22 @@
 # Spec Delta
 
+## MODIFIED Requirements
+
+### Requirement: WAL mode and busy timeout
+The system SHALL enable WAL journal mode and set a busy timeout of 5 seconds on every database connection. This enables safe concurrent reads and writes from background sync, on-demand requests, and workflow evaluation.
+
+#### Scenario: WAL mode enabled
+- **WHEN** a database connection is opened
+- **THEN** the system executes `PRAGMA journal_mode=WAL` before any queries (WAL persists in the file, so the executed pragma governs the file, not one connection)
+
+#### Scenario: Busy timeout set
+- **WHEN** a database connection is opened
+- **THEN** the connection carries a busy timeout of 5000 milliseconds before any queries run on it — set via the driver's connection configuration (the JDBC connection properties sqlite-jdbc applies at the birth of every connection), not a one-shot executed pragma
+
 ## ADDED Requirements
 
 ### Requirement: Foreign-key enforcement per connection
-Every database connection the server opens at runtime SHALL enable SQLite foreign-key enforcement (`PRAGMA foreign_keys = ON`) before any data-modifying statement runs on it. SQLite applies this setting per connection and cannot persist it in the file — the server, not the schema, owns this contract. A JVM test SHALL assert the setting is active on a factory-initialized connection.
+Every database connection the server opens at runtime SHALL enable SQLite foreign-key enforcement (via the connection's configuration, so that `PRAGMA foreign_keys` reads 1) before any data-modifying statement runs on it. SQLite applies this setting per connection and cannot persist it in the file — the server, not the schema, owns this contract. A JVM test SHALL assert the setting is active on a factory-initialized connection.
 
 #### Scenario: Enforcement active on the server's connection
 - **WHEN** the server initializes its database connection

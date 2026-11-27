@@ -444,11 +444,12 @@ class BalanceSyncEngine(
         for (account in accounts) {
             val uid = account.uid
             if (uid == null || account.in_consent == 0L) continue // not fetchable
-            // Race guard (remove-during-sync): SQLite FK enforcement is off, so
-            // a write against a removed row would succeed as an invisible
-            // orphan. The session may have been removed since this run's
-            // snapshot — re-check existence before fetching; a guarded no-op
-            // never fails the run (the removal was the user's explicit act).
+            // Race guard (remove-during-sync): with FK enforcement on, a write
+            // against a removed row fails the transaction loudly; the guard
+            // keeps the run a no-op instead. The session may have been removed
+            // since this run's snapshot — re-check existence before fetching;
+            // a guarded no-op never fails the run (the removal was the user's
+            // explicit act).
             if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
                 logger.info("Sync (type=$syncType): session $sessionRowId removed mid-run — skipping its remaining accounts")
                 return
@@ -642,9 +643,10 @@ class BalanceSyncEngine(
         }
 
         // Race guard (remove-during-sync): the session may have been removed
-        // since this run's snapshot — a sync_log insert against a deleted
-        // session would be an invisible orphan (FK enforcement is off). A
-        // guarded no-op never fails the run.
+        // since this run's snapshot — with FK enforcement on, a sync_log
+        // insert against a deleted session fails the transaction loudly; the
+        // guard keeps the run a no-op instead. A guarded no-op never fails
+        // the run.
         if (database.ebSessionsQueries.selectSessionById(sessionRowId).executeAsOneOrNull() == null) {
             logger.info("Sync (type=$syncType): session $sessionRowId removed mid-run — sync-log write skipped")
             return

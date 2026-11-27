@@ -747,9 +747,12 @@ class OnboardingService(
         //
         // The purge is TOTAL (spec: database — consent expiry and logo columns,
         // purge-totality clause): balances and sync_log rows go with their
-        // accounts/sessions — FK enforcement is off, so leaving them would
-        // accumulate invisible orphans. (The local-copy KEEP requirement is
-        // merge-path only; a re-registration deletes everything by design.)
+        // accounts/sessions — with FK enforcement on, leaving them would
+        // accumulate orphans the boot check would flag (and the ownership
+        // cascades would delete anyway — here the purge stays explicit:
+        // posture A, application cascades remain primary). (The local-copy
+        // KEEP requirement is merge-path only; a re-registration deletes
+        // everything by design.)
         //
         // Re-registration is the ONE place that un-onboards: clearing the
         // ever-onboarded marker (the row's `ever_onboarded` column) restores

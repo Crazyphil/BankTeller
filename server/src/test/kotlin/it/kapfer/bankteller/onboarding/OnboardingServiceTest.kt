@@ -1821,9 +1821,10 @@ class OnboardingServiceTest {
         // routes again.
         assertTrue(EbSessionStore(db).isEverOnboarded())
         // Dependent rows from the old app's sync history: a balance snapshot
-        // and a sync_log run for the stale session's account. FK enforcement
-        // is off — leaving them behind would accumulate invisible orphans
-        // (review F2: the purge is TOTAL).
+        // and a sync_log run for the stale session's account. With FK
+        // enforcement on, leaving them behind would fail the purge loudly
+        // (or be deleted by the ownership cascades) — the purge is explicit
+        // and TOTAL (review F2).
         val staleSessionRow = db.ebSessionsQueries.selectSessionBySessionId("stale-session").executeAsOne()
         val staleAccountRow = db.ebSessionsQueries
             .selectAccountsBySessionIds(listOf(staleSessionRow.id))
